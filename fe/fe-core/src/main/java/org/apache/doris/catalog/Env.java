@@ -406,6 +406,7 @@ public class Env {
     private static long checkpointThreadId = -1;
     private Checkpoint checkpointer;
     private List<HostInfo> helperNodes = Lists.newArrayList();
+    private int helperNodePort;
     private HostInfo selfNode = null;
 
     // node name -> Frontend
@@ -1164,7 +1165,7 @@ public class Env {
                 token = storage.getToken();
                 try {
                     String url = "http://" + NetUtils
-                            .getHostPortInAccessibleFormat(rightHelperNode.getHost(), Config.http_port) + "/check";
+                            .getHostPortInAccessibleFormat(rightHelperNode.getHost(), helperNodePort) + "/check";
                     HttpURLConnection conn = HttpURLUtil.getConnectionWithNodeIdent(url);
                     conn.setConnectTimeout(2 * 1000);
                     conn.setReadTimeout(2 * 1000);
@@ -1235,7 +1236,7 @@ public class Env {
             try {
                 // For upgrade compatibility, the host parameter name remains the same
                 // and the new hostname parameter is added
-                String url = "http://" + NetUtils.getHostPortInAccessibleFormat(helperNode.getHost(), Config.http_port)
+                String url = "http://" + NetUtils.getHostPortInAccessibleFormat(helperNode.getHost(), helperNodePort)
                         + "/role?host=" + selfNode.getHost()
                         + "&port=" + selfNode.getPort();
                 HttpURLConnection conn = HttpURLUtil.getConnectionWithNodeIdent(url);
@@ -1271,7 +1272,7 @@ public class Env {
             }
 
             LOG.info("get fe node type {}, name {} from {}:{}:{}", role, nodeName,
-                    helperNode.getHost(), helperNode.getHost(), Config.http_port);
+                    helperNode.getHost(), helperNode.getHost(), helperNodePort);
             rightHelperNode = helperNode;
             break;
         }
@@ -1292,14 +1293,31 @@ public class Env {
     }
 
     private void getHelperNodes(String[] args) throws Exception {
+        // Set the default value of helper node to self http port, for compatible.
+        helperNodePort = Config.http_port;
         String helpers = null;
         for (int i = 0; i < args.length; i++) {
+            if (args[i].equalsIgnoreCase("-helper_port")) {
+                if (i + 1 >= args.length) {
+                    throw new AnalysisException("-helper_port need parameter port");
+                }
+                try {
+                    int port = Integer.parseInt(args[i + 1]);
+                    if (port <= 0 || 65535 < port) {
+                        throw new AnalysisException("the helper port out of range");
+                    }
+                    helperNodePort = port;
+                } catch (NumberFormatException e) {
+                    throw new AnalysisException("invalid port value", e);
+                }
+                i += 1;
+            }
             if (args[i].equalsIgnoreCase("-helper")) {
                 if (i + 1 >= args.length) {
                     throw new AnalysisException("-helper need parameter host:port,host:port");
                 }
                 helpers = args[i + 1];
-                break;
+                i += 1;
             }
         }
 
@@ -1729,7 +1747,7 @@ public class Env {
 
     private boolean getVersionFileFromHelper(HostInfo helperNode) throws IOException {
         try {
-            String url = "http://" + NetUtils.getHostPortInAccessibleFormat(helperNode.getHost(), Config.http_port)
+            String url = "http://" + NetUtils.getHostPortInAccessibleFormat(helperNode.getHost(), helperNodePort)
                     + "/version";
             File dir = new File(this.imageDir);
             MetaHelper.getRemoteFile(url, HTTP_TIMEOUT_SECOND * 1000,
@@ -1749,7 +1767,7 @@ public class Env {
         localImageVersion = storage.getLatestImageSeq();
 
         try {
-            String hostPort = NetUtils.getHostPortInAccessibleFormat(helperNode.getHost(), Config.http_port);
+            String hostPort = NetUtils.getHostPortInAccessibleFormat(helperNode.getHost(), helperNodePort);
             String infoUrl = "http://" + hostPort + "/info";
             ResponseBody<StorageInfo> responseBody = MetaHelper
                     .doGet(infoUrl, HTTP_TIMEOUT_SECOND * 1000, StorageInfo.class);
