@@ -27,23 +27,23 @@ public class CloudPropertyAnalyzer extends PropertyAnalyzer {
 
     public CloudPropertyAnalyzer() {
         forceProperties = ImmutableMap.<String, String>builder()
-                .put(PropertyAnalyzer.PROPERTIES_INMEMORY, "true")
+                .put(PropertyAnalyzer.PROPERTIES_INMEMORY, "false")
                 //.put(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM, null)
-                .put(PropertyAnalyzer.PROPERTIES_STORAGE_FORMAT, "")
-                .put(PropertyAnalyzer.PROPERTIES_STORAGE_POLICY, "")
-                .put(PropertyAnalyzer.PROPERTIES_STORAGE_COOLDOWN_TIME, "")
-                .put(PropertyAnalyzer.PROPERTIES_MIN_LOAD_REPLICA_NUM, "-1")
-                .put(PropertyAnalyzer.PROPERTIES_DISABLE_AUTO_COMPACTION, "false")
+                //.put(PropertyAnalyzer.PROPERTIES_STORAGE_FORMAT, "")
+                //.put(PropertyAnalyzer.PROPERTIES_STORAGE_POLICY, "")
+                //.put(PropertyAnalyzer.PROPERTIES_STORAGE_COOLDOWN_TIME, "")
+                //.put(PropertyAnalyzer.PROPERTIES_MIN_LOAD_REPLICA_NUM, "-1")
+                //.put(PropertyAnalyzer.PROPERTIES_DISABLE_AUTO_COMPACTION, "false")
                 .put(PropertyAnalyzer.PROPERTIES_ENABLE_LIGHT_SCHEMA_CHANGE, "true")
-                .put(PropertyAnalyzer.PROPERTIES_REPLICATION_NUM,
-                        String.valueOf(ReplicaAllocation.DEFAULT_ALLOCATION.getTotalReplicaNum()))
-                .put(PropertyAnalyzer.PROPERTIES_REPLICATION_ALLOCATION,
-                        ReplicaAllocation.DEFAULT_ALLOCATION.toCreateStmt())
+                //.put(PropertyAnalyzer.PROPERTIES_REPLICATION_NUM,
+                //        String.valueOf(ReplicaAllocation.DEFAULT_ALLOCATION.getTotalReplicaNum()))
+                //.put(PropertyAnalyzer.PROPERTIES_REPLICATION_ALLOCATION,
+                //        ReplicaAllocation.DEFAULT_ALLOCATION.toCreateStmt())
                 //.put(DynamicPartitionProperty.PROPERTIES_STORAGE_MEDIUM, "")
-                .put(DynamicPartitionProperty.REPLICATION_NUM,
-                        String.valueOf(ReplicaAllocation.DEFAULT_ALLOCATION.getTotalReplicaNum()))
-                .put(DynamicPartitionProperty.REPLICATION_ALLOCATION,
-                        ReplicaAllocation.DEFAULT_ALLOCATION.toCreateStmt())
+                //.put(DynamicPartitionProperty.REPLICATION_NUM,
+                //        String.valueOf(ReplicaAllocation.DEFAULT_ALLOCATION.getTotalReplicaNum()))
+                //.put(DynamicPartitionProperty.REPLICATION_ALLOCATION,
+                //        ReplicaAllocation.DEFAULT_ALLOCATION.toCreateStmt())
                 .build();
     }
 
