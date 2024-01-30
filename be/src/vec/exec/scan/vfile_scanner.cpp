@@ -53,6 +53,9 @@
 #include "vec/data_types/data_type_nullable.h"
 #include "vec/data_types/data_type_number.h"
 #include "vec/data_types/data_type_string.h"
+
+#undef BOOL
+
 #include "vec/exec/format/arrow/arrow_stream_reader.h"
 #include "vec/exec/format/avro/avro_jni_reader.h"
 #include "vec/exec/format/csv/csv_reader.h"

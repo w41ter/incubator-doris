@@ -26,6 +26,7 @@ namespace doris {
 CloudDeltaWriter::CloudDeltaWriter(CloudStorageEngine& engine, const WriteRequest& req,
                                    RuntimeProfile* profile, const UniqueId& load_id)
         : BaseDeltaWriter(req, profile, load_id) {
+    DCHECK_GT(req.txn_expiration, 0);
     _rowset_builder = std::make_unique<CloudRowsetBuilder>(engine, req, profile);
 }
 

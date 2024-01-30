@@ -17,6 +17,7 @@
 
 #include "cloud/cloud_backend_service.h"
 
+#include "common/config.h"
 #include "util/thrift_server.h"
 
 namespace doris {
