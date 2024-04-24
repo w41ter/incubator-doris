@@ -145,13 +145,15 @@ static std::string build_info() {
     return ss.str();
 }
 
-// TODO(gavin): add doris cloud role to the metrics name
-bvar::Status<uint64_t> doris_cloud_version_metrics("doris_cloud_version", [] {
-    std::stringstream ss;
-    ss << DORIS_CLOUD_BUILD_VERSION_MAJOR << 0 << DORIS_CLOUD_BUILD_VERSION_MINOR << 0
-       << DORIS_CLOUD_BUILD_VERSION_PATCH;
-    return std::strtoul(ss.str().c_str(), nullptr, 10);
-}());
+// clang-format off
+// TODO(gavin): add selectdb cloud role to the metrics name
+bvar::Status<uint64_t> selectdb_cloud_version_metrics("selectdb_cloud_version",
+    [] { std::stringstream ss;
+        ss << DORIS_CLOUD_BUILD_VERSION_MAJOR << 0 << DORIS_CLOUD_BUILD_VERSION_MINOR << 0 << DORIS_CLOUD_BUILD_VERSION_PATCH;
+        if (DORIS_CLOUD_BUILD_VERSION_HOTFIX > 0) ss << 0 << DORIS_CLOUD_BUILD_VERSION_HOTFIX;
+        return std::strtoul(ss.str().c_str(), nullptr, 10);
+    }());
+// clang-format on
 
 namespace brpc {
 DECLARE_uint64(max_body_size);
@@ -193,7 +195,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    auto pid_file_fd_holder = gen_pidfile("doris_cloud");
+    auto pid_file_fd_holder = gen_pidfile("selectdb_cloud");
     if (pid_file_fd_holder == nullptr) {
         return -1;
     }

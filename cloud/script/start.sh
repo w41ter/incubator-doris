@@ -40,7 +40,7 @@ for arg; do
 done
 # echo "$@" "daemonized=${daemonized}"}
 
-process=doris_cloud
+process=selectdb_cloud
 
 if [[ -f "${DORIS_HOME}/bin/${process}.pid" ]]; then
     pid=$(cat "${DORIS_HOME}/bin/${process}.pid")
@@ -55,7 +55,7 @@ if [[ -f "${DORIS_HOME}/bin/${process}.pid" ]]; then
 fi
 
 lib_path="${DORIS_HOME}/lib"
-bin="${DORIS_HOME}/lib/doris_cloud"
+bin="${DORIS_HOME}/lib/${process}"
 if ldd "${bin}" | grep -Ei 'libfdb_c.*not found' &>/dev/null; then
     if ! command -v patchelf &>/dev/null; then
         echo "patchelf is needed to launch meta_service"
@@ -65,7 +65,7 @@ if ldd "${bin}" | grep -Ei 'libfdb_c.*not found' &>/dev/null; then
     ldd "${bin}"
 fi
 
-chmod 550 "${DORIS_HOME}/lib/doris_cloud"
+chmod 550 "${DORIS_HOME}/lib/${process}"
 
 if [[ -z "${JAVA_HOME}" ]]; then
     echo "The JAVA_HOME environment variable is not defined correctly"
