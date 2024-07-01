@@ -120,6 +120,9 @@ echo \$new_line >> ./bin/regression-test/conf/regression-conf-custom.groovy
 new_line="\$(sed -n '/^s3Prefix/p' \$CONF_FILE)"
 echo \$new_line >> ./bin/regression-test/conf/regression-conf-custom.groovy
 
+new_line="\$(sed -n '/^s3Provider/p' \$CONF_FILE)"
+echo \$new_line >> ./bin/regression-test/conf/regression-conf-custom.groovy
+
 new_line="cloudVersion=\"\$CLOUD_VERSION\""
 echo \$new_line >> ./bin/regression-test/conf/regression-conf-custom.groovy
 
