@@ -66,7 +66,7 @@ exit_flag=0
     shopt -s inherit_errexit
 
     host="127.0.0.1"
-    query_port=$(get_doris_conf_value "${DORIS_HOME}"/fe/conf/fe.conf query_port)
+    query_port=$(get_doris_conf_value "${DORIS_HOME}"/fe/conf query_port)
     backup_session_variables_file="${teamcity_build_checkoutDir}/regression-test/pipeline/performance/clickbench/conf/backup_session_variables.sql"
     opt_session_variables_file="${teamcity_build_checkoutDir}/regression-test/pipeline/performance/clickbench/conf/opt_session_variables.sql"
 

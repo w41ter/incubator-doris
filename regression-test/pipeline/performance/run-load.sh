@@ -60,8 +60,8 @@ echo "#### Run tpch test on Doris ####"
 DORIS_HOME="${teamcity_build_checkoutDir}/output"
 export DORIS_HOME
 data_home="/data/clickbench/"
-query_port=$(get_doris_conf_value "${DORIS_HOME}"/fe/conf/fe.conf query_port)
-http_port=$(get_doris_conf_value "${DORIS_HOME}"/fe/conf/fe.conf http_port)
+query_port=$(get_doris_conf_value "${DORIS_HOME}"/fe/conf query_port)
+http_port=$(get_doris_conf_value "${DORIS_HOME}"/fe/conf http_port)
 clt="mysql -h127.0.0.1 -P${query_port} -uroot "
 DB="load_test_db"
 exit_flag=0
