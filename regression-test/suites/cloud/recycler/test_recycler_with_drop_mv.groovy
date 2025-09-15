@@ -76,7 +76,7 @@ suite("test_recycler_with_drop_mv") {
     HashSet<String> tabletIdSet3 = tabletIdSet2.stream().filter(tabletId -> !tabletIdSet1.contains(tabletId)).collect(Collectors.toSet());
     logger.info("tabletIdSet3:${tabletIdSet3}")
     assertTrue(tabletIdSet3.size() > 0)
-    rowCount = sql "select count(*) from ${tableName}"
+    def rowCount = sql "select count(*) from ${tableName}"
     logger.info("rowCount:{}", rowCount)
     assertEquals(rowCount[0][0], 150000)
 
