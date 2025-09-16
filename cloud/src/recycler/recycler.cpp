@@ -70,6 +70,10 @@
 #include "recycler/sync_executor.h"
 #include "recycler/util.h"
 
+#ifdef FEATURE_ENTERPRISE_SNAPSHOT
+#include "enterprise/snapshot/snapshot_manager.h"
+#endif
+
 namespace doris::cloud {
 
 using namespace std::chrono;
@@ -207,7 +211,11 @@ Recycler::Recycler(std::shared_ptr<TxnKv> txn_kv) : txn_kv_(std::move(txn_kv)) {
                                     std::move(group_recycle_function_pool));
 
     txn_lazy_committer_ = std::make_shared<TxnLazyCommitter>(txn_kv_);
+#ifdef FEATURE_ENTERPRISE_SNAPSHOT
+    snapshot_manager_ = std::make_shared<selectdb::SnapshotManager>(txn_kv_);
+#else
     snapshot_manager_ = std::make_shared<SnapshotManager>(txn_kv_);
+#endif
 }
 
 Recycler::~Recycler() {
