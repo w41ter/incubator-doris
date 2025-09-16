@@ -55,7 +55,7 @@ public:
                                                Versionstamp* snapshot_version,
                                                const SnapshotPB* snapshot_pb);
 
-private:
+protected:
     SnapshotManager(const SnapshotManager&) = delete;
     SnapshotManager& operator=(const SnapshotManager&) = delete;
 
