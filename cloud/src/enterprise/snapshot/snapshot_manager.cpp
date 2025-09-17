@@ -20,6 +20,7 @@ using doris::cloud::Versionstamp;
 using doris::cloud::InstanceInfoPB;
 using doris::cloud::SnapshotPB;
 using doris::cloud::SnapshotStatus;
+using doris::cloud::SnapshotSwitchStatus;
 using doris::cloud::SnapshotType;
 using doris::cloud::encode_versioned_key;
 using doris::cloud::decode_versioned_key;
@@ -144,6 +145,12 @@ void SnapshotManager::begin_snapshot(std::string_view instance_id,
     if (!instance.ParseFromString(val)) {
         status->set_code(MetaServiceCode::PROTOBUF_PARSE_ERR);
         status->set_msg("failed to parse InstanceInfoPB");
+        return;
+    }
+
+    if (instance.snapshot_switch_status() != SnapshotSwitchStatus::SNAPSHOT_SWITCH_ON) {
+        status->set_code(MetaServiceCode::INVALID_ARGUMENT);
+        status->set_msg("failed to begin snapshot, because the snapshot feature is disabled");
         return;
     }
 
