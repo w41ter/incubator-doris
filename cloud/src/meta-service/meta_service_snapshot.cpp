@@ -127,7 +127,7 @@ void MetaServiceImpl::clone_instance(::google::protobuf::RpcController* controll
     RPC_PREPROCESS(clone_instance, get, put, del);
     RPC_RATE_LIMIT(clone_instance);
 
-    snapshot_manager_->clone_instance(instance_id, *request, response);
+    snapshot_manager_->clone_instance(*request, response);
     code = response->status().code();
     msg = response->status().msg();
 }
