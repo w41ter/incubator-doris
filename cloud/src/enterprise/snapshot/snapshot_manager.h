@@ -31,8 +31,7 @@ public:
     void list_snapshot(std::string_view instance_id,
                        const doris::cloud::ListSnapshotRequest& request,
                        doris::cloud::ListSnapshotResponse* response) override;
-    void clone_instance(std::string_view instance_id,
-                        const doris::cloud::CloneInstanceRequest& request,
+    void clone_instance(const doris::cloud::CloneInstanceRequest& request,
                         doris::cloud::CloneInstanceResponse* response) override;
 
     // Recycle snapshots that are expired or marked as recycled, based on the retention policy.
