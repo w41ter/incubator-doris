@@ -544,7 +544,11 @@ InstanceRecycler::InstanceRecycler(std::shared_ptr<TxnKv> txn_kv, const Instance
           inverted_index_id_cache_(std::make_unique<InvertedIndexIdCache>(instance_id_, txn_kv_)),
           _thread_pool_group(std::move(thread_pool_group)),
           txn_lazy_committer_(std::move(txn_lazy_committer)) {
+#ifdef FEATURE_ENTERPRISE_SNAPSHOT
+    snapshot_manager_ = std::make_shared<selectdb::SnapshotManager>(txn_kv_);
+#else
     snapshot_manager_ = std::make_shared<SnapshotManager>(txn_kv_);
+#endif
 };
 
 InstanceRecycler::~InstanceRecycler() = default;

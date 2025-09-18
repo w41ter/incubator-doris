@@ -1,11 +1,13 @@
 # where to put generated libraries
 set(LIBRARY_OUTPUT_PATH "${BUILD_DIR}/src/enterprise/snapshot/")
 
-set(ENTERPRISE_SNAPSHOT_SOURCES snapshot_manager.cpp)
+set(ENTERPRISE_SNAPSHOT_SOURCES
+    recycle_snapshot.cpp
+    snapshot_manager.cpp)
 
 add_compile_definitions(-DFEATURE_ENTERPRISE_SNAPSHOT)
 add_library(EnterpriseSnapshot STATIC ${ENTERPRISE_SNAPSHOT_SOURCES})
-target_include_directories(EnterpriseSnapshot PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/)
 
 # Export the library to parent scope
 set(DORIS_CLOUD_LIBS EnterpriseSnapshot ${DORIS_CLOUD_LIBS} PARENT_SCOPE)
+set(DORIS_ADDITIONAL_DEFINITIONS -DFEATURE_ENTERPRISE_SNAPSHOT ${DORIS_ADDITIONAL_DEFINITIONS} PARENT_SCOPE)

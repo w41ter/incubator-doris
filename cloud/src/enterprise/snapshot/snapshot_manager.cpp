@@ -773,19 +773,4 @@ void SnapshotManager::clone_instance(const doris::cloud::CloneInstanceRequest& r
     response->mutable_status()->set_msg("Not implemented");
 }
 
-// Recycle snapshots that are expired or marked as recycled, based on the retention policy.
-// Return 0 for success otherwise error.
-int SnapshotManager::recycle_snapshots(doris::cloud::InstanceRecycler* recycler) {
-    return 0; // Not implemented
-}
-
-// Recycle snapshot meta and data, return 0 for success otherwise error.
-int SnapshotManager::recycle_snapshot_meta_and_data(std::string_view instance_id,
-                                                    std::string_view resource_id,
-                                                    doris::cloud::StorageVaultAccessor* accessor,
-                                                    doris::cloud::Versionstamp snapshot_version,
-                                                    const doris::cloud::SnapshotPB& snapshot_pb) {
-    return 0;
-}
-
 } // namespace selectdb
