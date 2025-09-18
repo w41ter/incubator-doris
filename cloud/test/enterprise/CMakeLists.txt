@@ -10,4 +10,6 @@ message(STATUS "Enable enterprise edition tests")
 
 # ATTN: adding prefix "enterprise_" to avoid name conflict with the open source tests
 add_executable(enterprise_meta_service_snapshot_test meta_service_snapshot_test.cpp)
+add_executable(enterprise_meta_service_http_test meta_service_http_test.cpp)
 target_link_libraries(enterprise_meta_service_snapshot_test ${TEST_LINK_LIBS})
+target_link_libraries(enterprise_meta_service_http_test ${TEST_LINK_LIBS})

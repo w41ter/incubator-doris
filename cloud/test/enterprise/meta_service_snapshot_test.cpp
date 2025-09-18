@@ -14,11 +14,17 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+#include <brpc/channel.h>
 #include <brpc/controller.h>
 #include <fmt/format.h>
 #include <gen_cpp/cloud.pb.h>
 #include <gen_cpp/olap_file.pb.h>
+#include <google/protobuf/util/json_util.h>
 #include <gtest/gtest.h>
+#include <rapidjson/document.h>
+#include <rapidjson/error/en.h>
+#include <rapidjson/prettywriter.h>
+#include <rapidjson/stringbuffer.h>
 
 #include <cstdint>
 #include <functional>
@@ -26,6 +32,7 @@
 #include <string>
 
 #include "common/defer.h"
+#include "common/util.h"
 #include "cpp/sync_point.h"
 #include "enterprise/snapshot/snapshot_manager.h"
 #include "meta-service/meta_service.h"
@@ -147,7 +154,7 @@ TEST(MetaServiceSnapshotTest, BeginSnapshotTest) {
         ASSERT_EQ(txn->get(instance_key_str, &instance_value), TxnErrorCode::TXN_OK);
         InstanceInfoPB instance_info;
         ASSERT_TRUE(instance_info.ParseFromString(instance_value));
-        instance_info.set_multi_version_status(MultiVersionStatus::MULTI_VERSION_ENABLED);
+        instance_info.set_snapshot_switch_status(SnapshotSwitchStatus::SNAPSHOT_SWITCH_ON);
         txn->put(instance_key_str, instance_info.SerializeAsString());
         ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
     }
@@ -387,6 +394,20 @@ TEST(MetaServiceSnapshotTest, CommitSnapshotTest) {
         meta_service->create_instance(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
                                       &req, &res, nullptr);
         ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+    }
+
+    // Enable multi version for the test instance
+    {
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(meta_service->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+        std::string instance_key_str = instance_key("test_instance");
+        std::string instance_value;
+        ASSERT_EQ(txn->get(instance_key_str, &instance_value), TxnErrorCode::TXN_OK);
+        InstanceInfoPB instance_info;
+        ASSERT_TRUE(instance_info.ParseFromString(instance_value));
+        instance_info.set_snapshot_switch_status(SnapshotSwitchStatus::SNAPSHOT_SWITCH_ON);
+        txn->put(instance_key_str, instance_info.SerializeAsString());
+        ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
     }
 
     // Begin a snapshot first
@@ -711,6 +732,20 @@ TEST(MetaServiceSnapshotTest, AbortSnapshotTest) {
         ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
     }
 
+    // Enable multi version for the test instance
+    {
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(meta_service->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+        std::string instance_key_str = instance_key("test_instance");
+        std::string instance_value;
+        ASSERT_EQ(txn->get(instance_key_str, &instance_value), TxnErrorCode::TXN_OK);
+        InstanceInfoPB instance_info;
+        ASSERT_TRUE(instance_info.ParseFromString(instance_value));
+        instance_info.set_snapshot_switch_status(SnapshotSwitchStatus::SNAPSHOT_SWITCH_ON);
+        txn->put(instance_key_str, instance_info.SerializeAsString());
+        ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+    }
+
     // Create a snapshot first to test abort
     std::string snapshot_id;
     {
@@ -933,6 +968,794 @@ TEST(MetaServiceSnapshotTest, AbortSnapshotTest) {
                     res.status().msg().find("cannot abort snapshot that is already committed") !=
                     std::string::npos);
         }
+    }
+}
+
+TEST(MetaServiceSnapshotTest, ListSnapshotTest) {
+    auto meta_service = get_meta_service(true);
+    const char* const cloud_unique_id = "test_cloud_unique_id";
+
+    // Setup SyncPoint for encryption
+    auto* sp = SyncPoint::get_instance();
+    sp->enable_processing();
+    sp->set_call_back("encrypt_ak_sk:get_encryption_key", [](auto&& args) {
+        auto* ret = try_any_cast<int*>(args[0]);
+        *ret = 0;
+        auto* key = try_any_cast<std::string*>(args[1]);
+        *key = "selectdbselectdbselectdbselectdb";
+        auto* key_id = try_any_cast<int64_t*>(args[2]);
+        *key_id = 1;
+    });
+
+    // Cleanup SyncPoint when test finishes
+    DORIS_CLOUD_DEFER {
+        sp->disable_processing();
+        sp->clear_all_call_backs();
+    };
+
+    // Create test instance first
+    {
+        brpc::Controller cntl;
+        CreateInstanceRequest req;
+        req.set_instance_id("test_instance");
+        req.set_user_id("test_user");
+        req.set_name("test_name");
+        ObjectStoreInfoPB obj;
+        obj.set_ak("123");
+        obj.set_sk("321");
+        obj.set_bucket("456");
+        obj.set_prefix("654");
+        obj.set_endpoint("789");
+        obj.set_region("987");
+        obj.set_external_endpoint("888");
+        obj.set_provider(ObjectStoreInfoPB::BOS);
+        req.mutable_obj_info()->CopyFrom(obj);
+
+        CreateInstanceResponse res;
+        meta_service->create_instance(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                      &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+    }
+
+    // Enable multi version for the test instance
+    {
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(meta_service->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+        std::string instance_key_str = instance_key("test_instance");
+        std::string instance_value;
+        ASSERT_EQ(txn->get(instance_key_str, &instance_value), TxnErrorCode::TXN_OK);
+        InstanceInfoPB instance_info;
+        ASSERT_TRUE(instance_info.ParseFromString(instance_value));
+        instance_info.set_snapshot_switch_status(SnapshotSwitchStatus::SNAPSHOT_SWITCH_ON);
+        txn->put(instance_key_str, instance_info.SerializeAsString());
+        ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+    }
+
+    // Test invalid argument - empty cloud_unique_id
+    {
+        brpc::Controller cntl;
+        ListSnapshotRequest req;
+        ListSnapshotResponse res;
+        meta_service->list_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+        ASSERT_TRUE(res.status().msg().find("cloud_unique_id not set") != std::string::npos);
+    }
+
+    // Test with invalid IP address
+    {
+        brpc::Controller cntl;
+        ListSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_request_ip("invalid.ip.format");
+        ListSnapshotResponse res;
+        meta_service->list_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+        ASSERT_TRUE(res.status().msg().find("invalid request IP address format") !=
+                    std::string::npos);
+    }
+
+    // Test list snapshots when no snapshots exist
+    {
+        brpc::Controller cntl;
+        ListSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        ListSnapshotResponse res;
+        meta_service->list_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+        ASSERT_EQ(res.snapshots_size(), 0);
+    }
+
+    // Create several snapshots for testing
+    std::vector<std::string> snapshot_ids;
+    std::vector<std::string> image_urls;
+
+    // Create first snapshot
+    {
+        brpc::Controller cntl;
+        BeginSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_timeout_seconds(3600);
+        req.set_auto_snapshot(true);
+        req.set_ttl_seconds(7200);
+        req.set_snapshot_label("first_snapshot");
+        BeginSnapshotResponse res;
+        meta_service->begin_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                     &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+        snapshot_ids.push_back(res.snapshot_id());
+        std::cout << res.snapshot_id() << std::endl;
+        image_urls.push_back(res.image_url());
+    }
+
+    // Create second snapshot
+    {
+        brpc::Controller cntl;
+        BeginSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_timeout_seconds(1800);
+        req.set_auto_snapshot(false);
+        req.set_ttl_seconds(3600);
+        req.set_snapshot_label("second_snapshot");
+        BeginSnapshotResponse res;
+        meta_service->begin_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                     &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+        snapshot_ids.push_back(res.snapshot_id());
+        std::cout << res.snapshot_id() << std::endl;
+        image_urls.push_back(res.image_url());
+    }
+
+    // Create third snapshot
+    {
+        brpc::Controller cntl;
+        BeginSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_timeout_seconds(5400);
+        req.set_auto_snapshot(true);
+        req.set_ttl_seconds(10800);
+        req.set_snapshot_label("third_snapshot");
+        BeginSnapshotResponse res;
+        meta_service->begin_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                     &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+        snapshot_ids.push_back(res.snapshot_id());
+        std::cout << res.snapshot_id() << std::endl;
+        image_urls.push_back(res.image_url());
+    }
+
+    // Commit the first snapshot
+    {
+        brpc::Controller cntl;
+        CommitSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_snapshot_id(snapshot_ids[0]);
+        req.set_image_url(image_urls[0]);
+        req.set_last_journal_id(12345);
+        CommitSnapshotResponse res;
+        meta_service->commit_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                      &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+    }
+
+    // Abort the second snapshot
+    {
+        brpc::Controller cntl;
+        AbortSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_snapshot_id(snapshot_ids[1]);
+        req.set_reason("Test abort for list");
+        AbortSnapshotResponse res;
+        meta_service->abort_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                     &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+    }
+
+    // Test list all snapshots (excluding aborted by default)
+    {
+        brpc::Controller cntl;
+        ListSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        ListSnapshotResponse res;
+        meta_service->list_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+        ASSERT_EQ(res.snapshots_size(), 2); // Should exclude the aborted snapshot
+
+        // Check that we have the committed and prepare snapshots, but NOT the aborted one
+        bool found_committed = false;
+        bool found_prepare = false;
+        bool found_aborted = false;
+        for (const auto& snapshot : res.snapshots()) {
+            if (snapshot.snapshot_id() == snapshot_ids[0]) {
+                found_committed = true;
+                ASSERT_EQ(snapshot.status(), SNAPSHOT_NORMAL);
+                ASSERT_EQ(snapshot.snapshot_label(), "first_snapshot");
+                ASSERT_EQ(snapshot.journal_id(), 12345);
+                ASSERT_TRUE(snapshot.has_image_url());
+            } else if (snapshot.snapshot_id() == snapshot_ids[1]) {
+                found_aborted = true; // This should NOT happen in default behavior
+            } else if (snapshot.snapshot_id() == snapshot_ids[2]) {
+                found_prepare = true;
+                ASSERT_EQ(snapshot.status(), SNAPSHOT_PREPARE);
+                ASSERT_EQ(snapshot.snapshot_label(), "third_snapshot");
+            }
+        }
+        ASSERT_TRUE(found_committed);
+        ASSERT_TRUE(found_prepare);
+        ASSERT_FALSE(found_aborted); // Ensure aborted snapshot is NOT included by default
+    }
+
+    // Test list all snapshots including aborted
+    {
+        brpc::Controller cntl;
+        ListSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_include_aborted(true);
+        ListSnapshotResponse res;
+        meta_service->list_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+        ASSERT_EQ(res.snapshots_size(), 3); // Should include all snapshots
+
+        // Check that we have all three snapshots
+        bool found_committed = false;
+        bool found_aborted = false;
+        bool found_prepare = false;
+        for (const auto& snapshot : res.snapshots()) {
+            if (snapshot.snapshot_id() == snapshot_ids[0]) {
+                found_committed = true;
+                ASSERT_EQ(snapshot.status(), SNAPSHOT_NORMAL);
+            } else if (snapshot.snapshot_id() == snapshot_ids[1]) {
+                found_aborted = true;
+                ASSERT_EQ(snapshot.status(), SNAPSHOT_ABORTED);
+                ASSERT_EQ(snapshot.reason(), "Test abort for list");
+            } else if (snapshot.snapshot_id() == snapshot_ids[2]) {
+                found_prepare = true;
+                ASSERT_EQ(snapshot.status(), SNAPSHOT_PREPARE);
+            }
+        }
+        ASSERT_TRUE(found_committed);
+        ASSERT_TRUE(found_aborted);
+        ASSERT_TRUE(found_prepare);
+    }
+
+    // Test optimized query - list specific snapshot (committed)
+    {
+        brpc::Controller cntl;
+        ListSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_required_snapshot_id(snapshot_ids[0]); // Query specific committed snapshot
+        ListSnapshotResponse res;
+        meta_service->list_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+        ASSERT_EQ(res.snapshots_size(), 1);
+
+        const auto& snapshot = res.snapshots(0);
+        ASSERT_EQ(snapshot.snapshot_id(), snapshot_ids[0]);
+        ASSERT_EQ(snapshot.status(), SNAPSHOT_NORMAL);
+        ASSERT_EQ(snapshot.snapshot_label(), "first_snapshot");
+        ASSERT_EQ(snapshot.journal_id(), 12345);
+        ASSERT_TRUE(snapshot.has_image_url());
+        ASSERT_TRUE(snapshot.has_finish_at());
+    }
+
+    // Test optimized query - list specific snapshot (aborted, not included by default)
+    {
+        brpc::Controller cntl;
+        ListSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_required_snapshot_id(snapshot_ids[1]); // Query specific aborted snapshot
+        ListSnapshotResponse res;
+        meta_service->list_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+        ASSERT_EQ(res.snapshots_size(),
+                  0); // Should be empty since aborted snapshots are excluded by default
+    }
+
+    // Test optimized query - list specific snapshot (aborted, included with flag)
+    {
+        brpc::Controller cntl;
+        ListSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_required_snapshot_id(snapshot_ids[1]); // Query specific aborted snapshot
+        req.set_include_aborted(true);
+        ListSnapshotResponse res;
+        meta_service->list_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+        ASSERT_EQ(res.snapshots_size(), 1);
+
+        const auto& snapshot = res.snapshots(0);
+        ASSERT_EQ(snapshot.snapshot_id(), snapshot_ids[1]);
+        ASSERT_EQ(snapshot.status(), SNAPSHOT_ABORTED);
+        ASSERT_EQ(snapshot.snapshot_label(), "second_snapshot");
+        ASSERT_EQ(snapshot.reason(), "Test abort for list");
+        ASSERT_TRUE(snapshot.has_finish_at());
+    }
+
+    // Test optimized query - list specific snapshot (prepare)
+    {
+        brpc::Controller cntl;
+        ListSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_required_snapshot_id(snapshot_ids[2]); // Query specific prepare snapshot
+        ListSnapshotResponse res;
+        meta_service->list_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+        ASSERT_EQ(res.snapshots_size(), 1);
+
+        const auto& snapshot = res.snapshots(0);
+        ASSERT_EQ(snapshot.snapshot_id(), snapshot_ids[2]);
+        ASSERT_EQ(snapshot.status(), SNAPSHOT_PREPARE);
+        ASSERT_EQ(snapshot.snapshot_label(), "third_snapshot");
+        ASSERT_EQ(snapshot.timeout_seconds(), 5400);
+        ASSERT_EQ(snapshot.ttl_seconds(), 10800);
+        ASSERT_TRUE(snapshot.auto_snapshot());
+    }
+
+    // Test optimized query - list non-existent snapshot
+    {
+        brpc::Controller cntl;
+        ListSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_required_snapshot_id("12345678900987654321"); // Non-existent snapshot
+        ListSnapshotResponse res;
+        meta_service->list_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+        ASSERT_EQ(res.snapshots_size(), 0); // Should return empty result
+    }
+
+    // Test optimized query - invalid snapshot ID format
+    {
+        brpc::Controller cntl;
+        ListSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_required_snapshot_id("invalid_id"); // Invalid format (not 10 bytes)
+        ListSnapshotResponse res;
+        meta_service->list_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+        ASSERT_TRUE(res.status().msg().find("invalid snapshot_id format") != std::string::npos);
+    }
+
+    // Test with valid IP addresses
+    {
+        brpc::Controller cntl;
+        ListSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_request_ip("192.168.1.100");
+        ListSnapshotResponse res;
+        meta_service->list_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+        ASSERT_GE(res.snapshots_size(), 0);
+    }
+
+    // Test with IPv6 address
+    {
+        brpc::Controller cntl;
+        ListSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_request_ip("2001:db8::1");
+        ListSnapshotResponse res;
+        meta_service->list_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+        ASSERT_GE(res.snapshots_size(), 0);
+    }
+}
+
+TEST(MetaServiceSnapshotTest, DropSnapshotTest) {
+    auto meta_service = get_meta_service(true);
+    const char* const cloud_unique_id = "test_cloud_unique_id";
+
+    // Setup SyncPoint for encryption
+    auto* sp = SyncPoint::get_instance();
+    sp->enable_processing();
+    sp->set_call_back("encrypt_ak_sk:get_encryption_key", [](auto&& args) {
+        auto* ret = try_any_cast<int*>(args[0]);
+        *ret = 0;
+        auto* key = try_any_cast<std::string*>(args[1]);
+        *key = "selectdbselectdbselectdbselectdb";
+        auto* key_id = try_any_cast<int64_t*>(args[2]);
+        *key_id = 1;
+    });
+
+    // Cleanup SyncPoint when test finishes
+    DORIS_CLOUD_DEFER {
+        sp->disable_processing();
+        sp->clear_all_call_backs();
+    };
+
+    // Create test instance first
+    {
+        brpc::Controller cntl;
+        CreateInstanceRequest req;
+        req.set_instance_id("test_instance");
+        req.set_user_id("test_user");
+        req.set_name("test_name");
+        ObjectStoreInfoPB obj;
+        obj.set_ak("123");
+        obj.set_sk("321");
+        obj.set_bucket("456");
+        obj.set_prefix("654");
+        obj.set_endpoint("789");
+        obj.set_region("987");
+        obj.set_external_endpoint("888");
+        obj.set_provider(ObjectStoreInfoPB::BOS);
+        req.mutable_obj_info()->CopyFrom(obj);
+
+        CreateInstanceResponse res;
+        meta_service->create_instance(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                      &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+    }
+
+    // Enable multi version for the test instance
+    {
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(meta_service->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+        std::string instance_key_str = instance_key("test_instance");
+        std::string instance_value;
+        ASSERT_EQ(txn->get(instance_key_str, &instance_value), TxnErrorCode::TXN_OK);
+        InstanceInfoPB instance_info;
+        ASSERT_TRUE(instance_info.ParseFromString(instance_value));
+        instance_info.set_snapshot_switch_status(SnapshotSwitchStatus::SNAPSHOT_SWITCH_ON);
+        txn->put(instance_key_str, instance_info.SerializeAsString());
+        ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+    }
+
+    // Test invalid argument - empty cloud_unique_id
+    {
+        brpc::Controller cntl;
+        DropSnapshotRequest req;
+        req.set_snapshot_id("1234567890abcdef1234");
+        DropSnapshotResponse res;
+        meta_service->drop_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+        ASSERT_TRUE(res.status().msg().find("cloud_unique_id not set") != std::string::npos);
+    }
+
+    // Test invalid argument - empty snapshot_id
+    {
+        brpc::Controller cntl;
+        DropSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        DropSnapshotResponse res;
+        meta_service->drop_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+        ASSERT_TRUE(res.status().msg().find("snapshot_id not set") != std::string::npos);
+    }
+
+    // Test invalid argument - invalid IP address
+    {
+        brpc::Controller cntl;
+        DropSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_snapshot_id("1234567890abcdef1234");
+        req.set_request_ip("invalid.ip.format");
+        DropSnapshotResponse res;
+        meta_service->drop_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+        ASSERT_TRUE(res.status().msg().find("invalid request IP address format") !=
+                    std::string::npos);
+    }
+
+    // Test invalid snapshot_id format - wrong length
+    {
+        brpc::Controller cntl;
+        DropSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_snapshot_id("invalid_length");
+        DropSnapshotResponse res;
+        meta_service->drop_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+        ASSERT_TRUE(res.status().msg().find("invalid snapshot_id format") != std::string::npos);
+    }
+
+    // Test drop non-existent snapshot
+    {
+        brpc::Controller cntl;
+        DropSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_snapshot_id("1234567890abcdef1234"); // Non-existent snapshot ID
+        DropSnapshotResponse res;
+        meta_service->drop_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::TXN_ID_NOT_FOUND);
+        ASSERT_TRUE(res.status().msg().find("snapshot not found") != std::string::npos);
+    }
+
+    // Create snapshots for testing drop functionality
+    std::string committed_snapshot_id;
+    std::string aborted_snapshot_id;
+    std::string prepare_snapshot_id;
+
+    // Create and commit a snapshot
+    {
+        brpc::Controller cntl;
+        BeginSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_timeout_seconds(3600);
+        req.set_auto_snapshot(true);
+        req.set_ttl_seconds(7200);
+        req.set_snapshot_label("test_drop_committed");
+        BeginSnapshotResponse res;
+        meta_service->begin_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                     &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+        committed_snapshot_id = res.snapshot_id();
+
+        // Commit it
+        CommitSnapshotRequest commit_req;
+        commit_req.set_cloud_unique_id(cloud_unique_id);
+        commit_req.set_snapshot_id(committed_snapshot_id);
+        commit_req.set_image_url(res.image_url());
+        commit_req.set_last_journal_id(12345);
+        CommitSnapshotResponse commit_res;
+        meta_service->commit_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                      &commit_req, &commit_res, nullptr);
+        ASSERT_EQ(commit_res.status().code(), MetaServiceCode::OK);
+    }
+
+    // Create and abort a snapshot
+    {
+        brpc::Controller cntl;
+        BeginSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_timeout_seconds(3600);
+        req.set_auto_snapshot(false);
+        req.set_ttl_seconds(7200);
+        req.set_snapshot_label("test_drop_aborted");
+        BeginSnapshotResponse res;
+        meta_service->begin_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                     &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+        aborted_snapshot_id = res.snapshot_id();
+
+        // Abort it
+        AbortSnapshotRequest abort_req;
+        abort_req.set_cloud_unique_id(cloud_unique_id);
+        abort_req.set_snapshot_id(aborted_snapshot_id);
+        abort_req.set_reason("Test abort for drop");
+        AbortSnapshotResponse abort_res;
+        meta_service->abort_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                     &abort_req, &abort_res, nullptr);
+        ASSERT_EQ(abort_res.status().code(), MetaServiceCode::OK);
+    }
+
+    // Create a snapshot in prepare state
+    {
+        brpc::Controller cntl;
+        BeginSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_timeout_seconds(3600);
+        req.set_auto_snapshot(true);
+        req.set_ttl_seconds(7200);
+        req.set_snapshot_label("test_drop_prepare");
+        BeginSnapshotResponse res;
+        meta_service->begin_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                     &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+        prepare_snapshot_id = res.snapshot_id();
+    }
+
+    // Test drop snapshot in prepare state (should fail)
+    {
+        brpc::Controller cntl;
+        DropSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_snapshot_id(prepare_snapshot_id);
+        DropSnapshotResponse res;
+        meta_service->drop_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+        ASSERT_TRUE(res.status().msg().find("cannot drop snapshot that is not in final state") !=
+                    std::string::npos);
+    }
+
+    // Test successful drop of committed snapshot
+    {
+        brpc::Controller cntl;
+        DropSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_snapshot_id(committed_snapshot_id);
+        DropSnapshotResponse res;
+        meta_service->drop_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+    }
+
+    // Test successful drop of aborted snapshot
+    {
+        brpc::Controller cntl;
+        DropSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_snapshot_id(aborted_snapshot_id);
+        DropSnapshotResponse res;
+        meta_service->drop_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+    }
+
+    // Test drop already dropped snapshot (should fail)
+    {
+        brpc::Controller cntl;
+        DropSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_snapshot_id(committed_snapshot_id);
+        DropSnapshotResponse res;
+        meta_service->drop_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::TXN_ID_NOT_FOUND);
+        ASSERT_TRUE(res.status().msg().find("snapshot not found") != std::string::npos);
+    }
+
+    // Test with valid IPv4 address
+    {
+        // Create another committed snapshot for IP test
+        std::string ip_test_snapshot_id;
+        {
+            brpc::Controller cntl;
+            BeginSnapshotRequest req;
+            req.set_cloud_unique_id(cloud_unique_id);
+            req.set_timeout_seconds(3600);
+            req.set_auto_snapshot(true);
+            req.set_ttl_seconds(7200);
+            req.set_snapshot_label("test_drop_with_ip");
+            BeginSnapshotResponse res;
+            meta_service->begin_snapshot(
+                    reinterpret_cast<::google::protobuf::RpcController*>(&cntl), &req, &res,
+                    nullptr);
+            ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+            ip_test_snapshot_id = res.snapshot_id();
+
+            // Commit it
+            CommitSnapshotRequest commit_req;
+            commit_req.set_cloud_unique_id(cloud_unique_id);
+            commit_req.set_snapshot_id(ip_test_snapshot_id);
+            commit_req.set_image_url(res.image_url());
+            commit_req.set_last_journal_id(54321);
+            CommitSnapshotResponse commit_res;
+            meta_service->commit_snapshot(
+                    reinterpret_cast<::google::protobuf::RpcController*>(&cntl), &commit_req,
+                    &commit_res, nullptr);
+            ASSERT_EQ(commit_res.status().code(), MetaServiceCode::OK);
+        }
+
+        brpc::Controller cntl;
+        DropSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_snapshot_id(ip_test_snapshot_id);
+        req.set_request_ip("192.168.1.100");
+        DropSnapshotResponse res;
+        meta_service->drop_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+    }
+
+    // Test with valid IPv6 address
+    {
+        // Create another committed snapshot for IPv6 test
+        std::string ipv6_test_snapshot_id;
+        {
+            brpc::Controller cntl;
+            BeginSnapshotRequest req;
+            req.set_cloud_unique_id(cloud_unique_id);
+            req.set_timeout_seconds(3600);
+            req.set_auto_snapshot(false);
+            req.set_ttl_seconds(7200);
+            req.set_snapshot_label("test_drop_with_ipv6");
+            BeginSnapshotResponse res;
+            meta_service->begin_snapshot(
+                    reinterpret_cast<::google::protobuf::RpcController*>(&cntl), &req, &res,
+                    nullptr);
+            ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+            ipv6_test_snapshot_id = res.snapshot_id();
+
+            // Commit it
+            CommitSnapshotRequest commit_req;
+            commit_req.set_cloud_unique_id(cloud_unique_id);
+            commit_req.set_snapshot_id(ipv6_test_snapshot_id);
+            commit_req.set_image_url(res.image_url());
+            commit_req.set_last_journal_id(67890);
+            CommitSnapshotResponse commit_res;
+            meta_service->commit_snapshot(
+                    reinterpret_cast<::google::protobuf::RpcController*>(&cntl), &commit_req,
+                    &commit_res, nullptr);
+            ASSERT_EQ(commit_res.status().code(), MetaServiceCode::OK);
+        }
+
+        brpc::Controller cntl;
+        DropSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_snapshot_id(ipv6_test_snapshot_id);
+        req.set_request_ip("2001:db8::1");
+        DropSnapshotResponse res;
+        meta_service->drop_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+    }
+
+    // Test with empty IP address (should pass - IP is optional)
+    {
+        // Create another committed snapshot for empty IP test
+        std::string empty_ip_test_snapshot_id;
+        {
+            brpc::Controller cntl;
+            BeginSnapshotRequest req;
+            req.set_cloud_unique_id(cloud_unique_id);
+            req.set_timeout_seconds(3600);
+            req.set_auto_snapshot(true);
+            req.set_ttl_seconds(7200);
+            req.set_snapshot_label("test_drop_empty_ip");
+            BeginSnapshotResponse res;
+            meta_service->begin_snapshot(
+                    reinterpret_cast<::google::protobuf::RpcController*>(&cntl), &req, &res,
+                    nullptr);
+            ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+            empty_ip_test_snapshot_id = res.snapshot_id();
+
+            // Commit it
+            CommitSnapshotRequest commit_req;
+            commit_req.set_cloud_unique_id(cloud_unique_id);
+            commit_req.set_snapshot_id(empty_ip_test_snapshot_id);
+            commit_req.set_image_url(res.image_url());
+            commit_req.set_last_journal_id(98765);
+            CommitSnapshotResponse commit_res;
+            meta_service->commit_snapshot(
+                    reinterpret_cast<::google::protobuf::RpcController*>(&cntl), &commit_req,
+                    &commit_res, nullptr);
+            ASSERT_EQ(commit_res.status().code(), MetaServiceCode::OK);
+        }
+
+        brpc::Controller cntl;
+        DropSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_snapshot_id(empty_ip_test_snapshot_id);
+        req.set_request_ip("");
+        DropSnapshotResponse res;
+        meta_service->drop_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+    }
+
+    // Verify dropped snapshots are no longer listed
+    {
+        brpc::Controller cntl;
+        ListSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_include_aborted(true);
+        ListSnapshotResponse res;
+        meta_service->list_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+
+        // Should only have the prepare snapshot remaining
+        bool found_prepare = false;
+        bool found_dropped = false;
+        for (const auto& snapshot : res.snapshots()) {
+            if (snapshot.snapshot_id() == prepare_snapshot_id) {
+                found_prepare = true;
+                ASSERT_EQ(snapshot.status(), SNAPSHOT_PREPARE);
+            } else if (snapshot.snapshot_id() == committed_snapshot_id ||
+                       snapshot.snapshot_id() == aborted_snapshot_id) {
+                found_dropped = true; // Should not happen
+            }
+        }
+        ASSERT_TRUE(found_prepare);
+        ASSERT_FALSE(found_dropped); // Ensure dropped snapshots are not listed
     }
 }
 } // namespace doris::cloud

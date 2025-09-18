@@ -19,9 +19,12 @@ using doris::cloud::ErrCategory;
 using doris::cloud::Versionstamp;
 using doris::cloud::InstanceInfoPB;
 using doris::cloud::SnapshotPB;
+using doris::cloud::SnapshotInfoPB;
 using doris::cloud::SnapshotStatus;
 using doris::cloud::SnapshotSwitchStatus;
 using doris::cloud::SnapshotType;
+using doris::cloud::FullRangeGetOptions;
+using doris::cloud::RangeKeySelector;
 using doris::cloud::encode_versioned_key;
 using doris::cloud::decode_versioned_key;
 using doris::cloud::hex;
@@ -357,7 +360,6 @@ void SnapshotManager::abort_snapshot(std::string_view instance_id,
         }
     }
 
-    std::string cloud_unique_id = request.cloud_unique_id();
     std::string snapshot_id = request.snapshot_id();
     std::string reason = request.has_reason() ? request.reason() : "Aborted by user";
 
@@ -453,15 +455,316 @@ void SnapshotManager::abort_snapshot(std::string_view instance_id,
 void SnapshotManager::drop_snapshot(std::string_view instance_id,
                                     const doris::cloud::DropSnapshotRequest& request,
                                     doris::cloud::DropSnapshotResponse* response) {
-    response->mutable_status()->set_code(MetaServiceCode::UNDEFINED_ERR);
-    response->mutable_status()->set_msg("Not implemented");
+    auto* status = response->mutable_status();
+    status->set_code(MetaServiceCode::OK);
+    status->set_msg("OK");
+
+    if (!request.has_snapshot_id() || request.snapshot_id().empty()) {
+        status->set_code(MetaServiceCode::INVALID_ARGUMENT);
+        status->set_msg("snapshot_id not set");
+        return;
+    }
+
+    std::string snapshot_id = request.snapshot_id();
+
+    // Validate IP if provided
+    if (request.has_request_ip() && !request.request_ip().empty()) {
+        if (!is_valid_ip_address(request.request_ip())) {
+            status->set_code(MetaServiceCode::INVALID_ARGUMENT);
+            status->set_msg("invalid request IP address format");
+            return;
+        }
+    }
+
+    Versionstamp snapshot_versionstamp;
+    if (!parse_snapshot_versionstamp(snapshot_id, &snapshot_versionstamp)) {
+        status->set_code(MetaServiceCode::INVALID_ARGUMENT);
+        status->set_msg("invalid snapshot_id format");
+        return;
+    }
+
+    std::unique_ptr<Transaction> txn;
+    TxnErrorCode err = txn_kv_->create_txn(&txn);
+    if (err != TxnErrorCode::TXN_OK) {
+        status->set_code(cast_as<ErrCategory::CREATE>(err));
+        status->set_msg("failed to create txn");
+        LOG(WARNING) << status->msg() << " err=" << err;
+        return;
+    }
+
+    // Construct key using instance_id and use snapshot_id as versionstamp
+    std::string snapshot_full_key = versioned::snapshot_full_key({instance_id});
+    std::string snapshot_key = encode_versioned_key(snapshot_full_key, snapshot_versionstamp);
+    std::string snapshot_val;
+    err = txn->get(snapshot_key, &snapshot_val);
+    LOG(INFO) << "get versioned snapshot key=" << hex(snapshot_full_key)
+              << " version=" << snapshot_id;
+
+    if (err != TxnErrorCode::TXN_OK) {
+        if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
+            status->set_code(MetaServiceCode::TXN_ID_NOT_FOUND);
+            status->set_msg("snapshot not found, snapshot_id=" + snapshot_id);
+        } else {
+            status->set_code(cast_as<ErrCategory::READ>(err));
+            status->set_msg("failed to get snapshot, snapshot_id=" + snapshot_id);
+        }
+        LOG(WARNING) << status->msg() << " err=" << err;
+        return;
+    }
+
+    SnapshotPB snapshot_pb;
+    if (!snapshot_pb.ParseFromString(snapshot_val)) {
+        status->set_code(MetaServiceCode::PROTOBUF_PARSE_ERR);
+        status->set_msg("failed to parse SnapshotPB");
+        return;
+    }
+
+    // Check if snapshot can be dropped (should be in final state)
+    if (snapshot_pb.status() != SnapshotStatus::SNAPSHOT_NORMAL &&
+        snapshot_pb.status() != SnapshotStatus::SNAPSHOT_ABORTED) {
+        status->set_code(MetaServiceCode::INVALID_ARGUMENT);
+        status->set_msg("cannot drop snapshot that is not in final state (NORMAL or ABORTED)");
+        return;
+    }
+
+    // Delete the snapshot
+    txn->remove(snapshot_key);
+
+    LOG_INFO("drop snapshot completed")
+            .tag("snapshot_key", hex(snapshot_full_key))
+            .tag("instance_id", instance_id)
+            .tag("snapshot_id", snapshot_id);
+
+    err = txn->commit();
+    if (err != TxnErrorCode::TXN_OK) {
+        status->set_code(cast_as<ErrCategory::COMMIT>(err));
+        status->set_msg(fmt::format("failed to commit kv txn, err={}", err));
+        LOG(WARNING) << status->msg();
+    }
 }
 
 void SnapshotManager::list_snapshot(std::string_view instance_id,
                                     const doris::cloud::ListSnapshotRequest& request,
                                     doris::cloud::ListSnapshotResponse* response) {
-    response->mutable_status()->set_code(MetaServiceCode::UNDEFINED_ERR);
-    response->mutable_status()->set_msg("Not implemented");
+    auto* status = response->mutable_status();
+    status->set_code(MetaServiceCode::OK);
+    status->set_msg("OK");
+
+    std::string required_snapshot_id =
+            request.has_required_snapshot_id() ? request.required_snapshot_id() : "";
+    bool include_aborted = request.has_include_aborted() ? request.include_aborted() : false;
+
+    if (request.has_request_ip() && !request.request_ip().empty()) {
+        if (!is_valid_ip_address(request.request_ip())) {
+            status->set_code(MetaServiceCode::INVALID_ARGUMENT);
+            status->set_msg("invalid request IP address format");
+            return;
+        }
+    }
+
+    std::unique_ptr<Transaction> txn;
+    TxnErrorCode err = txn_kv_->create_txn(&txn);
+    if (err != TxnErrorCode::TXN_OK) {
+        status->set_code(cast_as<ErrCategory::CREATE>(err));
+        status->set_msg("failed to create txn");
+        LOG(WARNING) << status->msg() << " err=" << err;
+        return;
+    }
+
+    std::string snapshot_full_key = versioned::snapshot_full_key({instance_id});
+
+    std::map<std::string, SnapshotInfoPB> snapshots_map;
+
+    if (!required_snapshot_id.empty()) {
+        // Optimize for specific snapshot ID query - directly get the snapshot
+        Versionstamp snapshot_versionstamp;
+        if (!parse_snapshot_versionstamp(required_snapshot_id, &snapshot_versionstamp)) {
+            status->set_code(MetaServiceCode::INVALID_ARGUMENT);
+            status->set_msg("invalid snapshot_id format");
+            return;
+        }
+
+        std::string snapshot_key = encode_versioned_key(snapshot_full_key, snapshot_versionstamp);
+        std::string snapshot_val;
+        err = txn->get(snapshot_key, &snapshot_val);
+
+        if (err != TxnErrorCode::TXN_OK) {
+            if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
+                // Snapshot not found, return empty result
+                LOG(INFO) << "snapshot not found, snapshot_id=" << required_snapshot_id;
+                return;
+            } else {
+                status->set_code(cast_as<ErrCategory::READ>(err));
+                status->set_msg(fmt::format("failed to get snapshot, snapshot_id={}, err={}",
+                                            required_snapshot_id, err));
+                LOG(WARNING) << status->msg();
+                return;
+            }
+        }
+
+        SnapshotPB snapshot_pb;
+        if (!snapshot_pb.ParseFromString(snapshot_val)) {
+            status->set_code(MetaServiceCode::PROTOBUF_PARSE_ERR);
+            status->set_msg("failed to parse SnapshotPB");
+            return;
+        }
+        LOG_INFO("get snapshot versioned key")
+                .tag("snapshot_key", hex(snapshot_full_key))
+                .tag("instance_id", instance_id);
+
+        // Check if we should include aborted snapshots
+        if (!include_aborted && snapshot_pb.status() == SnapshotStatus::SNAPSHOT_ABORTED) {
+            // Skip aborted snapshot, return empty result
+            return;
+        }
+
+        SnapshotInfoPB snapshot_info;
+        snapshot_info.set_snapshot_id(required_snapshot_id);
+        snapshot_info.set_instance_id(snapshot_pb.instance_id());
+        snapshot_info.set_status(snapshot_pb.status());
+        snapshot_info.set_type(snapshot_pb.type());
+
+        if (snapshot_pb.has_image_url()) {
+            snapshot_info.set_image_url(snapshot_pb.image_url());
+        }
+        if (snapshot_pb.has_last_journal_id()) {
+            snapshot_info.set_journal_id(snapshot_pb.last_journal_id());
+        }
+        if (snapshot_pb.has_create_at()) {
+            snapshot_info.set_create_at(snapshot_pb.create_at());
+        }
+        if (snapshot_pb.has_finish_at()) {
+            snapshot_info.set_finish_at(snapshot_pb.finish_at());
+        }
+        if (snapshot_pb.has_snapshot_ancestor()) {
+            snapshot_info.set_ancestor_id(snapshot_pb.snapshot_ancestor());
+        }
+        if (snapshot_pb.has_auto_()) {
+            snapshot_info.set_auto_snapshot(snapshot_pb.auto_());
+        }
+        if (snapshot_pb.has_ttl_seconds()) {
+            snapshot_info.set_ttl_seconds(snapshot_pb.ttl_seconds());
+        }
+        if (snapshot_pb.has_timeout_seconds()) {
+            snapshot_info.set_timeout_seconds(snapshot_pb.timeout_seconds());
+        }
+        if (snapshot_pb.has_label()) {
+            snapshot_info.set_snapshot_label(snapshot_pb.label());
+        }
+        if (snapshot_pb.has_reason()) {
+            snapshot_info.set_reason(snapshot_pb.reason());
+        }
+
+        snapshots_map[required_snapshot_id] = std::move(snapshot_info);
+    } else {
+        // No specific snapshot ID requested - scan all snapshots
+        // Use full_range_get to get ALL versions of the snapshot key
+        std::string begin_key = encode_versioned_key(snapshot_full_key, Versionstamp::min());
+        std::string end_key = encode_versioned_key(snapshot_full_key, Versionstamp::max());
+
+        FullRangeGetOptions opts;
+        opts.reverse = true; // Get the latest version first
+        opts.begin_key_selector = RangeKeySelector::FIRST_GREATER_OR_EQUAL;
+        opts.end_key_selector = RangeKeySelector::FIRST_GREATER_THAN;
+
+        auto iter = txn->full_range_get(begin_key, end_key, std::move(opts));
+
+        if (!iter->is_valid() && iter->error_code() != TxnErrorCode::TXN_OK) {
+            status->set_code(cast_as<ErrCategory::READ>(iter->error_code()));
+            status->set_msg(fmt::format("failed to scan snapshots, err={}", iter->error_code()));
+            LOG(WARNING) << status->msg();
+            return;
+        }
+
+        while (iter->has_next()) {
+            auto element = iter->next();
+            if (!element.has_value()) {
+                if (iter->error_code() != TxnErrorCode::TXN_OK) {
+                    status->set_code(cast_as<ErrCategory::READ>(iter->error_code()));
+                    status->set_msg(
+                            fmt::format("failed to scan snapshots, err={}", iter->error_code()));
+                    LOG(WARNING) << status->msg();
+                    return;
+                }
+                break;
+            }
+
+            auto [versioned_key, snapshot_val] = element.value();
+
+            // Extract version stamp from the versioned key
+            Versionstamp version_stamp;
+            std::string_view key_copy = versioned_key;
+            if (!decode_versioned_key(&key_copy, &version_stamp)) {
+                LOG(WARNING) << "failed to decode versioned key=" << hex(versioned_key);
+                continue;
+            }
+
+            LOG_INFO("get snapshot versioned key")
+                    .tag("snapshot_key", hex(snapshot_full_key))
+                    .tag("instance_id", version_stamp.to_string());
+
+            SnapshotPB snapshot_pb;
+            if (!snapshot_pb.ParseFromString(std::string(snapshot_val))) {
+                LOG(WARNING) << "failed to parse SnapshotPB for snapshot_id="
+                             << version_stamp.to_string();
+                continue;
+            }
+
+            if (!include_aborted && snapshot_pb.status() == SnapshotStatus::SNAPSHOT_ABORTED) {
+                continue;
+            }
+
+            std::string snapshot_id = version_stamp.to_string();
+            SnapshotInfoPB snapshot_info;
+            snapshot_info.set_snapshot_id(snapshot_id);
+            snapshot_info.set_instance_id(snapshot_pb.instance_id());
+            snapshot_info.set_status(snapshot_pb.status());
+            snapshot_info.set_type(snapshot_pb.type());
+
+            if (snapshot_pb.has_image_url()) {
+                snapshot_info.set_image_url(snapshot_pb.image_url());
+            }
+            if (snapshot_pb.has_last_journal_id()) {
+                snapshot_info.set_journal_id(snapshot_pb.last_journal_id());
+            }
+            if (snapshot_pb.has_create_at()) {
+                snapshot_info.set_create_at(snapshot_pb.create_at());
+            }
+            if (snapshot_pb.has_finish_at()) {
+                snapshot_info.set_finish_at(snapshot_pb.finish_at());
+            }
+            if (snapshot_pb.has_snapshot_ancestor()) {
+                snapshot_info.set_ancestor_id(snapshot_pb.snapshot_ancestor());
+            }
+            if (snapshot_pb.has_auto_()) {
+                snapshot_info.set_auto_snapshot(snapshot_pb.auto_());
+            }
+            if (snapshot_pb.has_ttl_seconds()) {
+                snapshot_info.set_ttl_seconds(snapshot_pb.ttl_seconds());
+            }
+            if (snapshot_pb.has_timeout_seconds()) {
+                snapshot_info.set_timeout_seconds(snapshot_pb.timeout_seconds());
+            }
+            if (snapshot_pb.has_label()) {
+                snapshot_info.set_snapshot_label(snapshot_pb.label());
+            }
+            if (snapshot_pb.has_reason()) {
+                snapshot_info.set_reason(snapshot_pb.reason());
+            }
+
+            snapshots_map[snapshot_id] = std::move(snapshot_info);
+        }
+    }
+
+    for (auto& [snapshot_id, snapshot_info] : snapshots_map) {
+        *response->add_snapshots() = std::move(snapshot_info);
+    }
+
+    LOG_INFO("list snapshots completed")
+            .tag("instance_id", instance_id)
+            .tag("snapshots_count", response->snapshots_size())
+            .tag("required_snapshot_id", required_snapshot_id)
+            .tag("include_aborted", include_aborted);
 }
 
 void SnapshotManager::clone_instance(const doris::cloud::CloneInstanceRequest& request,
@@ -477,9 +780,11 @@ int SnapshotManager::recycle_snapshots(doris::cloud::InstanceRecycler* recycler)
 }
 
 // Recycle snapshot meta and data, return 0 for success otherwise error.
-int SnapshotManager::recycle_snapshot_meta_and_data(doris::cloud::StorageVaultAccessor* accessor,
-                                                    doris::cloud::Versionstamp* snapshot_version,
-                                                    const doris::cloud::SnapshotPB* snapshot_pb) {
+int SnapshotManager::recycle_snapshot_meta_and_data(std::string_view instance_id,
+                                                    std::string_view resource_id,
+                                                    doris::cloud::StorageVaultAccessor* accessor,
+                                                    doris::cloud::Versionstamp snapshot_version,
+                                                    const doris::cloud::SnapshotPB& snapshot_pb) {
     return 0;
 }
 
