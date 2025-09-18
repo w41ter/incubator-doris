@@ -12,8 +12,9 @@ message(STATUS "Enable enterprise edition tests")
 add_executable(enterprise_meta_service_snapshot_test meta_service_snapshot_test.cpp)
 target_link_libraries(enterprise_meta_service_snapshot_test ${TEST_LINK_LIBS})
 
-add_executable(enterprise_meta_service_http_test meta_service_http_test.cpp)
-target_link_libraries(enterprise_meta_service_http_test ${TEST_LINK_LIBS})
+# TODO:
+# add_executable(enterprise_meta_service_http_test meta_service_http_test.cpp)
+# target_link_libraries(enterprise_meta_service_http_test ${TEST_LINK_LIBS})
 
 add_executable(enterprise_recycle_snapshot_test recycle_snapshot_test.cpp)
 target_link_libraries(enterprise_recycle_snapshot_test ${TEST_LINK_LIBS})

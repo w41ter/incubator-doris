@@ -4,6 +4,7 @@
 #include <gen_cpp/cloud.pb.h>
 #include <netinet/in.h>
 
+#include "common/encryption_util.h"
 #include "common/util.h"
 #include "meta-service/meta_service_helper.h"
 #include "meta-store/keys.h"
@@ -85,6 +86,26 @@ static bool parse_snapshot_versionstamp(std::string_view snapshot_id, Versionsta
     return true;
 }
 
+static bool decrypt_object_store_info_ak_sk(doris::cloud::ObjectStoreInfoPB* obj_info) {
+    if (!obj_info->has_encryption_info()) {
+        return true;
+    }
+
+    auto& ak = obj_info->ak();
+    auto& sk = obj_info->sk();
+    auto& encryption_info = obj_info->encryption_info();
+    doris::cloud::AkSkPair plain_ak_sk_pair;
+    if (int ret = decrypt_ak_sk_helper(ak, sk, encryption_info, &plain_ak_sk_pair); ret != 0) {
+        LOG(WARNING) << "failed to decrypt object store info ak/sk, err=" << ret;
+        return false;
+    }
+
+    obj_info->clear_encryption_info(); // avoid leaking encryption info
+    obj_info->set_ak(std::move(plain_ak_sk_pair.first));
+    obj_info->set_sk(std::move(plain_ak_sk_pair.second));
+    return true;
+}
+
 void SnapshotManager::begin_snapshot(std::string_view instance_id,
                                      const doris::cloud::BeginSnapshotRequest& request,
                                      doris::cloud::BeginSnapshotResponse* response) {
@@ -151,9 +172,26 @@ void SnapshotManager::begin_snapshot(std::string_view instance_id,
         return;
     }
 
+    if (instance.enable_storage_vault()) {
+        status->set_code(MetaServiceCode::INVALID_ARGUMENT);
+        status->set_msg("snapshot not support for storage vault instance");
+        return;
+    }
+
     if (instance.snapshot_switch_status() != SnapshotSwitchStatus::SNAPSHOT_SWITCH_ON) {
         status->set_code(MetaServiceCode::INVALID_ARGUMENT);
         status->set_msg("failed to begin snapshot, because the snapshot feature is disabled");
+        return;
+    }
+
+    DCHECK(instance.obj_info_size() > 0) << "instance must have at least one obj_info";
+
+    // Choose the last store obj as the storage to save the snapshot images.
+    auto& obj_info = instance.obj_info(instance.obj_info_size() - 1);
+    response->mutable_obj_info()->CopyFrom(obj_info);
+    if (!decrypt_object_store_info_ak_sk(response->mutable_obj_info())) {
+        status->set_code(MetaServiceCode::UNDEFINED_ERR);
+        status->set_msg("failed to decrypt object info ak/sk");
         return;
     }
 
@@ -170,6 +208,12 @@ void SnapshotManager::begin_snapshot(std::string_view instance_id,
     snapshot_pb.set_ttl_seconds(request.ttl_seconds());
     snapshot_pb.set_label(request.snapshot_label());
     snapshot_pb.set_create_at(std::time(nullptr));
+
+    // Save the resource_id of the chosen object store.
+    //
+    // This create a reference to the object store, so any update or deletion of the object store
+    // must be blocked until all snapshots referencing it are deleted.
+    snapshot_pb.set_resource_id(obj_info.id());
 
     std::string snapshot_full_info_val;
     if (!snapshot_pb.SerializeToString(&snapshot_full_info_val)) {
