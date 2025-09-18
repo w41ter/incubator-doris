@@ -3610,9 +3610,10 @@ public class Config extends ConfigBase {
     public static int first_error_msg_max_length = 256;
 
     @ConfField
-    public static String cloud_snapshot_handler_class = "org.apache.doris.cloud.snapshot.CloudSnapshotHandler";
+    public static String cloud_snapshot_handler_class
+            = "org.apache.doris.cloud.snapshot.CloudSnapshotHandlerImplementation";
     @ConfField
-    public static int cloud_snapshot_handler_interval_second = 3600;
+    public static int cloud_snapshot_handler_interval_second = 10;
     @ConfField(mutable = true)
     public static long cloud_snapshot_timeout_seconds = 600;
     @ConfField(mutable = true)
