@@ -24,6 +24,7 @@ using doris::cloud::SnapshotInfoPB;
 using doris::cloud::SnapshotStatus;
 using doris::cloud::SnapshotSwitchStatus;
 using doris::cloud::SnapshotType;
+using doris::cloud::ObjectStoreInfoPB;
 using doris::cloud::FullRangeGetOptions;
 using doris::cloud::RangeKeySelector;
 using doris::cloud::encode_versioned_key;
@@ -187,9 +188,8 @@ void SnapshotManager::begin_snapshot(std::string_view instance_id,
     DCHECK(instance.obj_info_size() > 0) << "instance must have at least one obj_info";
 
     // Choose the last store obj as the storage to save the snapshot images.
-    auto& obj_info = instance.obj_info(instance.obj_info_size() - 1);
-    response->mutable_obj_info()->CopyFrom(obj_info);
-    if (!decrypt_object_store_info_ak_sk(response->mutable_obj_info())) {
+    ObjectStoreInfoPB obj_info(instance.obj_info(instance.obj_info_size() - 1));
+    if (!decrypt_object_store_info_ak_sk(&obj_info)) {
         status->set_code(MetaServiceCode::UNDEFINED_ERR);
         status->set_msg("failed to decrypt object info ak/sk");
         return;
@@ -250,6 +250,7 @@ void SnapshotManager::begin_snapshot(std::string_view instance_id,
     std::string snapshot_id = serialize_snapshot_versionstamp(versionstamp);
     response->set_image_url("/snapshot/" + snapshot_id + "/");
     response->set_snapshot_id(snapshot_id);
+    response->mutable_obj_info()->Swap(&obj_info);
 }
 
 void SnapshotManager::commit_snapshot(std::string_view instance_id,

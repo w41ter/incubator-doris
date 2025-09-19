@@ -56,7 +56,7 @@ int main(int argc, char** argv) {
     config::txn_store_retry_times = 20;
     config::enable_check_instance_id = false;
 
-    if (!doris::cloud::init_glog("meta_service_snapshot_test")) {
+    if (!doris::cloud::init_glog("enterprise_meta_service_snapshot_test")) {
         std::cerr << "failed to init glog" << std::endl;
         return -1;
     }
@@ -113,6 +113,12 @@ TEST(MetaServiceSnapshotTest, BeginSnapshotTest) {
         *key = "selectdbselectdbselectdbselectdb";
         auto* key_id = try_any_cast<int64_t*>(args[2]);
         *key_id = 1;
+    });
+    sp->set_call_back("decrypt_ak_sk:get_encryption_key", [](auto&& args) {
+        auto* key = try_any_cast<std::string*>(args[0]);
+        *key = "selectdbselectdbselectdbselectdb";
+        auto* ret = try_any_cast<int*>(args[1]);
+        *ret = 0;
     });
 
     // Cleanup SyncPoint when test finishes
@@ -364,6 +370,12 @@ TEST(MetaServiceSnapshotTest, CommitSnapshotTest) {
         *key = "selectdbselectdbselectdbselectdb";
         auto* key_id = try_any_cast<int64_t*>(args[2]);
         *key_id = 1;
+    });
+    sp->set_call_back("decrypt_ak_sk:get_encryption_key", [](auto&& args) {
+        auto* key = try_any_cast<std::string*>(args[0]);
+        *key = "selectdbselectdbselectdbselectdb";
+        auto* ret = try_any_cast<int*>(args[1]);
+        *ret = 0;
     });
 
     // Cleanup SyncPoint when test finishes
@@ -701,6 +713,12 @@ TEST(MetaServiceSnapshotTest, AbortSnapshotTest) {
         auto* key_id = try_any_cast<int64_t*>(args[2]);
         *key_id = 1;
     });
+    sp->set_call_back("decrypt_ak_sk:get_encryption_key", [](auto&& args) {
+        auto* key = try_any_cast<std::string*>(args[0]);
+        *key = "selectdbselectdbselectdbselectdb";
+        auto* ret = try_any_cast<int*>(args[1]);
+        *ret = 0;
+    });
 
     // Cleanup SyncPoint when test finishes
     DORIS_CLOUD_DEFER {
@@ -985,6 +1003,12 @@ TEST(MetaServiceSnapshotTest, ListSnapshotTest) {
         *key = "selectdbselectdbselectdbselectdb";
         auto* key_id = try_any_cast<int64_t*>(args[2]);
         *key_id = 1;
+    });
+    sp->set_call_back("decrypt_ak_sk:get_encryption_key", [](auto&& args) {
+        auto* key = try_any_cast<std::string*>(args[0]);
+        *key = "selectdbselectdbselectdbselectdb";
+        auto* ret = try_any_cast<int*>(args[1]);
+        *ret = 0;
     });
 
     // Cleanup SyncPoint when test finishes
@@ -1366,6 +1390,12 @@ TEST(MetaServiceSnapshotTest, DropSnapshotTest) {
         *key = "selectdbselectdbselectdbselectdb";
         auto* key_id = try_any_cast<int64_t*>(args[2]);
         *key_id = 1;
+    });
+    sp->set_call_back("decrypt_ak_sk:get_encryption_key", [](auto&& args) {
+        auto* key = try_any_cast<std::string*>(args[0]);
+        *key = "selectdbselectdbselectdbselectdb";
+        auto* ret = try_any_cast<int*>(args[1]);
+        *ret = 0;
     });
 
     // Cleanup SyncPoint when test finishes

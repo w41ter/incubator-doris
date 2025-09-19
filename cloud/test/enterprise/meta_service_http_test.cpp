@@ -69,7 +69,7 @@ int main(int argc, char** argv) {
     config::txn_store_retry_times = 20;
     config::enable_check_instance_id = false;
 
-    if (!doris::cloud::init_glog("meta_service_http_test")) {
+    if (!doris::cloud::init_glog("enterprise_meta_service_http_test")) {
         std::cerr << "failed to init glog" << std::endl;
         return -1;
     }

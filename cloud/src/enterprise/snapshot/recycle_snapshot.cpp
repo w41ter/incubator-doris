@@ -212,14 +212,6 @@ int SnapshotManager::recycle_snapshots(InstanceRecycler* recycler) {
                 .tag("recycled_snapshots", recycled_snapshots);
     };
 
-    const InstanceInfoPB& instance_info = recycler->instance_info();
-    if (instance_info.resource_ids_size() == 0) {
-        LOG_WARNING("instance has no resources, cannot recycle snapshots");
-        return -1;
-    }
-
-    std::string resource_id = recycler->instance_info().resource_ids(0);
-
     std::vector<std::pair<SnapshotPB, Versionstamp>> snapshots;
     {
         MetaReader reader(instance_id, txn_kv_.get());
@@ -236,6 +228,7 @@ int SnapshotManager::recycle_snapshots(InstanceRecycler* recycler) {
         std::string snapshot_id = snapshot_versionstamp.to_string();
         AnnotateTag snapshot_id_tag("snapshot_id", snapshot_id);
 
+        const std::string& resource_id = snapshot_pb.resource_id();
         if (snapshot_pb.status() == SnapshotStatus::SNAPSHOT_PREPARE &&
             is_creating_snapshot_timeout(snapshot_pb)) {
             LOG_WARNING("abort snapshot due to timeout")
@@ -276,6 +269,7 @@ int SnapshotManager::recycle_snapshots(InstanceRecycler* recycler) {
     std::sort(auto_snapshots.begin(), auto_snapshots.end(),
               [](const auto& a, const auto& b) { return a.second > b.second; });
 
+    const InstanceInfoPB& instance_info = recycler->instance_info();
     int64_t max_reserved_snapshot = instance_info.max_reserved_snapshot();
     while (auto_snapshots.size() > max_reserved_snapshot) {
         auto&& [snapshot_pb, snapshot_versionstamp] = auto_snapshots.back();

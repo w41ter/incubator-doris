@@ -132,6 +132,11 @@ void create_and_refresh_instance(MetaServiceProxy* service, std::string instance
     instance_info.set_snapshot_switch_status(
             SnapshotSwitchStatus::SNAPSHOT_SWITCH_OFF); // switch off snapshot by default.
     instance_info.mutable_resource_ids()->Add(std::string(RESOURCE_ID));
+    auto* obj_info = instance_info.mutable_obj_info()->Add();
+    obj_info->set_id(std::string(RESOURCE_ID));
+    obj_info->set_ak("mock_ak");
+    obj_info->set_sk("mock_sk");
+
     std::unique_ptr<Transaction> txn;
     ASSERT_EQ(service->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
     txn->put(instance_key(instance_id), instance_info.SerializeAsString());
