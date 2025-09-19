@@ -34,6 +34,10 @@ public:
     void clone_instance(const doris::cloud::CloneInstanceRequest& request,
                         doris::cloud::CloneInstanceResponse* response) override;
 
+    std::pair<doris::cloud::MetaServiceCode, std::string> set_multi_version_status(
+            std::string_view instance_id, std::string_view cloud_unique_id,
+            doris::cloud::MultiVersionStatus multi_version_status) override;
+
     // Recycle snapshots that are expired or marked as recycled, based on the retention policy.
     // Return 0 for success otherwise error.
     int recycle_snapshots(doris::cloud::InstanceRecycler* recycler) override;

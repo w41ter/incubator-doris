@@ -45,6 +45,7 @@
 #include "common/logging.h"
 #include "common/util.h"
 #include "cpp/sync_point.h"
+#include "enterprise/snapshot/snapshot_manager.h"
 #include "meta-service/meta_service.h"
 #include "meta-store/keys.h"
 #include "meta-store/mem_txn_kv.h"
@@ -52,7 +53,6 @@
 #include "meta-store/txn_kv_error.h"
 #include "mock_resource_manager.h"
 #include "resource-manager/resource_manager.h"
-#include "snapshot_manager.h"
 
 namespace config = doris::cloud::config;
 
@@ -609,6 +609,87 @@ TEST(MetaServiceHttpTest, ListSnapshotHttpTest) {
         ListSnapshotResponse direct_resp;
         ctx.meta_service()->list_snapshot(&ctrl, &req, &direct_resp, nullptr);
         ASSERT_EQ(direct_resp.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+    }
+}
+
+TEST(MetaServiceHttpTest, set_multi_version_status_test) {
+    HttpContext ctx;
+
+    // Create a test instance first
+    std::string instance_id = "test_http_multi_version_instance";
+    {
+        CreateInstanceRequest req;
+        req.set_instance_id(instance_id);
+        req.set_user_id("test_user");
+        req.set_name("test_instance");
+
+        auto [status_code, resp] = ctx.forward<MetaServiceResponseStatus>("create_instance", req);
+        ASSERT_EQ(status_code, 200);
+        ASSERT_EQ(resp.code(), MetaServiceCode::OK);
+    }
+
+    // Test 1: Set multi-version status to WRITE_ONLY using query parameters
+    {
+        auto [http_code, response] = ctx.query<MetaServiceResponseStatus>(
+                "set_multi_version_status", fmt::format("cloud_unique_id=test_cloud_unique_id&"
+                                                        "instance_id={}&multi_version_status=1",
+                                                        instance_id));
+        ASSERT_EQ(http_code, 200);
+        ASSERT_EQ(response.code(), MetaServiceCode::OK);
+    }
+
+    // Test 2: Verify status was set correctly by getting instance info
+    {
+        auto [http_code, response] = ctx.query_with_result<InstanceInfoPB>(
+                "get_instance",
+                fmt::format("instance_id={}&cloud_unique_id=test_cloud_unique_id", instance_id));
+        ASSERT_EQ(http_code, 200);
+        ASSERT_EQ(response.status.code(), MetaServiceCode::OK);
+        ASSERT_TRUE(response.result.has_value());
+        ASSERT_EQ(response.result->multi_version_status(),
+                  MultiVersionStatus::MULTI_VERSION_WRITE_ONLY);
+    }
+
+    // Test 3: Set multi-version status to ENABLED using string enum
+    {
+        auto [http_code, response] = ctx.query<MetaServiceResponseStatus>(
+                "set_multi_version_status",
+                fmt::format("cloud_unique_id=test_cloud_unique_id&instance_id={}&multi_version_"
+                            "status=MULTI_VERSION_ENABLED",
+                            instance_id));
+        ASSERT_EQ(http_code, 200);
+        ASSERT_EQ(response.code(), MetaServiceCode::OK);
+    }
+
+    // Test 4: Verify final status change
+    {
+        auto [http_code, response] = ctx.query_with_result<InstanceInfoPB>(
+                "get_instance",
+                fmt::format("instance_id={}&cloud_unique_id=test_cloud_unique_id", instance_id));
+        ASSERT_EQ(http_code, 200);
+        ASSERT_EQ(response.status.code(), MetaServiceCode::OK);
+        ASSERT_TRUE(response.result.has_value());
+        ASSERT_EQ(response.result->multi_version_status(),
+                  MultiVersionStatus::MULTI_VERSION_ENABLED);
+    }
+
+    // Test 5: Test with missing arguments
+    {
+        auto [http_code, response] =
+                ctx.query<MetaServiceResponseStatus>("set_multi_version_status", "");
+        ASSERT_EQ(http_code, 400);
+        ASSERT_EQ(response.code(), MetaServiceCode::INVALID_ARGUMENT);
+    }
+
+    // Test 6: Test with invalid multi_version_status value
+    {
+        auto [http_code, response] = ctx.query<MetaServiceResponseStatus>(
+                "set_multi_version_status",
+                fmt::format("cloud_unique_id=test_cloud_unique_id&instance_id={}&multi_version_"
+                            "status=invalid",
+                            instance_id));
+        ASSERT_EQ(http_code, 400);
+        ASSERT_EQ(response.code(), MetaServiceCode::INVALID_ARGUMENT);
     }
 }
 

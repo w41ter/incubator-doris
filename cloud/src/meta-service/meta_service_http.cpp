@@ -684,6 +684,42 @@ static HttpResponse process_set_snapshot_property(MetaServiceImpl* service,
     return http_json_reply(resp.status());
 }
 
+static HttpResponse process_set_multi_version_status(MetaServiceImpl* service,
+                                                     brpc::Controller* ctrl) {
+    auto& uri = ctrl->http_request().uri();
+    std::string cloud_unique_id(http_query(uri, "cloud_unique_id"));
+    std::string instance_id(http_query(uri, "instance_id"));
+    std::string multi_version_status_str(http_query(uri, "multi_version_status"));
+
+    if (cloud_unique_id.empty() || instance_id.empty() || multi_version_status_str.empty()) {
+        return http_json_reply(MetaServiceCode::INVALID_ARGUMENT, "missing required arguments");
+    }
+
+    // Parse multi_version_status from string to enum
+    MultiVersionStatus multi_version_status;
+    if (multi_version_status_str == "0" || multi_version_status_str == "MULTI_VERSION_DISABLED") {
+        multi_version_status = MultiVersionStatus::MULTI_VERSION_DISABLED;
+    } else if (multi_version_status_str == "1" ||
+               multi_version_status_str == "MULTI_VERSION_WRITE_ONLY") {
+        multi_version_status = MultiVersionStatus::MULTI_VERSION_WRITE_ONLY;
+    } else if (multi_version_status_str == "2" ||
+               multi_version_status_str == "MULTI_VERSION_READ_WRITE") {
+        multi_version_status = MultiVersionStatus::MULTI_VERSION_READ_WRITE;
+    } else if (multi_version_status_str == "3" ||
+               multi_version_status_str == "MULTI_VERSION_ENABLED") {
+        multi_version_status = MultiVersionStatus::MULTI_VERSION_ENABLED;
+    } else {
+        return http_json_reply(MetaServiceCode::INVALID_ARGUMENT,
+                               "invalid multi_version_status value");
+    }
+
+    // Call snapshot manager directly
+    auto [code, msg] = service->snapshot_manager()->set_multi_version_status(
+            instance_id, cloud_unique_id, multi_version_status);
+
+    return http_json_reply(code, msg);
+}
+
 static HttpResponse process_get_snapshot_property(MetaServiceImpl* service,
                                                   brpc::Controller* ctrl) {
     auto& uri = ctrl->http_request().uri();
@@ -841,9 +877,11 @@ void MetaServiceImpl::http(::google::protobuf::RpcController* controller,
             {"list_snapshot", process_list_snapshot},
             {"set_snapshot_property", process_set_snapshot_property},
             {"get_snapshot_property", process_get_snapshot_property},
+            {"set_multi_version_status", process_set_multi_version_status},
             {"v1/list_snapshot", process_list_snapshot},
             {"v1/set_snapshot_property", process_set_snapshot_property},
             {"v1/get_snapshot_property", process_get_snapshot_property},
+            {"v1/set_multi_version_status", process_set_multi_version_status},
             // misc
             {"abort_txn", process_abort_txn},
             {"abort_tablet_job", process_abort_tablet_job},

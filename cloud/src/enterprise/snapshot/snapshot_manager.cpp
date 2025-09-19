@@ -818,4 +818,57 @@ void SnapshotManager::clone_instance(const doris::cloud::CloneInstanceRequest& r
     response->mutable_status()->set_msg("Not implemented");
 }
 
+std::pair<MetaServiceCode, std::string> SnapshotManager::set_multi_version_status(
+        std::string_view instance_id, std::string_view cloud_unique_id,
+        doris::cloud::MultiVersionStatus multi_version_status) {
+    LOG_INFO("set_multi_version_status")
+            .tag("cloud_unique_id", cloud_unique_id)
+            .tag("instance_id", instance_id)
+            .tag("multi_version_status", multi_version_status);
+
+    std::unique_ptr<Transaction> txn;
+    TxnErrorCode err = txn_kv_->create_txn(&txn);
+    if (err != TxnErrorCode::TXN_OK) {
+        return {cast_as<ErrCategory::CREATE>(err), "failed to create txn"};
+    }
+
+    doris::cloud::InstanceKeyInfo key_info {std::string(instance_id)};
+    std::string instance_key_str;
+    doris::cloud::instance_key(key_info, &instance_key_str);
+
+    std::string instance_val;
+    err = txn->get(instance_key_str, &instance_val);
+    if (err != TxnErrorCode::TXN_OK) {
+        if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
+            return {MetaServiceCode::CLUSTER_NOT_FOUND, "instance not found"};
+        } else {
+            return {cast_as<ErrCategory::READ>(err), "failed to get instance info"};
+        }
+    }
+
+    InstanceInfoPB instance_info;
+    if (!instance_info.ParseFromString(instance_val)) {
+        return {MetaServiceCode::PROTOBUF_PARSE_ERR, "failed to parse instance info"};
+    }
+
+    instance_info.set_multi_version_status(multi_version_status);
+
+    std::string updated_instance_val = instance_info.SerializeAsString();
+    if (updated_instance_val.empty()) {
+        return {MetaServiceCode::PROTOBUF_SERIALIZE_ERR, "failed to serialize instance info"};
+    }
+
+    txn->put(instance_key_str, updated_instance_val);
+    err = txn->commit();
+    if (err != TxnErrorCode::TXN_OK) {
+        return {cast_as<ErrCategory::COMMIT>(err), "failed to commit txn"};
+    }
+
+    LOG_INFO("set_multi_version_status completed")
+            .tag("instance_id", instance_id)
+            .tag("multi_version_status", multi_version_status);
+
+    return {MetaServiceCode::OK, "success"};
+}
+
 } // namespace selectdb
