@@ -121,15 +121,16 @@ void SnapshotManager::begin_snapshot(std::string_view instance_id,
         return;
     }
 
+    bool auto_snapshot = request.auto_snapshot();
     // Validate TTL must be positive
-    if (!request.has_ttl_seconds() || request.ttl_seconds() <= 0) {
+    if (!auto_snapshot && (!request.has_ttl_seconds() || request.ttl_seconds() <= 0)) {
         status->set_code(MetaServiceCode::INVALID_ARGUMENT);
         status->set_msg("ttl_seconds must be positive");
         return;
     }
 
     // Validate snapshot label is not empty
-    if (!request.has_snapshot_label() || request.snapshot_label().empty()) {
+    if (!auto_snapshot && (!request.has_snapshot_label() || request.snapshot_label().empty())) {
         status->set_code(MetaServiceCode::INVALID_ARGUMENT);
         status->set_msg("snapshot_label cannot be empty");
         return;
