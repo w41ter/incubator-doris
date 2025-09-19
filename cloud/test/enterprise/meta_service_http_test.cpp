@@ -612,7 +612,7 @@ TEST(MetaServiceHttpTest, ListSnapshotHttpTest) {
     }
 }
 
-TEST(MetaServiceHttpTest, set_multi_version_status_test) {
+TEST(MetaServiceHttpTest, SetMultiVersionStatusTest) {
     HttpContext ctx;
 
     // Create a test instance first
@@ -631,9 +631,10 @@ TEST(MetaServiceHttpTest, set_multi_version_status_test) {
     // Test 1: Set multi-version status to WRITE_ONLY using query parameters
     {
         auto [http_code, response] = ctx.query<MetaServiceResponseStatus>(
-                "set_multi_version_status", fmt::format("cloud_unique_id=test_cloud_unique_id&"
-                                                        "instance_id={}&multi_version_status=1",
-                                                        instance_id));
+                "set_multi_version_status",
+                fmt::format("cloud_unique_id=test_cloud_unique_id&"
+                            "instance_id={}&multi_version_status=MULTI_VERSION_WRITE_ONLY",
+                            instance_id));
         ASSERT_EQ(http_code, 200);
         ASSERT_EQ(response.code(), MetaServiceCode::OK);
     }

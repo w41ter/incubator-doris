@@ -697,20 +697,23 @@ static HttpResponse process_set_multi_version_status(MetaServiceImpl* service,
 
     // Parse multi_version_status from string to enum
     MultiVersionStatus multi_version_status;
-    if (multi_version_status_str == "0" || multi_version_status_str == "MULTI_VERSION_DISABLED") {
+    std::string multi_version_status_upper = multi_version_status_str;
+    std::ranges::transform(multi_version_status_upper, multi_version_status_upper.begin(),
+                           ::toupper);
+
+    if (multi_version_status_upper == "MULTI_VERSION_DISABLED") {
         multi_version_status = MultiVersionStatus::MULTI_VERSION_DISABLED;
-    } else if (multi_version_status_str == "1" ||
-               multi_version_status_str == "MULTI_VERSION_WRITE_ONLY") {
+    } else if (multi_version_status_upper == "MULTI_VERSION_WRITE_ONLY") {
         multi_version_status = MultiVersionStatus::MULTI_VERSION_WRITE_ONLY;
-    } else if (multi_version_status_str == "2" ||
-               multi_version_status_str == "MULTI_VERSION_READ_WRITE") {
+    } else if (multi_version_status_upper == "MULTI_VERSION_READ_WRITE") {
         multi_version_status = MultiVersionStatus::MULTI_VERSION_READ_WRITE;
-    } else if (multi_version_status_str == "3" ||
-               multi_version_status_str == "MULTI_VERSION_ENABLED") {
+    } else if (multi_version_status_upper == "MULTI_VERSION_ENABLED") {
         multi_version_status = MultiVersionStatus::MULTI_VERSION_ENABLED;
     } else {
-        return http_json_reply(MetaServiceCode::INVALID_ARGUMENT,
-                               "invalid multi_version_status value");
+        return http_json_reply(
+                MetaServiceCode::INVALID_ARGUMENT,
+                "invalid multi_version_status value. Supported values: MULTI_VERSION_DISABLED, "
+                "MULTI_VERSION_WRITE_ONLY, MULTI_VERSION_READ_WRITE, MULTI_VERSION_ENABLED");
     }
 
     // Call snapshot manager directly
