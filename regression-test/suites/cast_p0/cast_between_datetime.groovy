@@ -15,13 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package org.apache.doris.nereids.trees.expressions.functions.agg;
-
-import org.apache.doris.nereids.trees.TreeNode;
-import org.apache.doris.nereids.trees.expressions.Expression;
-
-/**
- * base class of multi-distinct agg function
- */
-public interface MultiDistinction extends TreeNode<Expression> {
+suite("cast_between_datetime") {
+    qt_sql1 """
+    select cast(cast('2000-10-10 00:00:00.123001' as datetime(6)) as datetime(3))
+        = cast('2000-10-10 00:00:00.123000' as datetime(3));
+    """
+    qt_sql2 """
+    select cast(cast('2000-06-25 23:59:59.996000' as datetime(6)) as datetime(0));
+    """
+    testFoldConst("""
+    select cast(cast('2000-10-10 00:00:00.123001' as datetime(6)) as datetime(3))
+        = cast('2000-10-10 00:00:00.123000' as datetime(3));
+    """)
+    testFoldConst("""
+    select cast(cast('2000-06-25 23:59:59.996000' as datetime(6)) as datetime(0));
+    """)
 }
