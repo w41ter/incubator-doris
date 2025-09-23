@@ -78,24 +78,32 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
     }
 
     @Override
-    public void submitJob(long ttl, String label) {
-        manualSnapshotJobs.add(new CloudSnapshotJob(false, ttl, label));
+    public void submitJob(long ttl, String label) throws Exception {
+        CloudSnapshotJob job = new CloudSnapshotJob(false, ttl, label);
+        beginSnapshotAndWriteEditLog(job);
+        manualSnapshotJobs.add(job);
     }
 
     @Override
     public synchronized void refreshAutoSnapshotJob() {
         Cloud.GetInstanceResponse response = ((CloudSystemInfoService) Env.getCurrentSystemInfo()).getCloudInstance();
-        Cloud.SnapshotSwitchStatus switchStatus = response.getInstance().getSnapshotSwitchStatus();
-        if (switchStatus == Cloud.SnapshotSwitchStatus.SNAPSHOT_SWITCH_ON
-                && response.getInstance().getMaxReservedSnapshot() > 0) {
+        Cloud.InstanceInfoPB instanceInfo = response.getInstance();
+        long maxReservedSnapshot = instanceInfo.hasMaxReservedSnapshot() ? instanceInfo.getMaxReservedSnapshot() : 0;
+        long autoSnapshotIntervalSeconds = instanceInfo.hasSnapshotIntervalSeconds()
+                ? instanceInfo.getSnapshotIntervalSeconds() : 3600;
+        if (instanceInfo.hasSnapshotSwitchStatus()
+                && instanceInfo.getSnapshotSwitchStatus() == Cloud.SnapshotSwitchStatus.SNAPSHOT_SWITCH_ON
+                && maxReservedSnapshot > 0) {
             if (this.autoSnapshotJob == null) {
                 this.autoSnapshotJob = new CloudSnapshotJob(true);
             }
-            this.autoSnapshotIntervalSeconds = response.getInstance().getSnapshotIntervalSeconds();
+            this.autoSnapshotIntervalSeconds = autoSnapshotIntervalSeconds;
         } else {
             this.autoSnapshotJob = null;
         }
         autoSnapshotJobInitialized = true;
+        LOG.info("auto snapshot job is {}, interval: {}", this.autoSnapshotJob != null ? "ON" : "OFF",
+                this.autoSnapshotIntervalSeconds);
     }
 
     private void getLastFinishedAutoSnapshotTime() {
@@ -147,22 +155,37 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
         }
     }
 
+    private void beginSnapshotAndWriteEditLog(CloudSnapshotJob job) throws Exception {
+        synchronized (Env.getCurrentEnv().getEditLog()) {
+            // begin snapshot
+            Cloud.BeginSnapshotResponse response = beginSnapshot(job);
+            job.setBeginSnapshotResponse(response);
+            // write edit log
+            SnapshotState snapshotState = new SnapshotState(response.getSnapshotId(), response.getImageUrl());
+            long logId = Env.getCurrentEnv().getEditLog().logBeginSnapshot(snapshotState);
+            job.setLogId(logId);
+        }
+    }
+
     private void executeJob(CloudSnapshotJob job) {
         String snapshotId = null;
         long logId = 0;
         try {
-            // 0. begin snapshot
-            String imageUrl = null;
-            Cloud.ObjectStoreInfoPB objInfo;
-            synchronized (Env.getCurrentEnv().getEditLog()) {
-                Cloud.BeginSnapshotResponse response = beginSnapshot(job);
-                snapshotId = response.getSnapshotId();
-                imageUrl = response.getImageUrl();
-                objInfo = response.getObjInfo();
-                // 1. write edit log
-                SnapshotState snapshotState = new SnapshotState(snapshotId, imageUrl);
-                logId = Env.getCurrentEnv().getEditLog().logBeginSnapshot(snapshotState);
+            // 1. begin snapshot and write edit log
+            if (job.isAuto()) {
+                beginSnapshotAndWriteEditLog(job);
             }
+            if (job.getBeginSnapshotResponse() == null) {
+                throw new DdlException("snapshot failed because begin snapshot response is null");
+            }
+            if (job.getLogId() == 0) {
+                throw new DdlException("snapshot failed because log id is 0");
+            }
+            Cloud.BeginSnapshotResponse beginSnapshotResponse = job.getBeginSnapshotResponse();
+            snapshotId = beginSnapshotResponse.getSnapshotId();
+            String imageUrl = beginSnapshotResponse.getImageUrl();
+            Cloud.ObjectStoreInfoPB objInfo = beginSnapshotResponse.getObjInfo();
+            logId = job.getLogId();
             // 2. upload image
             Checkpoint checkpoint = Env.getCurrentEnv().getCheckpointer();
             checkpoint.getLock().readLock().lock();
@@ -198,6 +221,9 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
             } catch (Exception e1) {
                 LOG.warn("failed to delete edit log file for job: {}", job, e1);
             }
+        } finally {
+            job.setBeginSnapshotResponse(null);
+            job.setLogId(0);
         }
     }
 
@@ -247,22 +273,28 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
             throw new DdlException("image version " + imageVersion + " is larger than log id " + logId);
         }
         RemoteBase remote = RemoteBase.newInstance(new RemoteBase.ObjectInfo(objInfo));
-        if (imageVersion > 0) {
-            String imageDir = Env.getServingEnv().getImageDir();
-            String imageFileName = "image." + imageVersion;
-            File imageFile = new File(imageDir + "/" + imageFileName);
-            if (!imageFile.exists()) {
-                LOG.error("image file does not exist: {}", imageFile.getAbsoluteFile());
-                throw new DdlException("image file does not exist: " + imageFile.getAbsoluteFile());
+        try {
+            if (imageVersion > 0) {
+                String imageDir = Env.getServingEnv().getImageDir();
+                String imageFileName = "image." + imageVersion;
+                File imageFile = new File(imageDir + "/" + imageFileName);
+                if (!imageFile.exists()) {
+                    LOG.error("image file does not exist: {}", imageFile.getAbsoluteFile());
+                    throw new DdlException("image file does not exist: " + imageFile.getAbsoluteFile());
+                }
+                String newImageUrl = formatImageUrl(objInfo.getPrefix(), imageUrl);
+                String key = formatImageUrl(newImageUrl, imageFileName);
+                remote.putObject(imageFile, key);
             }
-            remote.putObject(imageFile, imageUrl + "/" + imageFileName);
-        }
-        // 2. scan edit logs between imageVersion + 1 and logId, upload edit log
-        if (imageVersion + 1 < logId) {
-            writeSnapshotEditLogFile(imageVersion + 1, logId, snapshotId);
-            File snapshotEditLogFile = getEditLogFile(logId);
-            remote.putObject(snapshotEditLogFile, imageUrl + "/" + snapshotEditLogFile.getName());
-            snapshotEditLogFile.delete();
+            // 2. scan edit logs between imageVersion + 1 and logId, upload edit log
+            if (imageVersion + 1 < logId) {
+                writeSnapshotEditLogFile(imageVersion + 1, logId, snapshotId);
+                File snapshotEditLogFile = getEditLogFile(logId);
+                remote.putObject(snapshotEditLogFile, imageUrl + "/" + snapshotEditLogFile.getName());
+                snapshotEditLogFile.delete();
+            }
+        } finally {
+            remote.close();
         }
     }
 
@@ -373,5 +405,17 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
                 LOG.info("delete directory: {}", directory.getAbsolutePath());
             }
         }
+    }
+
+    private String formatImageUrl(String prefix, String imageUrl) {
+        String newPrefix = prefix;
+        if (prefix.endsWith("/")) {
+            newPrefix = prefix.substring(0, prefix.length() - 1);
+        }
+        String newImageUrl = imageUrl;
+        if (!newImageUrl.startsWith("/")) {
+            newImageUrl = "/" + newImageUrl;
+        }
+        return newPrefix + newImageUrl;
     }
 }

@@ -17,11 +17,15 @@
 
 package org.apache.doris.cloud.snapshot;
 
+import org.apache.doris.cloud.proto.Cloud;
+
 public class CloudSnapshotJob  {
 
     private boolean auto;
     private long ttl; // used for manual snapshot
     private String label;
+    private Cloud.BeginSnapshotResponse beginSnapshotResponse;
+    private long logId;
 
     public CloudSnapshotJob(boolean auto, long ttl, String label) {
         this.auto = auto;
@@ -49,6 +53,22 @@ public class CloudSnapshotJob  {
         return label;
     }
 
+    public void setBeginSnapshotResponse(Cloud.BeginSnapshotResponse response) {
+        this.beginSnapshotResponse = response;
+    }
+
+    public Cloud.BeginSnapshotResponse getBeginSnapshotResponse() {
+        return beginSnapshotResponse;
+    }
+
+    public void setLogId(long logId) {
+        this.logId = logId;
+    }
+
+    public long getLogId() {
+        return logId;
+    }
+
     @Override
     public String toString() {
         StringBuilder sb = new StringBuilder();
@@ -58,6 +78,9 @@ public class CloudSnapshotJob  {
         }
         if (ttl > 0) {
             sb.append(", ttl=").append(ttl);
+        }
+        if (logId > 0) {
+            sb.append(", logId=").append(logId);
         }
         sb.append("}");
         return sb.toString();
