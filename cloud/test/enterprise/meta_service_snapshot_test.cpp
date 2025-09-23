@@ -1788,4 +1788,147 @@ TEST(MetaServiceSnapshotTest, DropSnapshotTest) {
         ASSERT_FALSE(found_dropped); // Ensure dropped snapshots are not listed
     }
 }
+
+TEST(MetaServiceSnapshotTest, BeginAutoSnapshotDisabledTest) {
+    auto meta_service = get_meta_service(true);
+    const char* const cloud_unique_id = "test_cloud_unique_id_auto_disabled";
+
+    // Setup SyncPoint for encryption
+    auto* sp = SyncPoint::get_instance();
+    sp->enable_processing();
+    sp->set_call_back("encrypt_ak_sk:get_encryption_key", [](auto&& args) {
+        auto* ret = try_any_cast<int*>(args[0]);
+        *ret = 0;
+        auto* key = try_any_cast<std::string*>(args[1]);
+        *key = "selectdbselectdbselectdbselectdb";
+        auto* key_id = try_any_cast<int64_t*>(args[2]);
+        *key_id = 1;
+    });
+    sp->set_call_back("decrypt_ak_sk:get_encryption_key", [](auto&& args) {
+        auto* key = try_any_cast<std::string*>(args[0]);
+        *key = "selectdbselectdbselectdbselectdb";
+        auto* ret = try_any_cast<int*>(args[1]);
+        *ret = 0;
+    });
+
+    // Cleanup SyncPoint when test finishes
+    DORIS_CLOUD_DEFER {
+        sp->disable_processing();
+        sp->clear_all_call_backs();
+    };
+
+    CreateInstanceRequest req;
+    CreateInstanceResponse res;
+    req.set_instance_id("test_instance");
+    req.set_name("test_instance");
+    req.set_user_id("test_user");
+
+    auto obj_info = req.mutable_obj_info();
+    obj_info->set_ak("ak_test");
+    obj_info->set_sk("sk_test");
+    obj_info->set_bucket("test_bucket");
+    obj_info->set_prefix("test_prefix");
+    obj_info->set_endpoint("test_endpoint");
+    obj_info->set_region("test_region");
+    obj_info->set_external_endpoint("test_external_endpoint");
+    obj_info->set_provider(ObjectStoreInfoPB::OSS);
+    obj_info->set_id("obj_info_id");
+
+    brpc::Controller cntl;
+    meta_service->create_instance(reinterpret_cast<::google::protobuf::RpcController*>(&cntl), &req,
+                                  &res, nullptr);
+    ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+
+    // Enable multi version for the test instance
+    {
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(meta_service->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+        std::string instance_key_str = instance_key("test_instance");
+        std::string instance_value;
+        ASSERT_EQ(txn->get(instance_key_str, &instance_value), TxnErrorCode::TXN_OK);
+        InstanceInfoPB instance_info;
+        ASSERT_TRUE(instance_info.ParseFromString(instance_value));
+        instance_info.set_snapshot_switch_status(SnapshotSwitchStatus::SNAPSHOT_SWITCH_OFF);
+        txn->put(instance_key_str, instance_info.SerializeAsString());
+        ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+    }
+
+    // Set up snapshot settings after instance creation using alter_instance
+    {
+        brpc::Controller cntl;
+        AlterInstanceRequest alter_req;
+        AlterInstanceResponse alter_res;
+        alter_req.set_op(AlterInstanceRequest::SET_SNAPSHOT_PROPERTY);
+        alter_req.set_instance_id("test_instance");
+        (*alter_req.mutable_properties())["enabled"] = "true";
+        (*alter_req.mutable_properties())["max_reserved_snapshots"] = "0"; // Disable auto snapshot
+
+        meta_service->alter_instance(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                     &alter_req, &alter_res, nullptr);
+        ASSERT_EQ(alter_res.status().code(), MetaServiceCode::OK);
+    }
+
+    // Test manual snapshot should work even when auto snapshot is disabled
+    {
+        brpc::Controller cntl;
+        BeginSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_timeout_seconds(1800);
+        req.set_auto_snapshot(false); // Manual snapshot
+        req.set_ttl_seconds(14400);
+        req.set_snapshot_label("manual_snapshot");
+        BeginSnapshotResponse res;
+        meta_service->begin_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                     &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+        ASSERT_FALSE(res.image_url().empty());
+        ASSERT_FALSE(res.snapshot_id().empty());
+    }
+
+    // Test auto snapshot should fail when max_reserved_snapshots is 0
+    {
+        brpc::Controller cntl;
+        BeginSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_timeout_seconds(1800);
+        req.set_auto_snapshot(true); // Auto snapshot
+        req.set_ttl_seconds(14400);
+        req.set_snapshot_label("auto_snapshot");
+        BeginSnapshotResponse res;
+        meta_service->begin_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                     &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+        ASSERT_TRUE(res.status().msg().find("auto snapshot is disabled") != std::string::npos);
+    }
+
+    // Test auto snapshot should work when max_reserved_snapshots > 0
+    {
+        // First update instance to enable auto snapshot
+        AlterInstanceRequest alter_req;
+        AlterInstanceResponse alter_res;
+        alter_req.set_op(AlterInstanceRequest::SET_SNAPSHOT_PROPERTY);
+        alter_req.set_instance_id("test_instance");
+        (*alter_req.mutable_properties())["max_reserved_snapshots"] = "5";
+
+        brpc::Controller cntl;
+        meta_service->alter_instance(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                     &alter_req, &alter_res, nullptr);
+        ASSERT_EQ(alter_res.status().code(), MetaServiceCode::OK);
+
+        // Now auto snapshot should work
+        BeginSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_timeout_seconds(1800);
+        req.set_auto_snapshot(true); // Auto snapshot
+        req.set_ttl_seconds(14400);
+        req.set_snapshot_label("auto_snapshot_enabled");
+        BeginSnapshotResponse res;
+        meta_service->begin_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                     &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+        ASSERT_FALSE(res.image_url().empty());
+        ASSERT_FALSE(res.snapshot_id().empty());
+    }
+}
+
 } // namespace doris::cloud

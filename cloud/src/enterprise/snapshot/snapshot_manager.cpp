@@ -186,6 +186,16 @@ void SnapshotManager::begin_snapshot(std::string_view instance_id,
         return;
     }
 
+    // Check if auto snapshot is disabled when request is for auto snapshot
+    if (auto_snapshot && instance.has_max_reserved_snapshot() &&
+        instance.max_reserved_snapshot() == 0) {
+        status->set_code(MetaServiceCode::INVALID_ARGUMENT);
+        status->set_msg(
+                "failed to begin auto snapshot, because auto snapshot is disabled "
+                "(max_reserved_snapshots is 0)");
+        return;
+    }
+
     DCHECK(instance.obj_info_size() > 0) << "instance must have at least one obj_info";
 
     // Choose the last store obj as the storage to save the snapshot images.
