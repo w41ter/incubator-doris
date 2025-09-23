@@ -865,6 +865,9 @@ std::pair<MetaServiceCode, std::string> SnapshotManager::set_multi_version_statu
         return {cast_as<ErrCategory::COMMIT>(err), "failed to commit txn"};
     }
 
+    // Asynchronously notify ResourceManager to refresh instance cache
+    notify_refresh_instance(txn_kv_, std::string(instance_id), nullptr);
+
     LOG_INFO("set_multi_version_status completed")
             .tag("instance_id", instance_id)
             .tag("multi_version_status", multi_version_status);
