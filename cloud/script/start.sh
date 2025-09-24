@@ -96,7 +96,9 @@ lib_path="${DORIS_HOME}/lib"
 bin="${DORIS_HOME}/lib/${process}"
 export LD_LIBRARY_PATH="${lib_path}:${LD_LIBRARY_PATH}"
 
-chmod 550 "${DORIS_HOME}/lib/${process}"
+if [[ ! -x "${DORIS_HOME}/lib/${process}" || ! -r "${DORIS_HOME}/lib/${process}" ]]; then
+    chmod 550 "${DORIS_HOME}/lib/${process}"
+fi
 
 # to enable dump jeprof heap stats prodigally, change `prof_active:false` to `prof_active:true` or curl http://be_host:be_webport/jeheap/prof/true
 # to control the dump interval change `lg_prof_interval` to a specific value, it is pow/exponent of 2 in size of bytes, default 34 means 2 ** 34 = 16GB
