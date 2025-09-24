@@ -62,6 +62,10 @@
 #endif
 #include "recycler/util.h"
 
+#ifdef FEATURE_ENTERPRISE_SNAPSHOT
+#include "enterprise/snapshot/snapshot_manager.h"
+#endif
+
 namespace doris::cloud {
 namespace config {
 extern int32_t brpc_listen_port;
@@ -242,6 +246,12 @@ int Checker::start() {
                 }
             }
 
+            if (config::enable_snapshot_check) {
+                if (int ret = checker->do_snapshots_check(); ret != 0) {
+                    success = false;
+                }
+            }
+
             // If instance checker has been aborted, don't finish this job
             if (!checker->stopped()) {
                 finish_instance_recycle_job(txn_kv_.get(), check_job_key, instance.instance_id(),
@@ -416,7 +426,13 @@ int key_exist(TxnKv* txn_kv, std::string_view key) {
 }
 
 InstanceChecker::InstanceChecker(std::shared_ptr<TxnKv> txn_kv, const std::string& instance_id)
-        : txn_kv_(std::move(txn_kv)), instance_id_(instance_id) {}
+        : txn_kv_(txn_kv), instance_id_(instance_id) {
+#ifdef FEATURE_ENTERPRISE_SNAPSHOT
+    snapshot_manager_ = std::make_shared<selectdb::SnapshotManager>(txn_kv_);
+#else
+    snapshot_manager_ = std::make_shared<SnapshotManager>(txn_kv_);
+#endif
+}
 
 int InstanceChecker::init(const InstanceInfoPB& instance) {
     int ret = init_obj_store_accessors(instance);
@@ -2629,6 +2645,20 @@ int InstanceChecker::do_meta_rowset_key_check() {
               << ", num_loss=" << num_loss;
 
     return ret;
+}
+
+StorageVaultAccessor* InstanceChecker::get_accessor(const std::string& id) {
+    auto it = accessor_map_.find(id);
+    if (it == accessor_map_.end()) {
+        return nullptr;
+    }
+    return it->second.get();
+}
+
+void InstanceChecker::get_all_accessor(std::vector<StorageVaultAccessor*>* accessors) {
+    for (const auto& [_, accessor] : accessor_map_) {
+        accessors->push_back(accessor.get());
+    }
 }
 
 } // namespace doris::cloud

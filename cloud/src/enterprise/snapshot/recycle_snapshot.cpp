@@ -35,49 +35,13 @@
 #include "recycler/storage_vault_accessor.h"
 #include "recycler/util.h"
 #include "snapshot/snapshot_manager.h"
+#include "snapshot_helper.h"
 #include "snapshot_manager.h"
 
 using namespace doris::cloud;
 using namespace std::chrono;
 
 namespace selectdb {
-
-inline int64_t system_clock_now_seconds() {
-    return duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
-}
-
-// Is the snapshot in preparing status timed out?
-bool is_creating_snapshot_timeout(const SnapshotPB& snapshot_pb) {
-    if (config::force_immediate_recycle) {
-        return true;
-    }
-
-    int64_t created_at = snapshot_pb.create_at();
-    int64_t deadline = created_at + snapshot_pb.timeout_seconds();
-    return system_clock_now_seconds() >= deadline;
-}
-
-// Is the aborted snapshot can be pruned?
-bool is_aborted_snapshot_pruneable(const SnapshotPB& snapshot_pb) {
-    if (config::force_immediate_recycle) {
-        return true;
-    }
-
-    int64_t aborted_at = snapshot_pb.finish_at();
-    int64_t deadline = aborted_at + config::prune_aborted_snapshot_seconds;
-    return system_clock_now_seconds() >= deadline;
-}
-
-// Is the manually created snapshot expired?
-bool is_snapshot_expired(const SnapshotPB& snapshot_pb) {
-    if (config::force_immediate_recycle) {
-        return true;
-    }
-
-    int64_t created_at = snapshot_pb.create_at();
-    int64_t deadline = created_at + snapshot_pb.ttl_seconds();
-    return system_clock_now_seconds() >= deadline;
-}
 
 // Abort the snapshot in preparing status due to timeout.
 int abort_timeout_snapshot(TxnKv* txn_kv, std::string_view instance_id,

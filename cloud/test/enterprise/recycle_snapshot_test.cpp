@@ -35,6 +35,7 @@
 #include "common/defer.h"
 #include "common/util.h"
 #include "cpp/sync_point.h"
+#include "enterprise/snapshot/snapshot_helper.h"
 #include "enterprise/snapshot/snapshot_manager.h"
 #include "meta-service/meta_service.h"
 #include "meta-store/codec.h"
@@ -713,6 +714,20 @@ std::unique_ptr<InstanceRecycler> get_instance_recycler(MetaServiceProxy* meta_s
     return get_instance_recycler(meta_service, instance_info, accessor);
 }
 
+std::unique_ptr<InstanceChecker> get_instance_checker(
+        MetaServiceProxy* meta_service, const std::string& instance_id,
+        std::shared_ptr<StorageVaultAccessor> accessor) {
+    auto checker = std::make_unique<InstanceChecker>(meta_service->txn_kv(), instance_id);
+    checker->TEST_add_accessor(RESOURCE_ID, accessor);
+    return checker;
+}
+
+std::unique_ptr<InstanceChecker> get_instance_checker(MetaServiceProxy* meta_service,
+                                                      const std::string& instance_id) {
+    std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+    return get_instance_checker(meta_service, instance_id, accessor);
+}
+
 // Convert a string to a hex-escaped string.
 // A non-displayed character is represented as \xHH where HH is the hexadecimal value of the character.
 // A displayed character is represented as itself.
@@ -1206,4 +1221,143 @@ TEST(RecycleSnapshotTest, RecycleManualSnapshot) {
     // The manual snapshot should be recycled.
     get_snapshots(meta_service.get(), instance_id, snapshots);
     ASSERT_EQ(snapshots.size(), 0);
+}
+
+TEST(RecycleSnapshotTest, CheckSnapshotNormal) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "recycle_snapshot_test_manual_snapshot_instance";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    MOCK_GET_INSTANCE_ID(instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+    // insert a rowset
+    insert_rowset(meta_service.get(), cloud_unique_id, db_id, "label_1", table_id, partition_id,
+                  tablet_id);
+
+    update_snapshot_properties(meta_service.get(), instance_id, true, 1, 3600);
+
+    std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    for (size_t i = 0; i < 3; i++) {
+        SnapshotContext ctx;
+        std::string label = fmt::format("manual-gen-{}", i);
+        begin_snapshot(meta_service.get(), cloud_unique_id, label, &ctx, false);
+        commit_snapshot(meta_service.get(), cloud_unique_id, ctx.snapshot_id, ctx.image_url,
+                        100 + i);
+        std::string image_path = "snapshot/" + ctx.snapshot_id + "/image.img";
+        accessor->put_file(image_path, "");
+    }
+
+    std::vector<SnapshotInfoPB> snapshots;
+    get_snapshots(meta_service.get(), instance_id, snapshots);
+    ASSERT_EQ(snapshots.size(), 3);
+
+    auto checker = get_instance_checker(meta_service.get(), instance_id, accessor);
+
+    ASSERT_EQ(checker->do_snapshots_check(), 0);
+}
+
+TEST(RecycleSnapshotTest, CheckSnapshotAbnormal) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "recycle_snapshot_test_manual_snapshot_instance";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    MOCK_GET_INSTANCE_ID(instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+    // insert a rowset
+    insert_rowset(meta_service.get(), cloud_unique_id, db_id, "label_1", table_id, partition_id,
+                  tablet_id);
+
+    update_snapshot_properties(meta_service.get(), instance_id, true, 1, 3600);
+
+    std::string last_snapshot_id;
+    std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    for (size_t i = 0; i < 3; i++) {
+        SnapshotContext ctx;
+        std::string label = fmt::format("manual-gen-{}", i);
+        begin_snapshot(meta_service.get(), cloud_unique_id, label, &ctx, false);
+        commit_snapshot(meta_service.get(), cloud_unique_id, ctx.snapshot_id, ctx.image_url,
+                        100 + i);
+        std::string image_path = "snapshot/" + ctx.snapshot_id + "/image.img";
+        accessor->put_file(image_path, "");
+        last_snapshot_id = ctx.snapshot_id;
+    }
+
+    std::vector<SnapshotInfoPB> snapshots;
+    get_snapshots(meta_service.get(), instance_id, snapshots);
+    ASSERT_EQ(snapshots.size(), 3);
+
+    auto checker = get_instance_checker(meta_service.get(), instance_id, accessor);
+    std::string snapshot_path = "snapshot/" + last_snapshot_id;
+
+    accessor->delete_directory(snapshot_path);
+
+    ASSERT_EQ(checker->do_snapshots_check(), 1);
+}
+
+TEST(RecycleSnapshotTest, InvertedCheckSnapshotAbnormal) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "recycle_snapshot_test_manual_snapshot_instance";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    MOCK_GET_INSTANCE_ID(instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+    // insert a rowset
+    insert_rowset(meta_service.get(), cloud_unique_id, db_id, "label_1", table_id, partition_id,
+                  tablet_id);
+
+    update_snapshot_properties(meta_service.get(), instance_id, true, 1, 3600);
+
+    std::string last_snapshot_id;
+    std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    for (size_t i = 0; i < 3; i++) {
+        SnapshotContext ctx;
+        std::string label = fmt::format("manual-gen-{}", i);
+        begin_snapshot(meta_service.get(), cloud_unique_id, label, &ctx, false);
+        commit_snapshot(meta_service.get(), cloud_unique_id, ctx.snapshot_id, ctx.image_url,
+                        100 + i);
+        std::string image_path = "snapshot/" + ctx.snapshot_id + "/image.img";
+        accessor->put_file(image_path, "");
+        last_snapshot_id = ctx.snapshot_id;
+    }
+
+    std::vector<SnapshotInfoPB> snapshots;
+    get_snapshots(meta_service.get(), instance_id, snapshots);
+    ASSERT_EQ(snapshots.size(), 3);
+
+    auto checker = get_instance_checker(meta_service.get(), instance_id, accessor);
+
+    Versionstamp versionstamp = selectdb::parse_snapshot_versionstamp(last_snapshot_id);
+    std::string snapshot_key =
+            encode_versioned_key(versioned::snapshot_full_key(instance_id), versionstamp);
+
+    std::unique_ptr<Transaction> txn;
+    EXPECT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+    txn->remove(snapshot_key);
+    EXPECT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+
+    ASSERT_EQ(checker->do_snapshots_check(), 1);
 }

@@ -25,6 +25,7 @@
 namespace doris::cloud {
 
 class InstanceRecycler;
+class InstanceChecker;
 class StorageVaultAccessor;
 
 // A abstract class for managing cluster snapshots.
@@ -53,6 +54,10 @@ public:
     // Recycle snapshots that are expired or marked as recycled, based on the retention policy.
     // Return 0 for success otherwise error.
     virtual int recycle_snapshots(InstanceRecycler* recycler);
+
+    virtual int check_snapshots(InstanceChecker* checker);
+
+    virtual int inverted_check_snapshots(InstanceChecker* checker);
 
     // Recycle snapshot meta and data, return 0 for success otherwise error.
     virtual int recycle_snapshot_meta_and_data(std::string_view instance_id,

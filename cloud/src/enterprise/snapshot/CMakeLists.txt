@@ -3,6 +3,7 @@ set(LIBRARY_OUTPUT_PATH "${BUILD_DIR}/src/enterprise/snapshot/")
 
 set(ENTERPRISE_SNAPSHOT_SOURCES
     recycle_snapshot.cpp
+    check_snapshot.cpp
     snapshot_manager.cpp)
 
 add_compile_definitions(-DFEATURE_ENTERPRISE_SNAPSHOT)
