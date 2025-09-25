@@ -2660,8 +2660,5 @@ void InstanceChecker::get_all_accessor(std::vector<StorageVaultAccessor*>* acces
         accessors->push_back(accessor.get());
     }
 }
-<<<<<<< HEAD
 
-=======
->>>>>>> origin/master
 } // namespace doris::cloud

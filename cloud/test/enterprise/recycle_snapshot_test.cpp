@@ -1350,7 +1350,8 @@ TEST(RecycleSnapshotTest, InvertedCheckSnapshotAbnormal) {
 
     auto checker = get_instance_checker(meta_service.get(), instance_id, accessor);
 
-    Versionstamp versionstamp = selectdb::parse_snapshot_versionstamp(last_snapshot_id);
+    Versionstamp versionstamp;
+    ASSERT_TRUE(SnapshotManager::parse_snapshot_versionstamp(last_snapshot_id, &versionstamp));
     std::string snapshot_key =
             encode_versioned_key(versioned::snapshot_full_key(instance_id), versionstamp);
 

@@ -40,8 +40,8 @@ bool is_snapshot_normal(const SnapshotPB& snapshot_pb) {
 }
 
 int check_snapshot_file(TxnKv* txn_kv, std::string_view instance_id,
-                        const std::string& snapshot_versionstamp) {
-    if (!txn_kv || instance_id.empty() || snapshot_versionstamp.empty()) {
+                        const std::string& snapshot_id) {
+    if (!txn_kv || instance_id.empty() || snapshot_id.empty()) {
         return -1;
     }
     std::unique_ptr<Transaction> txn;
@@ -50,7 +50,14 @@ int check_snapshot_file(TxnKv* txn_kv, std::string_view instance_id,
         LOG_WARNING("failed to create txn for recycle snapshot").tag("error_code", err);
         return -1;
     }
-    Versionstamp versionstamp = parse_snapshot_versionstamp(snapshot_versionstamp);
+
+    Versionstamp versionstamp;
+    if (!SnapshotManager::parse_snapshot_versionstamp(snapshot_id, &versionstamp)) {
+        LOG_WARNING("invalid snapshot versionstamp format")
+                .tag("instance_id", instance_id)
+                .tag("snapshot_versionstamp", snapshot_id);
+    }
+
     std::string snapshot_key =
             encode_versioned_key(versioned::snapshot_full_key(instance_id), versionstamp);
 
@@ -60,14 +67,14 @@ int check_snapshot_file(TxnKv* txn_kv, std::string_view instance_id,
             LOG_WARNING("snapshot key not found, snapshot key loss or snapshot file leak")
                     .tag("instance_id", instance_id)
                     .tag("key", hex(snapshot_key))
-                    .tag("snapshot_versionstamp", snapshot_versionstamp);
+                    .tag("snapshot_versionstamp", snapshot_id);
             return 1;
         }
         LOG_WARNING("failed to get snapshot key")
                 .tag("instance_id", instance_id)
                 .tag("error_code", err)
                 .tag("key", hex(snapshot_key))
-                .tag("snapshot_versionstamp", snapshot_versionstamp);
+                .tag("snapshot_versionstamp", snapshot_id);
 
         return -1;
     }
@@ -112,15 +119,14 @@ int SnapshotManager::check_snapshots(InstanceChecker* checker) {
                 check_res = -1;
                 continue;
             }
-            std::string snapshot_versionstamp_str =
-                    serialize_snapshot_versionstamp(snapshot_versionstamp);
-            std::string snapshot_path = "snapshot/" + snapshot_versionstamp_str + "/";
+            std::string snapshot_id = serialize_snapshot_id(snapshot_versionstamp);
+            std::string snapshot_path = "snapshot/" + snapshot_id + "/";
             std::unique_ptr<ListIterator> list_iter;
             if (accessor->list_directory(snapshot_path, &list_iter) == 0) {
                 if (!list_iter->has_next()) {
                     LOG_WARNING("snapshot path not exist, snapshot file loss or snapshot key leak")
                             .tag("resource_id", snapshot_pb.resource_id())
-                            .tag("snapshot versionstamp", snapshot_versionstamp_str)
+                            .tag("snapshot versionstamp", snapshot_id)
                             .tag("snapshot_path", snapshot_path);
                     num_loss++;
                     check_res = 1;
@@ -128,7 +134,7 @@ int SnapshotManager::check_snapshots(InstanceChecker* checker) {
             } else {
                 LOG_WARNING("failed to check snapshot path existence")
                         .tag("resource_id", snapshot_pb.resource_id())
-                        .tag("snapshot versionstamp", snapshot_versionstamp_str)
+                        .tag("snapshot versionstamp", snapshot_id)
                         .tag("snapshot_path", snapshot_path);
                 check_res = -1;
             }

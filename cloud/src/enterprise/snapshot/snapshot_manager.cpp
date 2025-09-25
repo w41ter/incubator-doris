@@ -212,7 +212,7 @@ void SnapshotManager::begin_snapshot(std::string_view instance_id,
         return;
     }
 
-    std::string snapshot_id = serialize_snapshot_versionstamp(versionstamp);
+    std::string snapshot_id = serialize_snapshot_id(versionstamp);
     response->set_image_url("/snapshot/" + snapshot_id + "/");
     response->set_snapshot_id(snapshot_id);
     response->mutable_obj_info()->Swap(&obj_info);
@@ -784,10 +784,8 @@ void SnapshotManager::clone_instance(const doris::cloud::CloneInstanceRequest& r
 }
 
 std::pair<MetaServiceCode, std::string> SnapshotManager::set_multi_version_status(
-        std::string_view instance_id, std::string_view cloud_unique_id,
-        doris::cloud::MultiVersionStatus multi_version_status) {
+        std::string_view instance_id, doris::cloud::MultiVersionStatus multi_version_status) {
     LOG_INFO("set_multi_version_status")
-            .tag("cloud_unique_id", cloud_unique_id)
             .tag("instance_id", instance_id)
             .tag("multi_version_status", multi_version_status);
 

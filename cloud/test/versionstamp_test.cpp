@@ -154,20 +154,3 @@ TEST(VersionstampTest, Compare) {
         EXPECT_EQ(encoded.data()[i], v1.data().data()[i]) << "i: " << i;
     }
 }
-
-TEST(VersionstampTest, ToFromString) {
-    using namespace doris::cloud;
-
-    // Create a versionstamp from a byte array
-    constexpr uint8_t data[10] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A};
-    Versionstamp vs(data);
-    std::string vs_str = vs.to_string();
-    EXPECT_EQ(vs_str, "0102030405060708090a");
-
-    Versionstamp v2 = selectdb::parse_snapshot_versionstamp(vs_str);
-    EXPECT_EQ(v2 == vs, true);
-
-    // Test invalid string
-    Versionstamp v3 = selectdb::parse_snapshot_versionstamp("invalid_string");
-    EXPECT_EQ(v3 == Versionstamp::min(), true);
-}

@@ -126,6 +126,10 @@ public:
 
     int do_snapshots_check();
 
+    StorageVaultAccessor* get_accessor(const std::string& id);
+
+    void get_all_accessor(std::vector<StorageVaultAccessor*>* accessors);
+
     void TEST_add_accessor(std::string_view id, std::shared_ptr<StorageVaultAccessor> accessor) {
         accessor_map_.insert({std::string(id), std::move(accessor)});
     }
@@ -223,10 +227,6 @@ private:
      */
     int scan_and_handle_kv(std::string& start_key, const std::string& end_key,
                            std::function<int(std::string_view, std::string_view)> handle_kv);
-
-    StorageVaultAccessor* get_accessor(const std::string& id);
-
-    void get_all_accessor(std::vector<StorageVaultAccessor*>* accessors);
 
     std::atomic_bool stopped_ {false};
     std::shared_ptr<TxnKv> txn_kv_;
