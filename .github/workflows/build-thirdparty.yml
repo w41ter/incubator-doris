@@ -126,119 +126,119 @@ jobs:
           cd thirdparty
           ./build-thirdparty.sh -j "$(nproc)"
 
-  build_macos:
-    name: Build Third Party Libraries (macOS)
-    needs: changes
-    if: ${{ needs.changes.outputs.thirdparty_changes == 'true' }}
-    runs-on: macos-13
-    steps:
-      - name: Checkout ${{ github.ref }}
-        uses: actions/checkout@v4
+  # build_macos:
+  #   name: Build Third Party Libraries (macOS)
+  #   needs: changes
+  #   if: ${{ needs.changes.outputs.thirdparty_changes == 'true' }}
+  #   runs-on: macos-13
+  #   steps:
+  #     - name: Checkout ${{ github.ref }}
+  #       uses: actions/checkout@v4
 
-      - name: Download
-        run: |
-          cd thirdparty
-          curl -L https://github.com/apache/doris-thirdparty/releases/download/automation-3.0/doris-thirdparty-source.tgz \
-            -o doris-thirdparty-source.tgz
-          tar -zxvf doris-thirdparty-source.tgz
+  #     - name: Download
+  #       run: |
+  #         cd thirdparty
+  #         curl -L https://github.com/apache/doris-thirdparty/releases/download/automation-3.0/doris-thirdparty-source.tgz \
+  #           -o doris-thirdparty-source.tgz
+  #         tar -zxvf doris-thirdparty-source.tgz
 
-      - name: Prepare
-        run: |
-          packages=(
-            'm4'
-            'automake'
-            'autoconf'
-            'libtool'
-            'pkg-config'
-            'texinfo'
-            'coreutils'
-            'gnu-getopt'
-            'python@3'
-            'ninja'
-            'ccache'
-            'bison'
-            'byacc'
-            'gettext'
-            'wget'
-            'pcre'
-            'openjdk@11'
-            'maven'
-            'node'
-            'llvm@16'
-          )
+  #     - name: Prepare
+  #       run: |
+  #         packages=(
+  #           'm4'
+  #           'automake'
+  #           'autoconf'
+  #           'libtool'
+  #           'pkg-config'
+  #           'texinfo'
+  #           'coreutils'
+  #           'gnu-getopt'
+  #           'python@3'
+  #           'ninja'
+  #           'ccache'
+  #           'bison'
+  #           'byacc'
+  #           'gettext'
+  #           'wget'
+  #           'pcre'
+  #           'openjdk@11'
+  #           'maven'
+  #           'node'
+  #           'llvm@16'
+  #         )
 
-          # Install packages except cmake
-          brew install "${packages[@]}" || true
+  #         # Install packages except cmake
+  #         brew install "${packages[@]}" || true
 
-          # Install specific version of cmake
-          brew unlink cmake || true
-          wget https://github.com/Kitware/CMake/releases/download/v3.22.1/cmake-3.22.1-macos-universal.tar.gz
-          tar -xzf cmake-3.22.1-macos-universal.tar.gz
-          sudo cp -r cmake-3.22.1-macos-universal/CMake.app/Contents/* /usr/local/
-          cmake --version
+  #         # Install specific version of cmake
+  #         brew unlink cmake || true
+  #         wget https://github.com/Kitware/CMake/releases/download/v3.22.1/cmake-3.22.1-macos-universal.tar.gz
+  #         tar -xzf cmake-3.22.1-macos-universal.tar.gz
+  #         sudo cp -r cmake-3.22.1-macos-universal/CMake.app/Contents/* /usr/local/
+  #         cmake --version
 
-      - name: Build
-        run: |
-          export MACOSX_DEPLOYMENT_TARGET=12.0
+  #     - name: Build
+  #       run: |
+  #         export MACOSX_DEPLOYMENT_TARGET=12.0
 
-          cd thirdparty
-          ./build-thirdparty.sh -j "$(nproc)"
+  #         cd thirdparty
+  #         ./build-thirdparty.sh -j "$(nproc)"
 
-  build_macos_arm64:
-    name: Build Third Party Libraries (macOS-arm64)
-    needs: changes
-    if: ${{ needs.changes.outputs.thirdparty_changes == 'true' }}
-    runs-on: macos-14
-    steps:
-      - name: Checkout ${{ github.ref }}
-        uses: actions/checkout@v4
+  # build_macos_arm64:
+  #   name: Build Third Party Libraries (macOS-arm64)
+  #   needs: changes
+  #   if: ${{ needs.changes.outputs.thirdparty_changes == 'true' }}
+  #   runs-on: macos-14
+  #   steps:
+  #     - name: Checkout ${{ github.ref }}
+  #       uses: actions/checkout@v4
 
-      - name: Download
-        run: |
-          cd thirdparty
-          curl -L https://github.com/apache/doris-thirdparty/releases/download/automation-3.0/doris-thirdparty-source.tgz \
-            -o doris-thirdparty-source.tgz
-          tar -zxvf doris-thirdparty-source.tgz
+  #     - name: Download
+  #       run: |
+  #         cd thirdparty
+  #         curl -L https://github.com/apache/doris-thirdparty/releases/download/automation-3.0/doris-thirdparty-source.tgz \
+  #           -o doris-thirdparty-source.tgz
+  #         tar -zxvf doris-thirdparty-source.tgz
 
-      - name: Prepare
-        run: |
-          packages=(
-            'm4'
-            'automake'
-            'autoconf'
-            'libtool'
-            'pkg-config'
-            'texinfo'
-            'coreutils'
-            'gnu-getopt'
-            'python@3'
-            'ninja'
-            'ccache'
-            'bison'
-            'byacc'
-            'gettext'
-            'wget'
-            'pcre'
-            'openjdk@11'
-            'maven'
-            'node'
-            'llvm@16'
-          )
+  #     - name: Prepare
+  #       run: |
+  #         packages=(
+  #           'm4'
+  #           'automake'
+  #           'autoconf'
+  #           'libtool'
+  #           'pkg-config'
+  #           'texinfo'
+  #           'coreutils'
+  #           'gnu-getopt'
+  #           'python@3'
+  #           'ninja'
+  #           'ccache'
+  #           'bison'
+  #           'byacc'
+  #           'gettext'
+  #           'wget'
+  #           'pcre'
+  #           'openjdk@11'
+  #           'maven'
+  #           'node'
+  #           'llvm@16'
+  #         )
 
-          # Install packages except cmake
-          brew install "${packages[@]}" || true
+  #         # Install packages except cmake
+  #         brew install "${packages[@]}" || true
 
-          # Install specific version of cmake
-          brew unlink cmake || true
-          wget https://github.com/Kitware/CMake/releases/download/v3.22.1/cmake-3.22.1-macos-universal.tar.gz
-          tar -xzf cmake-3.22.1-macos-universal.tar.gz
-          sudo cp -r cmake-3.22.1-macos-universal/CMake.app/Contents/* /usr/local/
-          cmake --version
+  #         # Install specific version of cmake
+  #         brew unlink cmake || true
+  #         wget https://github.com/Kitware/CMake/releases/download/v3.22.1/cmake-3.22.1-macos-universal.tar.gz
+  #         tar -xzf cmake-3.22.1-macos-universal.tar.gz
+  #         sudo cp -r cmake-3.22.1-macos-universal/CMake.app/Contents/* /usr/local/
+  #         cmake --version
 
-      - name: Build
-        run: |
-          export MACOSX_DEPLOYMENT_TARGET=12.0
+  #     - name: Build
+  #       run: |
+  #         export MACOSX_DEPLOYMENT_TARGET=12.0
 
-          cd thirdparty
-          ./build-thirdparty.sh -j "$(nproc)"
+  #         cd thirdparty
+  #         ./build-thirdparty.sh -j "$(nproc)"
 

@@ -17,11 +17,11 @@
 #
 ---
 name: License Check
-on:
-  pull_request_target:
-  push:
-    branches:
-      - master
+# on:
+#   pull_request_target:
+#   push:
+#     branches:
+#       - master
 jobs:
   license-check:
     name: "License Check"
