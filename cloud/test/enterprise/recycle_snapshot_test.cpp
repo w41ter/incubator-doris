@@ -660,7 +660,7 @@ void update_snapshot_properties(MetaServiceProxy* meta_service, const std::strin
     AlterInstanceRequest req;
     req.set_instance_id(instance_id);
     req.set_op(AlterInstanceRequest::SET_SNAPSHOT_PROPERTY);
-    req.mutable_properties()->insert({"enabled", enable_snapshot ? "true" : "false"});
+    req.mutable_properties()->insert({"status", enable_snapshot ? "ENABLED" : "DISABLED"});
     req.mutable_properties()->insert(
             {"max_reserved_snapshots", std::to_string(max_reserved_snapshots)});
     req.mutable_properties()->insert(

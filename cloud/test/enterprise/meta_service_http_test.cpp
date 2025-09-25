@@ -351,7 +351,7 @@ TEST(MetaServiceHttpTest, SetSnapshotPropertyHttpTest) {
         req.set_instance_id(instance_id);
         req.set_op(AlterInstanceRequest::SET_SNAPSHOT_PROPERTY);
         auto& properties = *req.mutable_properties();
-        properties["enabled"] = "true";
+        properties["status"] = "ENABLED";
         properties["max_reserved_snapshots"] = "10";
         properties["snapshot_interval_seconds"] = "3600";
 
@@ -366,7 +366,7 @@ TEST(MetaServiceHttpTest, SetSnapshotPropertyHttpTest) {
         req.set_instance_id(instance_id);
         req.set_op(AlterInstanceRequest::SET_SNAPSHOT_PROPERTY);
         auto& properties = *req.mutable_properties();
-        properties["enabled"] = "false";
+        properties["status"] = "DISABLED";
         properties["max_reserved_snapshots"] = "5";
         properties["snapshot_interval_seconds"] = "3600";
 
@@ -387,7 +387,7 @@ TEST(MetaServiceHttpTest, SetSnapshotPropertyInvalidValuesHttpTest) {
         req.set_instance_id(instance_id);
         req.set_op(AlterInstanceRequest::SET_SNAPSHOT_PROPERTY);
         auto& properties = *req.mutable_properties();
-        properties["enabled"] = "invalid_value";
+        properties["status"] = "invalid_value";
 
         auto [status_code, resp] = ctx.forward<AlterInstanceResponse>("set_snapshot_property", req);
         ASSERT_EQ(status_code, 400);
@@ -445,7 +445,7 @@ TEST(MetaServiceHttpTest, GetSnapshotPropertyHttpTest) {
         req.set_instance_id(instance_id);
         req.set_op(AlterInstanceRequest::SET_SNAPSHOT_PROPERTY);
         auto& properties = *req.mutable_properties();
-        properties["enabled"] = "true";
+        properties["status"] = "ENABLED";
         properties["max_reserved_snapshots"] = "10";
         properties["snapshot_interval_seconds"] = "3600";
 
@@ -461,7 +461,7 @@ TEST(MetaServiceHttpTest, GetSnapshotPropertyHttpTest) {
         ASSERT_EQ(status_code, 200);
 
         // Check the response contains snapshot properties
-        EXPECT_TRUE(response_body.find("enabled") != std::string::npos);
+        EXPECT_TRUE(response_body.find("status") != std::string::npos);
         EXPECT_TRUE(response_body.find("max_reserved_snapshots") != std::string::npos);
         EXPECT_TRUE(response_body.find("snapshot_interval_seconds") != std::string::npos);
     }
@@ -473,7 +473,7 @@ TEST(MetaServiceHttpTest, GetSnapshotPropertyHttpTest) {
         ASSERT_EQ(status_code, 200);
 
         // Check the response contains snapshot properties
-        EXPECT_TRUE(response_body.find("enabled") != std::string::npos);
+        EXPECT_TRUE(response_body.find("status") != std::string::npos);
         EXPECT_TRUE(response_body.find("max_reserved_snapshots") != std::string::npos);
         EXPECT_TRUE(response_body.find("snapshot_interval_seconds") != std::string::npos);
     }
@@ -492,19 +492,20 @@ TEST(MetaServiceHttpTest, ListSnapshotHttpTest) {
     std::string instance_id = "test_list_snapshot_instance";
     create_test_instance_for_snapshot(ctx, instance_id);
 
-    // Enable multi-version for snapshot functionality
+    // Initialize snapshot switch status to OFF so we can test snapshot functionality
     {
-        std::unique_ptr<Transaction> txn;
-        ASSERT_EQ(ctx.meta_service()->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
         InstanceKeyInfo key_info {instance_id};
         std::string key;
         std::string val;
         instance_key(key_info, &key);
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(ctx.meta_service()->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
         ASSERT_EQ(txn->get(key, &val), TxnErrorCode::TXN_OK);
-        InstanceInfoPB instance_info;
-        ASSERT_TRUE(instance_info.ParseFromString(val));
-        instance_info.set_multi_version_status(MultiVersionStatus::MULTI_VERSION_ENABLED);
-        txn->put(key, instance_info.SerializeAsString());
+        InstanceInfoPB instance;
+        instance.ParseFromString(val);
+        instance.set_snapshot_switch_status(SNAPSHOT_SWITCH_ON);
+        val = instance.SerializeAsString();
+        txn->put(key, val);
         ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
     }
 
@@ -610,6 +611,25 @@ TEST(MetaServiceHttpTest, ListSnapshotHttpTest) {
         ctx.meta_service()->list_snapshot(&ctrl, &req, &direct_resp, nullptr);
         ASSERT_EQ(direct_resp.status().code(), MetaServiceCode::INVALID_ARGUMENT);
     }
+
+    // Test list snapshot with instance_id (new preferred method)
+    {
+        ListSnapshotRequest req;
+        req.set_instance_id(instance_id);
+
+        // Test HTTP endpoint returns 200 and OK status
+        auto [status_code, resp] = ctx.forward<ListSnapshotResponse>("list_snapshot", req);
+        ASSERT_EQ(status_code, 200);
+        ASSERT_EQ(resp.status().code(), MetaServiceCode::OK);
+
+        // Verify business logic with direct service call
+        brpc::Controller ctrl;
+        ListSnapshotResponse direct_resp;
+        ctx.meta_service()->list_snapshot(&ctrl, &req, &direct_resp, nullptr);
+        ASSERT_EQ(direct_resp.status().code(), MetaServiceCode::OK);
+        EXPECT_EQ(direct_resp.snapshots_size(), 1);
+        EXPECT_EQ(direct_resp.snapshots(0).snapshot_id(), snapshot_id);
+    }
 }
 
 TEST(MetaServiceHttpTest, SetMultiVersionStatusTest) {
@@ -632,8 +652,7 @@ TEST(MetaServiceHttpTest, SetMultiVersionStatusTest) {
     {
         auto [http_code, response] = ctx.query<MetaServiceResponseStatus>(
                 "set_multi_version_status",
-                fmt::format("cloud_unique_id=test_cloud_unique_id&"
-                            "instance_id={}&multi_version_status=MULTI_VERSION_WRITE_ONLY",
+                fmt::format("instance_id={}&multi_version_status=MULTI_VERSION_WRITE_ONLY",
                             instance_id));
         ASSERT_EQ(http_code, 200);
         ASSERT_EQ(response.code(), MetaServiceCode::OK);
@@ -654,10 +673,9 @@ TEST(MetaServiceHttpTest, SetMultiVersionStatusTest) {
     // Test 3: Set multi-version status to ENABLED using string enum
     {
         auto [http_code, response] = ctx.query<MetaServiceResponseStatus>(
-                "set_multi_version_status",
-                fmt::format("cloud_unique_id=test_cloud_unique_id&instance_id={}&multi_version_"
-                            "status=MULTI_VERSION_ENABLED",
-                            instance_id));
+                "set_multi_version_status", fmt::format("instance_id={}&multi_version_"
+                                                        "status=MULTI_VERSION_ENABLED",
+                                                        instance_id));
         ASSERT_EQ(http_code, 200);
         ASSERT_EQ(response.code(), MetaServiceCode::OK);
     }
@@ -685,10 +703,9 @@ TEST(MetaServiceHttpTest, SetMultiVersionStatusTest) {
     // Test 6: Test with invalid multi_version_status value
     {
         auto [http_code, response] = ctx.query<MetaServiceResponseStatus>(
-                "set_multi_version_status",
-                fmt::format("cloud_unique_id=test_cloud_unique_id&instance_id={}&multi_version_"
-                            "status=invalid",
-                            instance_id));
+                "set_multi_version_status", fmt::format("instance_id={}&multi_version_"
+                                                        "status=invalid",
+                                                        instance_id));
         ASSERT_EQ(http_code, 400);
         ASSERT_EQ(response.code(), MetaServiceCode::INVALID_ARGUMENT);
     }

@@ -1865,8 +1865,6 @@ std::pair<MetaServiceCode, std::string> handle_snapshot_switch(const std::string
             instance->set_max_reserved_snapshot(1);
             LOG(INFO) << "Set default max_reserved_snapshots to 1 for instance " << instance_id;
         }
-    } else {
-        instance->set_snapshot_switch_status(SNAPSHOT_SWITCH_OFF);
     }
 
     std::string msg = "Set snapshot enabled to " + value + " for instance " + instance_id;

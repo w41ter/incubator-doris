@@ -1860,7 +1860,7 @@ TEST(MetaServiceSnapshotTest, BeginAutoSnapshotDisabledTest) {
         AlterInstanceResponse alter_res;
         alter_req.set_op(AlterInstanceRequest::SET_SNAPSHOT_PROPERTY);
         alter_req.set_instance_id("test_instance");
-        (*alter_req.mutable_properties())["enabled"] = "true";
+        (*alter_req.mutable_properties())["status"] = "ENABLED";
         (*alter_req.mutable_properties())["max_reserved_snapshots"] = "0"; // Disable auto snapshot
 
         meta_service->alter_instance(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
