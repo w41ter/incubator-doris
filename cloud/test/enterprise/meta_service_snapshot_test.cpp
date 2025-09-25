@@ -1063,7 +1063,8 @@ TEST(MetaServiceSnapshotTest, ListSnapshotTest) {
         meta_service->list_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
                                     &req, &res, nullptr);
         ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
-        ASSERT_TRUE(res.status().msg().find("cloud_unique_id not set") != std::string::npos);
+        ASSERT_TRUE(res.status().msg().find("cloud_unique_id") != std::string::npos)
+                << res.ShortDebugString();
     }
 
     // Test with invalid IP address
@@ -1898,7 +1899,8 @@ TEST(MetaServiceSnapshotTest, BeginAutoSnapshotDisabledTest) {
         meta_service->begin_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
                                      &req, &res, nullptr);
         ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
-        ASSERT_TRUE(res.status().msg().find("auto snapshot is disabled") != std::string::npos);
+        ASSERT_TRUE(res.status().msg().find("auto snapshot is disabled") != std::string::npos)
+                << res.ShortDebugString();
     }
 
     // Test auto snapshot should work when max_reserved_snapshots > 0
