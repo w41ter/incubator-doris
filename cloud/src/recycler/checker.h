@@ -126,12 +126,6 @@ public:
 
     int do_snapshots_check();
 
-    StorageVaultAccessor* get_accessor(const std::string& id);
-
-    void get_all_accessor(std::vector<StorageVaultAccessor*>* accessors);
-
-    std::string_view instance_id() const { return instance_id_; }
-
     void TEST_add_accessor(std::string_view id, std::shared_ptr<StorageVaultAccessor> accessor) {
         accessor_map_.insert({std::string(id), std::move(accessor)});
     }
@@ -142,6 +136,7 @@ public:
     int get_bucket_lifecycle(int64_t* lifecycle_days);
     void stop() { stopped_.store(true, std::memory_order_release); }
     bool stopped() const { return stopped_.load(std::memory_order_acquire); }
+    std::string_view instance_id() const { return instance_id_; }
 
 private:
     struct RowsetIndexesFormatV1 {
@@ -228,6 +223,10 @@ private:
      */
     int scan_and_handle_kv(std::string& start_key, const std::string& end_key,
                            std::function<int(std::string_view, std::string_view)> handle_kv);
+
+    StorageVaultAccessor* get_accessor(const std::string& id);
+
+    void get_all_accessor(std::vector<StorageVaultAccessor*>* accessors);
 
     std::atomic_bool stopped_ {false};
     std::shared_ptr<TxnKv> txn_kv_;

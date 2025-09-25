@@ -51,7 +51,7 @@
 #include "meta-store/blob_message.h"
 #include "meta-store/keys.h"
 #include "meta-store/txn_kv.h"
-#include "meta-store/txn_kv_error.h"
+#include "snapshot/snapshot_manager.h"
 #ifdef ENABLE_HDFS_STORAGE_VAULT
 #include "recycler/hdfs_accessor.h"
 #endif
@@ -428,9 +428,9 @@ int key_exist(TxnKv* txn_kv, std::string_view key) {
 InstanceChecker::InstanceChecker(std::shared_ptr<TxnKv> txn_kv, const std::string& instance_id)
         : txn_kv_(txn_kv), instance_id_(instance_id) {
 #ifdef FEATURE_ENTERPRISE_SNAPSHOT
-    snapshot_manager_ = std::make_shared<selectdb::SnapshotManager>(txn_kv_);
+    snapshot_manager_ = std::make_shared<selectdb::SnapshotManager>(std::move(txn_kv));
 #else
-    snapshot_manager_ = std::make_shared<SnapshotManager>(txn_kv_);
+    snapshot_manager_ = std::make_shared<SnapshotManager>(std::move(txn_kv));
 #endif
 }
 
@@ -2660,5 +2660,8 @@ void InstanceChecker::get_all_accessor(std::vector<StorageVaultAccessor*>* acces
         accessors->push_back(accessor.get());
     }
 }
+<<<<<<< HEAD
 
+=======
+>>>>>>> origin/master
 } // namespace doris::cloud

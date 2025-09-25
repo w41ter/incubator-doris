@@ -15,11 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package org.apache.doris.nereids.trees.expressions.functions.generator;
+package org.apache.doris.job.base;
 
-/**
- * interface for all functions need to be rewritten.
- */
-public interface RewriteWhenAnalyze {
-    TableGeneratingFunction rewrite();
+
+public interface JobProperties {
 }

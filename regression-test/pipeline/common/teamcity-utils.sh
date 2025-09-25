@@ -27,6 +27,12 @@ declare -A targetBranch_to_pipelines
 targetBranch_to_pipelines=(
     ['branch-selectdb-doris-3.0']='feut beut cloudut compile p0 p1 external performance cloud_p0 cloud_p1 vault_p0 nonConcurrent check_coverage'
     ['branch-selectdb-doris-3.1']='feut beut cloudut compile p0 p1 external performance cloud_p0 cloud_p1 vault_p0 nonConcurrent check_coverage'
+    ['master']='feut beut cloudut compile p0 p1 external performance cloud_p0 cloud_p1 vault_p0 nonConcurrent check_coverage check_coverage_fe'
+    ['branch-4.0']='feut beut cloudut compile p0 p1 external performance cloud_p0 cloud_p1 vault_p0 nonConcurrent check_coverage check_coverage_fe'
+    ['branch-3.1']='feut beut cloudut compile p0 p1 external performance cloud_p0 cloud_p1 vault_p0 nonConcurrent check_coverage check_coverage_fe'
+    ['branch-3.0']='feut beut cloudut compile p0 p1 external performance cloud_p0 cloud_p1 vault_p0 nonConcurrent check_coverage'
+    ['branch-2.1']='feut beut compile p0 p1 external'
+    ['branch-2.0']='feut beut compile p0 p1 external performance'
 )
 
 # github中评论的要触发的流水线名字
@@ -36,6 +42,7 @@ targetBranch_to_pipelines=(
 # 新加流水线需要修改这里
 declare -A comment_to_pipeline
 comment_to_pipeline=(
+<<<<<<< HEAD
     ['feut']='SelectdbCore_Feut'
     ['beut']='SelectdbCore_Beut'
     ['cloudut']='SelectdbCore_Cloudut'
@@ -50,6 +57,21 @@ comment_to_pipeline=(
     ['performance']='SelectdbCore_Performance'
     ['check_coverage']='SelectdbCore_Check_Coverage'
     ['arm']='SelectdbCore_Arm'
+=======
+    ['feut']='Doris_Doris_FeUt'
+    ['beut']='Doris_DorisBeUt_BeUt'
+    ['cloudut']='Doris_DorisCloudUt_CloudUt'
+    ['compile']='Doris_DorisCompile_Compile'
+    ['p0']='Doris_DorisRegression_P0Regression'
+    ['p1']='Doris_DorisRegression_P1Regression'
+    ['external']='Doris_External_Regression'
+    ['performance']='Doris_DorisPerformance_Performance'
+    ['cloud_p0']='Doris_DorisRegression_CloudP0'
+    ['cloud_p1']='Doris_DorisCloudRegression_CloudP1'
+    ['vault_p0']='Doris_DorisCloudRegression_VaultP0'
+    ['nonConcurrent']='Doris_DorisRegression_NonConcurrentRegression'
+    ['check_coverage']='Doris_Coverage_Merge_P0_UT'
+>>>>>>> origin/master
 )
 
 # github中评论的要触发的流水线名字
@@ -59,6 +81,7 @@ comment_to_pipeline=(
 # 新加流水线需要修改这里
 declare -A conment_to_context
 conment_to_context=(
+<<<<<<< HEAD
     ['compile']='compile (Selectdb Core)'
     ['feut']='feut (Selectdb Core)'
     ['beut']='beut (Selectdb Core)'
@@ -72,6 +95,20 @@ conment_to_context=(
     ['nonConcurrent']='nonConcurrent (Regression)'
     ['arm']='arm (ARM)'
     ['performance']='performance (Performance)'
+=======
+    ['compile']='COMPILE (DORIS_COMPILE)'
+    ['feut']='FE UT (Doris FE UT)'
+    ['beut']='BE UT (Doris BE UT)'
+    ['cloudut']='Cloud UT (Doris Cloud UT)'
+    ['p0']='P0 Regression (Doris Regression)'
+    ['p1']='P1 Regression (Doris Regression)'
+    ['external']='External Regression (Doris External Regression)'
+    ['performance']='performance (Doris Performance)'
+    ['cloud_p0']='cloud_p0 (Doris Cloud Regression)'
+    ['cloud_p1']='cloud_p1 (Doris Cloud Regression)'
+    ['vault_p0']='vault_p0 (Doris Cloud Regression)'
+    ['nonConcurrent']='NonConcurrent Regression (Doris Regression)'
+>>>>>>> origin/master
     ['check_coverage']='check_coverage (Coverage)'
 )
 
