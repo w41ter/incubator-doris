@@ -1,8 +1,6 @@
 #include "snapshot_manager.h"
 
-#include <arpa/inet.h>
 #include <gen_cpp/cloud.pb.h>
-#include <netinet/in.h>
 
 #include "common/encryption_util.h"
 #include "common/util.h"
@@ -33,13 +31,6 @@ using doris::cloud::decode_versioned_key;
 using doris::cloud::hex;
 
 namespace selectdb {
-
-static bool is_valid_ip_address(const std::string& ip) {
-    struct sockaddr_in sa;
-    struct sockaddr_in6 sa6;
-    return (inet_pton(AF_INET, ip.c_str(), &(sa.sin_addr)) == 1) ||
-           (inet_pton(AF_INET6, ip.c_str(), &(sa6.sin6_addr)) == 1);
-}
 
 static bool decrypt_object_store_info_ak_sk(doris::cloud::ObjectStoreInfoPB* obj_info) {
     if (!obj_info->has_encryption_info()) {
@@ -90,15 +81,6 @@ void SnapshotManager::begin_snapshot(std::string_view instance_id,
         return;
     }
 
-    // Validate request IP format if provided
-    if (request.has_request_ip() && !request.request_ip().empty()) {
-        if (!is_valid_ip_address(request.request_ip())) {
-            status->set_code(MetaServiceCode::INVALID_ARGUMENT);
-            status->set_msg("invalid request IP address format");
-            return;
-        }
-    }
-
     std::unique_ptr<Transaction> txn;
     TxnErrorCode err = txn_kv_->create_txn(&txn);
     if (err != TxnErrorCode::TXN_OK) {
@@ -136,7 +118,9 @@ void SnapshotManager::begin_snapshot(std::string_view instance_id,
 
     if (instance.snapshot_switch_status() != SnapshotSwitchStatus::SNAPSHOT_SWITCH_ON) {
         status->set_code(MetaServiceCode::INVALID_ARGUMENT);
-        status->set_msg("failed to begin snapshot, because the snapshot feature is disabled");
+        status->set_msg(
+                "failed to begin snapshot, because the snapshot feature is disabled. Please enable "
+                "snapshot feature by executeing: `ADMIN SET CLUSTER SNAPSHOT FEATURE ON`");
         return;
     }
 
@@ -242,15 +226,6 @@ void SnapshotManager::commit_snapshot(std::string_view instance_id,
         status->set_code(MetaServiceCode::INVALID_ARGUMENT);
         status->set_msg("last_journal_id not set");
         return;
-    }
-
-    // Validate IP if provided
-    if (request.has_request_ip() && !request.request_ip().empty()) {
-        if (!is_valid_ip_address(request.request_ip())) {
-            status->set_code(MetaServiceCode::INVALID_ARGUMENT);
-            status->set_msg("invalid request IP address format");
-            return;
-        }
     }
 
     std::string snapshot_id = request.snapshot_id();
@@ -361,15 +336,6 @@ void SnapshotManager::abort_snapshot(std::string_view instance_id,
         return;
     }
 
-    // Validate IP if provided
-    if (request.has_request_ip() && !request.request_ip().empty()) {
-        if (!is_valid_ip_address(request.request_ip())) {
-            status->set_code(MetaServiceCode::INVALID_ARGUMENT);
-            status->set_msg("invalid request IP address format");
-            return;
-        }
-    }
-
     std::string snapshot_id = request.snapshot_id();
     std::string reason = request.has_reason() ? request.reason() : "Aborted by user";
 
@@ -477,15 +443,6 @@ void SnapshotManager::drop_snapshot(std::string_view instance_id,
 
     std::string snapshot_id = request.snapshot_id();
 
-    // Validate IP if provided
-    if (request.has_request_ip() && !request.request_ip().empty()) {
-        if (!is_valid_ip_address(request.request_ip())) {
-            status->set_code(MetaServiceCode::INVALID_ARGUMENT);
-            status->set_msg("invalid request IP address format");
-            return;
-        }
-    }
-
     Versionstamp snapshot_versionstamp;
     if (!parse_snapshot_versionstamp(snapshot_id, &snapshot_versionstamp)) {
         status->set_code(MetaServiceCode::INVALID_ARGUMENT);
@@ -563,14 +520,6 @@ void SnapshotManager::list_snapshot(std::string_view instance_id,
     std::string required_snapshot_id =
             request.has_required_snapshot_id() ? request.required_snapshot_id() : "";
     bool include_aborted = request.has_include_aborted() ? request.include_aborted() : false;
-
-    if (request.has_request_ip() && !request.request_ip().empty()) {
-        if (!is_valid_ip_address(request.request_ip())) {
-            status->set_code(MetaServiceCode::INVALID_ARGUMENT);
-            status->set_msg("invalid request IP address format");
-            return;
-        }
-    }
 
     std::unique_ptr<Transaction> txn;
     TxnErrorCode err = txn_kv_->create_txn(&txn);
