@@ -97,7 +97,7 @@ suite("test_materialized_view_with_readd_cluster") {
     sql "insert into ${tbName1} values(2, 1, 'test1', 100,100);"
     sql "insert into ${tbName1} values(3, 1, 'test1', 100,100);"
 
-    sql """create materialized view ${mvName1} as select siteid from ${tbName1} group by siteid;""";
+    sql """create materialized view ${mvName1} as select siteid as siteid_view from ${tbName1} group by siteid;""";
 
     // drop cluster
     drop_cluster.call("regression_cluster_name0", "regression_cluster_id0");
@@ -137,7 +137,7 @@ suite("test_materialized_view_with_readd_cluster") {
         }
     }
 
-    sql """create materialized view ${mvName2} as select siteid from ${tbName1} group by siteid;""";
+    sql """create materialized view ${mvName2} as select siteid as siteid_view from ${tbName1} group by siteid;""";
     max_try_secs = 60
     while (max_try_secs--) {
         String res = getJobMaterializedState(tbName1)

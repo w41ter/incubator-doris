@@ -99,7 +99,7 @@ suite("test_materialized_with_drop_cluster") {
     sql "insert into ${tbName1} values(3, 1, 'test1', 100,100);"
 
 
-    sql """create materialized view ${mvName1} as select siteid from ${tbName1} group by siteid;""";
+    sql """create materialized view ${mvName1} as select siteid as siteid_view from ${tbName1} group by siteid;""";
 
     // drop cluster
     drop_cluster.call("regression_cluster_name0", "regression_cluster_id0");
