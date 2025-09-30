@@ -14,17 +14,35 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+// This file is copied from
+// https://github.com/apache/impala/blob/branch-2.9.0/fe/src/main/java/org/apache/impala/SlotRef.java
+// and modified by Doris
 
-package org.apache.doris.analysis;
+package org.apache.doris.info;
 
-public abstract class DdlStmt extends StatementBase implements NotFallbackInParser {
-    @Override
-    public RedirectStatus getRedirectStatus() {
-        return RedirectStatus.FORWARD_WITH_SYNC;
+import org.apache.doris.catalog.TableIf;
+
+/**
+ * BaseTableRefInfo
+ */
+public class BaseTableRefInfo extends TableRefInfo {
+    private TableIf table;
+
+    public BaseTableRefInfo(TableRefInfo tableRefInfo, TableNameInfo tableNameInfo, TableIf table) {
+        super(tableRefInfo);
+        this.table = table;
+        this.tableNameInfo = tableNameInfo;
+        tableAlias = tableNameInfo.getTableAlias();
+    }
+
+    protected BaseTableRefInfo(BaseTableRefInfo other) {
+        super(other);
+        tableNameInfo = other.tableNameInfo;
+        table = other.table;
     }
 
     @Override
-    public StmtType stmtType() {
-        return StmtType.DDL;
+    public TableRefInfo clone() {
+        return new BaseTableRefInfo(this);
     }
 }
