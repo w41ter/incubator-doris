@@ -11,6 +11,11 @@
 #include <cstdint>
 
 #include "common/config.h"
+#include "common/logging.h"
+#include "common/util.h"
+#include "meta-store/keys.h"
+#include "meta-store/txn_kv.h"
+#include "meta-store/versioned_value.h"
 #include "meta-store/versionstamp.h"
 
 using namespace doris::cloud;
@@ -54,65 +59,65 @@ inline static bool is_snapshot_expired(const SnapshotPB& snapshot_pb) {
     return system_clock_now_seconds() >= deadline;
 }
 
-// inline static Versionstamp parse_snapshot_versionstamp(const std::string& str) {
-//     if (str.size() != 20) {
-//         return Versionstamp::min();
-//     }
+inline static Versionstamp parse_snapshot_versionstamp(const std::string& str) {
+    if (str.size() != 20) {
+        return Versionstamp::min();
+    }
 
-//     std::array<uint8_t, 10> data;
-//     for (size_t i = 0; i < 10; ++i) {
-//         std::string byte_str = str.substr(i * 2, 2);
-//         data[i] = static_cast<uint8_t>(std::stoul(byte_str, nullptr, 16));
-//     }
-//     return {data};
-// }
+    std::array<uint8_t, 10> data;
+    for (size_t i = 0; i < 10; ++i) {
+        std::string byte_str = str.substr(i * 2, 2);
+        data[i] = static_cast<uint8_t>(std::stoul(byte_str, nullptr, 16));
+    }
+    return {data};
+}
 
-// inline static std::string serialize_snapshot_versionstamp(Versionstamp snapshot_versionstamp) {
-//     return snapshot_versionstamp.to_string();
-// }
+inline static std::string serialize_snapshot_versionstamp(Versionstamp snapshot_versionstamp) {
+    return snapshot_versionstamp.to_string();
+}
 
-// // Parse hex-encoded versionstamp from snapshot ID.
-// // The snapshot ID is expected to be a 20-character hex string representing 10 bytes.
-// inline static bool parse_snapshot_versionstamp(std::string_view snapshot_id,
-//                                                Versionstamp* versionstamp) {
-//     if (snapshot_id.size() != 20) {
-//         return false;
-//     }
+// Parse hex-encoded versionstamp from snapshot ID.
+// The snapshot ID is expected to be a 20-character hex string representing 10 bytes.
+inline static bool parse_snapshot_versionstamp(std::string_view snapshot_id,
+                                               Versionstamp* versionstamp) {
+    if (snapshot_id.size() != 20) {
+        return false;
+    }
 
-//     std::array<uint8_t, 10> versionstamp_data;
-//     for (size_t i = 0; i < 10; ++i) {
-//         const char* hex_chars = snapshot_id.data() + (i * 2);
+    std::array<uint8_t, 10> versionstamp_data;
+    for (size_t i = 0; i < 10; ++i) {
+        const char* hex_chars = snapshot_id.data() + (i * 2);
 
-//         // Convert two hex digits to one byte more efficiently
-//         uint8_t high_nibble = 0, low_nibble = 0;
+        // Convert two hex digits to one byte more efficiently
+        uint8_t high_nibble = 0, low_nibble = 0;
 
-//         // Parse high nibble
-//         if (hex_chars[0] >= '0' && hex_chars[0] <= '9') {
-//             high_nibble = hex_chars[0] - '0';
-//         } else if (hex_chars[0] >= 'a' && hex_chars[0] <= 'f') {
-//             high_nibble = hex_chars[0] - 'a' + 10;
-//         } else if (hex_chars[0] >= 'A' && hex_chars[0] <= 'F') {
-//             high_nibble = hex_chars[0] - 'A' + 10;
-//         } else {
-//             return false;
-//         }
+        // Parse high nibble
+        if (hex_chars[0] >= '0' && hex_chars[0] <= '9') {
+            high_nibble = hex_chars[0] - '0';
+        } else if (hex_chars[0] >= 'a' && hex_chars[0] <= 'f') {
+            high_nibble = hex_chars[0] - 'a' + 10;
+        } else if (hex_chars[0] >= 'A' && hex_chars[0] <= 'F') {
+            high_nibble = hex_chars[0] - 'A' + 10;
+        } else {
+            return false;
+        }
 
-//         // Parse low nibble
-//         if (hex_chars[1] >= '0' && hex_chars[1] <= '9') {
-//             low_nibble = hex_chars[1] - '0';
-//         } else if (hex_chars[1] >= 'a' && hex_chars[1] <= 'f') {
-//             low_nibble = hex_chars[1] - 'a' + 10;
-//         } else if (hex_chars[1] >= 'A' && hex_chars[1] <= 'F') {
-//             low_nibble = hex_chars[1] - 'A' + 10;
-//         } else {
-//             return false;
-//         }
+        // Parse low nibble
+        if (hex_chars[1] >= '0' && hex_chars[1] <= '9') {
+            low_nibble = hex_chars[1] - '0';
+        } else if (hex_chars[1] >= 'a' && hex_chars[1] <= 'f') {
+            low_nibble = hex_chars[1] - 'a' + 10;
+        } else if (hex_chars[1] >= 'A' && hex_chars[1] <= 'F') {
+            low_nibble = hex_chars[1] - 'A' + 10;
+        } else {
+            return false;
+        }
 
-//         versionstamp_data[i] = (high_nibble << 4) | low_nibble;
-//     }
+        versionstamp_data[i] = (high_nibble << 4) | low_nibble;
+    }
 
-//     *versionstamp = Versionstamp(versionstamp_data);
-//     return true;
-// }
+    *versionstamp = Versionstamp(versionstamp_data);
+    return true;
+}
 
 } // namespace selectdb
