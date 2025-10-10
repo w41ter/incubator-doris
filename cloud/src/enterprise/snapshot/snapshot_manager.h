@@ -19,6 +19,9 @@ public:
     void begin_snapshot(std::string_view instance_id,
                         const doris::cloud::BeginSnapshotRequest& request,
                         doris::cloud::BeginSnapshotResponse* response) override;
+    void update_snapshot(std::string_view instance_id,
+                         const doris::cloud::UpdateSnapshotRequest& request,
+                         doris::cloud::UpdateSnapshotResponse* response) override;
     void commit_snapshot(std::string_view instance_id,
                          const doris::cloud::CommitSnapshotRequest& request,
                          doris::cloud::CommitSnapshotResponse* response) override;
@@ -45,6 +48,10 @@ public:
     int check_snapshots(doris::cloud::InstanceChecker* checker) override;
 
     int inverted_check_snapshots(doris::cloud::InstanceChecker* checker) override;
+
+    int check_mvcc_meta_key(doris::cloud::InstanceChecker* checker) override;
+
+    int inverted_check_mvcc_meta_key(doris::cloud::InstanceChecker* checker) override;
 
     // Recycle snapshot meta and data, return 0 for success otherwise error.
     int recycle_snapshot_meta_and_data(std::string_view instance_id, std::string_view resource_id,

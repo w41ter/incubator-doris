@@ -202,6 +202,104 @@ void SnapshotManager::begin_snapshot(std::string_view instance_id,
     response->mutable_obj_info()->Swap(&obj_info);
 }
 
+void SnapshotManager::update_snapshot(std::string_view instance_id,
+                                      const UpdateSnapshotRequest& request,
+                                      UpdateSnapshotResponse* response) {
+    auto* status = response->mutable_status();
+    status->set_code(MetaServiceCode::OK);
+    status->set_msg("OK");
+
+    if (request.upload_file().empty()) {
+        status->set_code(MetaServiceCode::INVALID_ARGUMENT);
+        status->set_msg("upload_file is empty");
+        return;
+    }
+
+    if (request.upload_id().empty()) {
+        status->set_code(MetaServiceCode::INVALID_ARGUMENT);
+        status->set_msg("upload_id is empty");
+        return;
+    }
+
+    std::unique_ptr<Transaction> txn;
+    TxnErrorCode err = txn_kv_->create_txn(&txn);
+    if (err != TxnErrorCode::TXN_OK) {
+        status->set_code(cast_as<ErrCategory::CREATE>(err));
+        status->set_msg("failed to create txn");
+        LOG(WARNING) << status->msg() << " err=" << err;
+        return;
+    }
+
+    std::string snapshot_id = request.snapshot_id();
+    Versionstamp snapshot_versionstamp;
+    if (!parse_snapshot_versionstamp(snapshot_id, &snapshot_versionstamp)) {
+        status->set_code(MetaServiceCode::INVALID_ARGUMENT);
+        status->set_msg("invalid snapshot_id format");
+        return;
+    }
+
+    // Construct key using instance_id and use snapshot_id as versionstamp
+    std::string snapshot_full_key = versioned::snapshot_full_key({instance_id});
+    std::string snapshot_key = encode_versioned_key(snapshot_full_key, snapshot_versionstamp);
+    std::string snapshot_val;
+    err = txn->get(snapshot_key, &snapshot_val);
+    LOG(INFO) << "get versioned snapshot key=" << hex(snapshot_full_key)
+              << " version=" << hex(snapshot_id);
+
+    if (err != TxnErrorCode::TXN_OK) {
+        if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
+            status->set_code(MetaServiceCode::TXN_ID_NOT_FOUND);
+            status->set_msg("snapshot not found, snapshot_id=" + snapshot_id);
+        } else {
+            status->set_code(cast_as<ErrCategory::READ>(err));
+            status->set_msg("failed to get snapshot, snapshot_id=" + snapshot_id);
+        }
+        LOG(WARNING) << status->msg() << " err=" << err;
+        return;
+    }
+
+    SnapshotPB snapshot_pb;
+    if (!snapshot_pb.ParseFromString(snapshot_val)) {
+        status->set_code(MetaServiceCode::PROTOBUF_PARSE_ERR);
+        status->set_msg("failed to parse SnapshotPB");
+        return;
+    }
+
+    // Check snapshot status
+    if (snapshot_pb.status() != SnapshotStatus::SNAPSHOT_PREPARE) {
+        status->set_code(MetaServiceCode::INVALID_ARGUMENT);
+        status->set_msg("snapshot status is " + SnapshotStatus_Name(snapshot_pb.status()) +
+                        ", cannot update upload_id");
+        return;
+    }
+
+    snapshot_pb.set_upload_file(request.upload_file());
+    snapshot_pb.set_upload_id(request.upload_id());
+
+    std::string updated_snapshot_val;
+    if (!snapshot_pb.SerializeToString(&updated_snapshot_val)) {
+        status->set_msg("failed to serialize updated SnapshotPB");
+        status->set_code(MetaServiceCode::PROTOBUF_SERIALIZE_ERR);
+        return;
+    }
+
+    // Save updated snapshot
+    txn->put(snapshot_key, updated_snapshot_val);
+    LOG_INFO("update snapshot upload path and id completed")
+            .tag("snapshot_key", hex(snapshot_full_key))
+            .tag("instance_id", instance_id)
+            .tag("snapshot_id", hex(snapshot_id))
+            .tag("update_file", hex(request.upload_file()))
+            .tag("update_id", hex(request.upload_id()));
+
+    err = txn->commit();
+    if (err != TxnErrorCode::TXN_OK) {
+        status->set_code(cast_as<ErrCategory::COMMIT>(err));
+        status->set_msg(fmt::format("failed to commit kv txn, err={}", err));
+        LOG(WARNING) << status->msg();
+    }
+}
+
 void SnapshotManager::commit_snapshot(std::string_view instance_id,
                                       const doris::cloud::CommitSnapshotRequest& request,
                                       doris::cloud::CommitSnapshotResponse* response) {
@@ -297,6 +395,9 @@ void SnapshotManager::commit_snapshot(std::string_view instance_id,
     snapshot_pb.set_last_journal_id(last_journal_id);
     snapshot_pb.set_status(SnapshotStatus::SNAPSHOT_NORMAL);
     snapshot_pb.set_finish_at(std::time(nullptr));
+    // the image is already uploaded, so clear upload_file and upload_id
+    snapshot_pb.set_upload_file("");
+    snapshot_pb.set_upload_id("");
 
     std::string updated_snapshot_val;
     if (!snapshot_pb.SerializeToString(&updated_snapshot_val)) {

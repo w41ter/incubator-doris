@@ -125,13 +125,16 @@ std::unique_ptr<MetaServiceProxy> get_meta_service() {
 }
 
 // Create a MULTI_VERSION_READ_WRITE instance and refresh the resource manager.
-void create_and_refresh_instance(MetaServiceProxy* service, std::string instance_id) {
+void create_and_refresh_instance(MetaServiceProxy* service, std::string instance_id,
+                                 bool snapshot_switch = true) {
     // write instance
+    SnapshotSwitchStatus status = snapshot_switch ? SnapshotSwitchStatus::SNAPSHOT_SWITCH_ON
+                                                  : SnapshotSwitchStatus::SNAPSHOT_SWITCH_OFF;
+
     InstanceInfoPB instance_info;
     instance_info.set_instance_id(instance_id);
     instance_info.set_multi_version_status(MULTI_VERSION_READ_WRITE);
-    instance_info.set_snapshot_switch_status(
-            SnapshotSwitchStatus::SNAPSHOT_SWITCH_OFF); // switch off snapshot by default.
+    instance_info.set_snapshot_switch_status(status); // switch off snapshot by default.
     instance_info.mutable_resource_ids()->Add(std::string(RESOURCE_ID));
     auto* obj_info = instance_info.mutable_obj_info()->Add();
     obj_info->set_id(std::string(RESOURCE_ID));
@@ -660,11 +663,22 @@ void update_snapshot_properties(MetaServiceProxy* meta_service, const std::strin
     AlterInstanceRequest req;
     req.set_instance_id(instance_id);
     req.set_op(AlterInstanceRequest::SET_SNAPSHOT_PROPERTY);
-    req.mutable_properties()->insert({"status", enable_snapshot ? "ENABLED" : "DISABLED"});
+    std::string status = enable_snapshot ? "true" : "false";
     req.mutable_properties()->insert(
-            {"max_reserved_snapshots", std::to_string(max_reserved_snapshots)});
+            {AlterInstanceRequest_SnapshotProperty_Name(
+                     AlterInstanceRequest_SnapshotProperty::
+                             AlterInstanceRequest_SnapshotProperty_ENABLE_SNAPSHOT),
+             status});
     req.mutable_properties()->insert(
-            {"snapshot_interval_seconds", std::to_string(snapshot_interval_seconds)});
+            {AlterInstanceRequest_SnapshotProperty_Name(
+                     AlterInstanceRequest_SnapshotProperty::
+                             AlterInstanceRequest_SnapshotProperty_SNAPSHOT_INTERVAL_SECONDS),
+             std::to_string(snapshot_interval_seconds)});
+    req.mutable_properties()->insert(
+            {AlterInstanceRequest_SnapshotProperty_Name(
+                     AlterInstanceRequest_SnapshotProperty::
+                             AlterInstanceRequest_SnapshotProperty_MAX_RESERVED_SNAPSHOTS),
+             std::to_string(max_reserved_snapshots)});
     req.set_request_ip("127.0.0.1");
 
     brpc::Controller cntl;
@@ -1361,4 +1375,255 @@ TEST(RecycleSnapshotTest, InvertedCheckSnapshotAbnormal) {
     EXPECT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
 
     ASSERT_EQ(checker->do_snapshots_check(), 1);
+}
+
+// Test for check_mvcc_meta_key function with various scenarios
+TEST(RecycleSnapshotTest, CheckMvccMetaKeyNormal) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "check_mvcc_meta_key_normal_instance";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    MOCK_GET_INSTANCE_ID(instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+
+    // insert multiple rowsets
+    std::vector<std::string> rowset_ids;
+    for (int i = 0; i < 3; i++) {
+        std::string label = fmt::format("label_{}", i);
+        std::string rowset_id;
+        insert_rowset(meta_service.get(), cloud_unique_id, db_id, label, table_id, partition_id,
+                      tablet_id, &rowset_id);
+        rowset_ids.push_back(rowset_id);
+    }
+
+    // create a normal snapshot
+    SnapshotContext ctx;
+    begin_snapshot(meta_service.get(), cloud_unique_id, "check-mvcc-test", &ctx);
+    commit_snapshot(meta_service.get(), cloud_unique_id, ctx.snapshot_id, ctx.image_url, 100);
+
+    std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    // prepare snapshot files in accessor
+    std::string image_path = "snapshot/" + ctx.snapshot_id + "/image.img";
+    accessor->put_file(image_path, "snapshot_content");
+
+    // prepare rowset files in accessor
+    for (const auto& rowset_id : rowset_ids) {
+        std::string segment_path = fmt::format("data/{}/{}_{}.dat", tablet_id, rowset_id, 0);
+        accessor->put_file(segment_path, "segment_content");
+    }
+
+    auto checker = get_instance_checker(meta_service.get(), instance_id, accessor);
+    auto snapshot_manager = std::make_shared<selectdb::SnapshotManager>(txn_kv);
+
+    // Normal case: all rowsets and ref counts are consistent
+    ASSERT_EQ(snapshot_manager->check_mvcc_meta_key(checker.get()), 0);
+}
+
+TEST(RecycleSnapshotTest, CheckMvccMetaKeyMissingRowsetFile) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "check_mvcc_meta_key_missing_file_instance";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    MOCK_GET_INSTANCE_ID(instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+
+    // insert rowsets
+    std::vector<std::string> rowset_ids;
+    for (int i = 0; i < 2; i++) {
+        std::string label = fmt::format("label_{}", i);
+        std::string rowset_id;
+        insert_rowset(meta_service.get(), cloud_unique_id, db_id, label, table_id, partition_id,
+                      tablet_id, &rowset_id);
+        rowset_ids.push_back(rowset_id);
+    }
+
+    // create a normal snapshot
+    SnapshotContext ctx;
+    begin_snapshot(meta_service.get(), cloud_unique_id, "check-mvcc-missing-test", &ctx);
+    commit_snapshot(meta_service.get(), cloud_unique_id, ctx.snapshot_id, ctx.image_url, 100);
+
+    std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    // prepare snapshot files in accessor
+    std::string image_path = "snapshot/" + ctx.snapshot_id + "/image.img";
+    accessor->put_file(image_path, "snapshot_content");
+
+    // prepare only one rowset file, missing the second one
+    std::string segment_path = fmt::format("data/{}/{}_{}.dat", tablet_id, rowset_ids[0], 0);
+    accessor->put_file(segment_path, "segment_content");
+    // rowset_ids[1] file is missing
+
+    auto checker = get_instance_checker(meta_service.get(), instance_id, accessor);
+    auto snapshot_manager = std::make_shared<selectdb::SnapshotManager>(txn_kv);
+
+    // Should return 1 indicating data loss
+    ASSERT_EQ(snapshot_manager->check_mvcc_meta_key(checker.get()), 1);
+}
+
+TEST(RecycleSnapshotTest, CheckMvccMetaKeyMissingRefCount) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "check_mvcc_meta_key_missing_ref_instance";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    MOCK_GET_INSTANCE_ID(instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+
+    // insert a rowset
+    std::string rowset_id;
+    insert_rowset(meta_service.get(), cloud_unique_id, db_id, "label_1", table_id, partition_id,
+                  tablet_id, &rowset_id);
+
+    // create a normal snapshot
+    SnapshotContext ctx;
+    begin_snapshot(meta_service.get(), cloud_unique_id, "check-mvcc-ref-test", &ctx);
+    commit_snapshot(meta_service.get(), cloud_unique_id, ctx.snapshot_id, ctx.image_url, 100);
+
+    // manually remove the ref count key to simulate missing ref count
+    std::unique_ptr<Transaction> txn;
+    ASSERT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+    std::string ref_count_key =
+            versioned::data_rowset_ref_count_key({instance_id, tablet_id, rowset_id});
+    txn->remove(ref_count_key);
+    ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+
+    std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    // prepare snapshot files in accessor
+    std::string image_path = "snapshot/" + ctx.snapshot_id + "/image.img";
+    accessor->put_file(image_path, "snapshot_content");
+
+    // prepare rowset file in accessor
+    std::string segment_path = fmt::format("data/{}/{}_{}.dat", tablet_id, rowset_id, 0);
+    accessor->put_file(segment_path, "segment_content");
+
+    auto checker = get_instance_checker(meta_service.get(), instance_id, accessor);
+    auto snapshot_manager = std::make_shared<selectdb::SnapshotManager>(txn_kv);
+
+    // Should return 1 indicating ref count inconsistency
+    ASSERT_EQ(snapshot_manager->check_mvcc_meta_key(checker.get()), 1);
+}
+
+TEST(RecycleSnapshotTest, CheckMvccMetaKeyAbortedSnapshot) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "check_mvcc_meta_key_aborted_instance";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    MOCK_GET_INSTANCE_ID(instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+
+    // insert a rowset
+    insert_rowset(meta_service.get(), cloud_unique_id, db_id, "label_1", table_id, partition_id,
+                  tablet_id);
+
+    // create and abort a snapshot
+    SnapshotContext ctx;
+    begin_snapshot(meta_service.get(), cloud_unique_id, "check-mvcc-aborted-test", &ctx);
+    abort_snapshot(meta_service.get(), cloud_unique_id, ctx.snapshot_id, "test abort");
+
+    std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+    auto checker = get_instance_checker(meta_service.get(), instance_id, accessor);
+    auto snapshot_manager = std::make_shared<selectdb::SnapshotManager>(txn_kv);
+
+    // Aborted snapshots should be skipped, so should return 0
+    ASSERT_EQ(snapshot_manager->check_mvcc_meta_key(checker.get()), 0);
+}
+
+TEST(RecycleSnapshotTest, CheckMvccMetaKeyGetSnapshotsFailed) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "check_mvcc_meta_key_failed_instance";
+    MOCK_GET_INSTANCE_ID(instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+
+    std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+    auto checker = get_instance_checker(meta_service.get(), instance_id, accessor);
+    auto snapshot_manager = std::make_shared<selectdb::SnapshotManager>(txn_kv);
+
+    // Manually corrupt the txn_kv to simulate get_snapshots failure
+    std::unique_ptr<Transaction> txn;
+    ASSERT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+    // Remove some critical keys to make get_snapshots fail
+    txn->remove(versioned::snapshot_full_key(instance_id));
+    ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+
+    // Should return 0 when no snapshots exist (empty result is valid)
+    ASSERT_EQ(snapshot_manager->check_mvcc_meta_key(checker.get()), 0);
+}
+
+TEST(RecycleSnapshotTest, CheckMvccMetaKeyEmptyRowsets) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "check_mvcc_meta_key_empty_rowsets_instance";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    MOCK_GET_INSTANCE_ID(instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+
+    // create empty rowset (num_segments = 0)
+    int64_t txn_id = 123;
+    auto empty_rowset = create_rowset(txn_id, tablet_id, partition_id, 2, 0);
+    empty_rowset.set_num_segments(0); // empty rowset
+    ASSERT_NO_FATAL_FAILURE(
+            begin_txn(meta_service.get(), cloud_unique_id, db_id, "empty_label", table_id, txn_id));
+    prepare_rowset(meta_service.get(), cloud_unique_id, empty_rowset);
+    commit_rowset(meta_service.get(), cloud_unique_id, empty_rowset);
+    commit_txn(meta_service.get(), cloud_unique_id, db_id, txn_id, "empty_label");
+
+    // create a normal snapshot
+    SnapshotContext ctx;
+    begin_snapshot(meta_service.get(), cloud_unique_id, "check-mvcc-empty-test", &ctx);
+    commit_snapshot(meta_service.get(), cloud_unique_id, ctx.snapshot_id, ctx.image_url, 100);
+
+    std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    // prepare snapshot files in accessor
+    std::string image_path = "snapshot/" + ctx.snapshot_id + "/image.img";
+    accessor->put_file(image_path, "snapshot_content");
+
+    auto checker = get_instance_checker(meta_service.get(), instance_id, accessor);
+    auto snapshot_manager = std::make_shared<selectdb::SnapshotManager>(txn_kv);
+
+    // Empty rowsets should be skipped, so should return 0
+    ASSERT_EQ(snapshot_manager->check_mvcc_meta_key(checker.get()), 0);
 }

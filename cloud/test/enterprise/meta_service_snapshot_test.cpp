@@ -39,7 +39,9 @@
 #include "meta-store/keys.h"
 #include "meta-store/mem_txn_kv.h"
 #include "meta-store/txn_kv_error.h"
+#include "meta-store/versioned_value.h"
 #include "mock_resource_manager.h"
+#include "snapshot/snapshot_manager.h"
 
 namespace config = doris::cloud::config;
 
@@ -97,6 +99,28 @@ std::unique_ptr<MetaServiceProxy> get_meta_service(bool mock_resource_mgr) {
     auto snapshot = std::make_shared<selectdb::SnapshotManager>(txn_kv);
     auto meta_service = std::make_unique<MetaServiceImpl>(txn_kv, rs, rl, snapshot);
     return std::make_unique<MetaServiceProxy>(std::move(meta_service));
+}
+
+int get_snapshot(std::unique_ptr<MetaServiceProxy>& meta_service, std::string& snapshot_id,
+                 SnapshotPB& snapshot_pb) {
+    Versionstamp snapshot_versionstamp;
+    if (!SnapshotManager::parse_snapshot_versionstamp(snapshot_id, &snapshot_versionstamp)) {
+        return -1;
+    }
+    std::unique_ptr<Transaction> txn;
+    if (meta_service->txn_kv()->create_txn(&txn) != TxnErrorCode::TXN_OK) {
+        return -2;
+    }
+    std::string snapshot_key = encode_versioned_key(
+            versioned::snapshot_full_key({"test_instance"}), snapshot_versionstamp);
+    std::string snapshot_val;
+    if (txn->get(snapshot_key, &snapshot_val) != TxnErrorCode::TXN_OK) {
+        return -3;
+    }
+    if (!snapshot_pb.ParseFromString(snapshot_val)) {
+        return -4;
+    }
+    return 0;
 }
 
 TEST(MetaServiceSnapshotTest, BeginSnapshotTest) {
@@ -356,6 +380,164 @@ TEST(MetaServiceSnapshotTest, BeginSnapshotTest) {
     }
 }
 
+TEST(MetaServiceSnapshotTest, UpdateSnapshotTest) {
+    auto meta_service = get_meta_service(true);
+    const char* const cloud_unique_id = "test_cloud_unique_id";
+
+    // Setup SyncPoint for encryption
+    auto* sp = SyncPoint::get_instance();
+    sp->enable_processing();
+    sp->set_call_back("encrypt_ak_sk:get_encryption_key", [](auto&& args) {
+        auto* ret = try_any_cast<int*>(args[0]);
+        *ret = 0;
+        auto* key = try_any_cast<std::string*>(args[1]);
+        *key = "selectdbselectdbselectdbselectdb";
+        auto* key_id = try_any_cast<int64_t*>(args[2]);
+        *key_id = 1;
+    });
+    sp->set_call_back("decrypt_ak_sk:get_encryption_key", [](auto&& args) {
+        auto* key = try_any_cast<std::string*>(args[0]);
+        *key = "selectdbselectdbselectdbselectdb";
+        auto* ret = try_any_cast<int*>(args[1]);
+        *ret = 0;
+    });
+
+    // Cleanup SyncPoint when test finishes
+    DORIS_CLOUD_DEFER {
+        sp->disable_processing();
+        sp->clear_all_call_backs();
+    };
+
+    // Create test instance first
+    {
+        brpc::Controller cntl;
+        CreateInstanceRequest req;
+        req.set_instance_id("test_instance");
+        req.set_user_id("test_user");
+        req.set_name("test_name");
+        ObjectStoreInfoPB obj;
+        obj.set_ak("123");
+        obj.set_sk("321");
+        obj.set_bucket("456");
+        obj.set_prefix("654");
+        obj.set_endpoint("789");
+        obj.set_region("987");
+        obj.set_external_endpoint("888");
+        obj.set_provider(ObjectStoreInfoPB::BOS);
+        req.mutable_obj_info()->CopyFrom(obj);
+
+        CreateInstanceResponse res;
+        meta_service->create_instance(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                      &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+    }
+
+    // Enable multi version for the test instance
+    {
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(meta_service->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+        std::string instance_key_str = instance_key("test_instance");
+        std::string instance_value;
+        ASSERT_EQ(txn->get(instance_key_str, &instance_value), TxnErrorCode::TXN_OK);
+        InstanceInfoPB instance_info;
+        ASSERT_TRUE(instance_info.ParseFromString(instance_value));
+        instance_info.set_snapshot_switch_status(SnapshotSwitchStatus::SNAPSHOT_SWITCH_ON);
+        txn->put(instance_key_str, instance_info.SerializeAsString());
+        ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+    }
+
+    // begin snapshot
+    std::string snapshot_id;
+    {
+        brpc::Controller cntl;
+        BeginSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_timeout_seconds(3600);
+        req.set_auto_snapshot(true);
+        req.set_ttl_seconds(7200);
+        req.set_snapshot_label("test_snapshot");
+        BeginSnapshotResponse res;
+        meta_service->begin_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                     &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+        ASSERT_FALSE(res.image_url().empty());
+        ASSERT_FALSE(res.snapshot_id().empty());
+        ASSERT_TRUE(res.image_url().find("/snapshot/") != std::string::npos);
+        snapshot_id = res.snapshot_id();
+    }
+
+    // update snapshot with invalid argument - empty cloud unique id
+    {
+        brpc::Controller cntl;
+        UpdateSnapshotRequest req;
+        req.set_snapshot_id(snapshot_id);
+        req.set_upload_file("image.100");
+        UpdateSnapshotResponse res;
+        meta_service->update_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                      &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+    }
+
+    // update snapshot with invalid argument - empty upload_id
+    {
+        brpc::Controller cntl;
+        UpdateSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_snapshot_id(snapshot_id);
+        req.set_upload_file("image.100");
+        UpdateSnapshotResponse res;
+        meta_service->update_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                      &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+    }
+
+    // update snapshot with invalid argument - empty upload_file
+    {
+        brpc::Controller cntl;
+        UpdateSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_snapshot_id(snapshot_id);
+        req.set_upload_id("test_upload_id");
+        UpdateSnapshotResponse res;
+        meta_service->update_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                      &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+    }
+
+    // abnormal update snapshot - non exist snapshot id
+    {
+        brpc::Controller cntl;
+        UpdateSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_snapshot_id("non_existent_snapshot_id_12345");
+        req.set_upload_file("image.100");
+        req.set_upload_id("test_upload_id_1");
+        UpdateSnapshotResponse res;
+        meta_service->update_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                      &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+    }
+
+    // normal update snapshot
+    {
+        brpc::Controller cntl;
+        UpdateSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_snapshot_id(snapshot_id);
+        req.set_upload_file("image.100");
+        req.set_upload_id("test_upload_id_1");
+        UpdateSnapshotResponse res;
+        meta_service->update_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                      &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+
+        SnapshotPB snapshot_pb;
+        ASSERT_EQ(get_snapshot(meta_service, snapshot_id, snapshot_pb), 0);
+        ASSERT_EQ(snapshot_pb.upload_file(), "image.100");
+        ASSERT_EQ(snapshot_pb.upload_id(), "test_upload_id_1");
+    }
+}
+
 TEST(MetaServiceSnapshotTest, CommitSnapshotTest) {
     auto meta_service = get_meta_service(true);
     const char* const cloud_unique_id = "test_cloud_unique_id";
@@ -496,6 +678,25 @@ TEST(MetaServiceSnapshotTest, CommitSnapshotTest) {
         ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
     }
 
+    // update snapshot
+    {
+        brpc::Controller cntl;
+        UpdateSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_snapshot_id(snapshot_id);
+        req.set_upload_file("image.100");
+        req.set_upload_id("test_upload_id_1");
+        UpdateSnapshotResponse res;
+        meta_service->update_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                      &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+
+        SnapshotPB snapshot_pb;
+        ASSERT_EQ(get_snapshot(meta_service, snapshot_id, snapshot_pb), 0);
+        ASSERT_EQ(snapshot_pb.upload_file(), "image.100");
+        ASSERT_EQ(snapshot_pb.upload_id(), "test_upload_id_1");
+    }
+
     // Test successful commit
     {
         brpc::Controller cntl;
@@ -508,6 +709,11 @@ TEST(MetaServiceSnapshotTest, CommitSnapshotTest) {
         meta_service->commit_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
                                       &req, &res, nullptr);
         ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+
+        SnapshotPB snapshot_pb;
+        ASSERT_EQ(get_snapshot(meta_service, snapshot_id, snapshot_pb), 0);
+        ASSERT_EQ(snapshot_pb.upload_file(), "");
+        ASSERT_EQ(snapshot_pb.upload_id(), "");
     }
 
     // Test committing non-existent snapshot

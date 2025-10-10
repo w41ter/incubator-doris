@@ -279,6 +279,22 @@ int SnapshotManager::recycle_snapshot_meta_and_data(std::string_view instance_id
         return -1;
     }
 
+    if (snapshot_pb.has_upload_file() && snapshot_pb.has_upload_id() &&
+        !snapshot_pb.upload_file().empty() && !snapshot_pb.upload_id().empty()) {
+        res = accessor->abort_multipart_upload(image_dir + snapshot_pb.upload_file(),
+                                               snapshot_pb.upload_id());
+        if (res != 0) {
+            LOG_WARNING("failed to abort multipart upload")
+                    .tag("resource_id", resource_id)
+                    .tag("snapshot_id", snapshot_id)
+                    .tag("image_dir", image_dir)
+                    .tag("upload_file", snapshot_pb.upload_file())
+                    .tag("upload_id", snapshot_pb.upload_id())
+                    .tag("result", res);
+            return -1;
+        }
+    }
+
     std::unique_ptr<Transaction> txn;
     TxnErrorCode err = txn_kv_->create_txn(&txn);
     if (err != TxnErrorCode::TXN_OK) {
