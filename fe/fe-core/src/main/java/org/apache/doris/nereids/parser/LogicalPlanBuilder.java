@@ -89,6 +89,7 @@ import org.apache.doris.nereids.DorisParser.AdminCheckTabletsContext;
 import org.apache.doris.nereids.DorisParser.AdminCompactTableContext;
 import org.apache.doris.nereids.DorisParser.AdminDiagnoseTabletContext;
 import org.apache.doris.nereids.DorisParser.AdminRebalanceDiskContext;
+import org.apache.doris.nereids.DorisParser.AdminRotateTdeRootKeyContext;
 import org.apache.doris.nereids.DorisParser.AdminSetEncryptionRootKeyContext;
 import org.apache.doris.nereids.DorisParser.AdminSetTableStatusContext;
 import org.apache.doris.nereids.DorisParser.AdminShowReplicaDistributionContext;
@@ -605,6 +606,7 @@ import org.apache.doris.nereids.trees.plans.commands.AdminCreateClusterSnapshotC
 import org.apache.doris.nereids.trees.plans.commands.AdminDropClusterSnapshotCommand;
 import org.apache.doris.nereids.trees.plans.commands.AdminRebalanceDiskCommand;
 import org.apache.doris.nereids.trees.plans.commands.AdminRepairTableCommand;
+import org.apache.doris.nereids.trees.plans.commands.AdminRotateTdeRootKeyCommand;
 import org.apache.doris.nereids.trees.plans.commands.AdminSetAutoClusterSnapshotCommand;
 import org.apache.doris.nereids.trees.plans.commands.AdminSetClusterSnapshotFeatureSwitchCommand;
 import org.apache.doris.nereids.trees.plans.commands.AdminSetEncryptionRootKeyCommand;
@@ -714,6 +716,7 @@ import org.apache.doris.nereids.trees.plans.commands.DropUserCommand;
 import org.apache.doris.nereids.trees.plans.commands.DropViewCommand;
 import org.apache.doris.nereids.trees.plans.commands.DropWorkloadGroupCommand;
 import org.apache.doris.nereids.trees.plans.commands.DropWorkloadPolicyCommand;
+import org.apache.doris.nereids.trees.plans.commands.ExecuteActionCommand;
 import org.apache.doris.nereids.trees.plans.commands.ExplainCommand;
 import org.apache.doris.nereids.trees.plans.commands.ExplainCommand.ExplainLevel;
 import org.apache.doris.nereids.trees.plans.commands.ExplainDictionaryCommand;
@@ -728,7 +731,6 @@ import org.apache.doris.nereids.trees.plans.commands.KillConnectionCommand;
 import org.apache.doris.nereids.trees.plans.commands.KillQueryCommand;
 import org.apache.doris.nereids.trees.plans.commands.LoadCommand;
 import org.apache.doris.nereids.trees.plans.commands.LockTablesCommand;
-import org.apache.doris.nereids.trees.plans.commands.OptimizeTableCommand;
 import org.apache.doris.nereids.trees.plans.commands.PauseJobCommand;
 import org.apache.doris.nereids.trees.plans.commands.PauseMTMVCommand;
 import org.apache.doris.nereids.trees.plans.commands.RecoverDatabaseCommand;
@@ -1043,6 +1045,7 @@ import org.apache.doris.nereids.util.Utils;
 import org.apache.doris.policy.FilterType;
 import org.apache.doris.policy.PolicyTypeEnum;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.GlobalVariable;
 import org.apache.doris.qe.SqlModeHelper;
 import org.apache.doris.resource.workloadschedpolicy.WorkloadActionMeta;
 import org.apache.doris.resource.workloadschedpolicy.WorkloadConditionMeta;
@@ -1743,6 +1746,12 @@ public class LogicalPlanBuilder extends DorisParserBaseVisitor<Object> {
     public LogicalPlan visitAdminSetEncryptionRootKey(AdminSetEncryptionRootKeyContext ctx) {
         Map<String, String> properties = visitPropertyItemList(ctx.propertyItemList());
         return new AdminSetEncryptionRootKeyCommand(properties);
+    }
+
+    @Override
+    public LogicalPlan visitAdminRotateTdeRootKey(AdminRotateTdeRootKeyContext ctx) {
+        Map<String, String> properties = visitPropertyClause(ctx.propertyClause());
+        return new AdminRotateTdeRootKeyCommand(properties);
     }
 
     @Override
@@ -5270,15 +5279,21 @@ public class LogicalPlanBuilder extends DorisParserBaseVisitor<Object> {
         if (size == 0) {
             throw new ParseException("database name can't be empty");
         }
-        String dbName = parts.get(size - 1);
 
         // [db].
         if (size == 1) {
-            return new RefreshDatabaseCommand(dbName, properties);
+            return new RefreshDatabaseCommand(parts.get(0), properties);
         } else if (parts.size() == 2) {  // [ctl,db].
-            return new RefreshDatabaseCommand(parts.get(0), dbName, properties);
+            return new RefreshDatabaseCommand(parts.get(0), parts.get(1), properties);
+        } else {
+            if (GlobalVariable.enableNestedNamespace) {
+                // use the first part as catalog name, the rest part as db name
+                return new RefreshDatabaseCommand(parts.get(0),
+                        String.join(".", parts.subList(1, size)), properties);
+            } else {
+                throw new ParseException("Only one dot can be in the name: " + String.join(".", parts));
+            }
         }
-        throw new ParseException("Only one dot can be in the name: " + String.join(".", parts));
     }
 
     @Override
@@ -7041,25 +7056,27 @@ public class LogicalPlanBuilder extends DorisParserBaseVisitor<Object> {
     }
 
     @Override
-    public LogicalPlan visitOptimizeTable(DorisParser.OptimizeTableContext ctx) {
-        TableNameInfo tableName = new TableNameInfo(visitMultipartIdentifier(ctx.multipartIdentifier()));
+    public LogicalPlan visitAlterTableExecute(DorisParser.AlterTableExecuteContext ctx) {
+        TableNameInfo tableName = new TableNameInfo(visitMultipartIdentifier(ctx.tableName));
+        String action = ctx.actionName.getText();
+
+        // Parse partition specification if present
         Optional<PartitionNamesInfo> partitionNamesInfo = Optional.empty();
         if (ctx.partitionSpec() != null) {
             Pair<Boolean, List<String>> partitionSpec = visitPartitionSpec(ctx.partitionSpec());
             partitionNamesInfo = Optional.of(new PartitionNamesInfo(partitionSpec.first, partitionSpec.second));
         }
-        Optional<Expression> whereCondition = ctx.booleanExpression() == null
-                ? Optional.empty()
-                : Optional.of((Expression) visit(ctx.booleanExpression()));
-        Map<String, String> properties = ctx.properties == null
-                ? Maps.newHashMap()
-                : visitPropertyClause(ctx.properties);
 
-        return new OptimizeTableCommand(
-                tableName,
-                partitionNamesInfo,
-                whereCondition,
-                properties);
+        // Parse WHERE condition if present
+        Optional<Expression> whereCondition = ctx.whereExpression == null
+                ? Optional.empty()
+                : Optional.of((Expression) visit(ctx.whereExpression));
+
+        Map<String, String> props = ctx.propertyItemList() == null
+                ? Maps.newHashMap()
+                : visitPropertyItemList(ctx.propertyItemList());
+        return new ExecuteActionCommand(
+                tableName, action, props, partitionNamesInfo, whereCondition);
     }
 
     @Override
