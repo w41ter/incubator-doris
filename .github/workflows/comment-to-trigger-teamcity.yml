@@ -71,16 +71,16 @@ jobs:
                 echo "comment_trigger=false" | tee -a "$GITHUB_OUTPUT"
                 echo "comment_skip=true" | tee -a "$GITHUB_OUTPUT"
                 echo "COMMENT_USER_ID ${COMMENT_USER_ID} is allowed to skip buildall."
-            elif [[ "${COMMENT_USER_ID}" == '9208457' && "${TARGET_BRANCH}" == *'branch-2.1'* ]]; then
-                echo "COMMENT_USER_ID ${COMMENT_USER_ID} is allowed to skip buildall for branch-2.1"
+            elif [[ "${COMMENT_USER_ID}" == '9208457' && "${TARGET_BRANCH}" == *'branch-selectdb-doris-2.1'* ]]; then
+                echo "COMMENT_USER_ID ${COMMENT_USER_ID} is allowed to skip buildall for branch-selectdb-doris-2.1"
                 echo "comment_trigger=false" | tee -a "$GITHUB_OUTPUT"
                 echo "comment_skip=true" | tee -a "$GITHUB_OUTPUT"
-            elif [[ "${COMMENT_USER_ID}" == '98214048' && "${TARGET_BRANCH}" == *'branch-3.0'* ]]; then
-                echo "COMMENT_USER_ID ${COMMENT_USER_ID} is allowed to skip buildall for branch-3.0"
+            elif [[ "${COMMENT_USER_ID}" == '98214048' && "${TARGET_BRANCH}" == *'branch-selectdb-doris-3.0'* ]]; then
+                echo "COMMENT_USER_ID ${COMMENT_USER_ID} is allowed to skip buildall for branch-selectdb-doris-3.0"
                 echo "comment_trigger=false" | tee -a "$GITHUB_OUTPUT"
                 echo "comment_skip=true" | tee -a "$GITHUB_OUTPUT"
-            elif [[ "${COMMENT_USER_ID}" == '101034200' && "${TARGET_BRANCH}" == *'branch-3.1'* ]]; then
-                echo "COMMENT_USER_ID ${COMMENT_USER_ID} is allowed to skip buildall for branch-3.1"
+            elif [[ "${COMMENT_USER_ID}" == '6919662' && "${TARGET_BRANCH}" == *'branch-selectdb-doris-3.1'* ]]; then
+                echo "COMMENT_USER_ID ${COMMENT_USER_ID} is allowed to skip buildall for branch-selectdb-doris-3.1"
                 echo "comment_trigger=false" | tee -a "$GITHUB_OUTPUT"
                 echo "comment_skip=true" | tee -a "$GITHUB_OUTPUT"
             else
