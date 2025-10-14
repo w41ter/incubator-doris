@@ -20,6 +20,8 @@ package org.apache.doris.cloud.snapshot;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.cloud.proto.Cloud;
 import org.apache.doris.cloud.rpc.MetaServiceProxy;
+import org.apache.doris.cloud.storage.ListObjectsResult;
+import org.apache.doris.cloud.storage.ObjectFile;
 import org.apache.doris.cloud.storage.RemoteBase;
 import org.apache.doris.cloud.system.CloudSystemInfoService;
 import org.apache.doris.common.Config;
@@ -28,15 +30,24 @@ import org.apache.doris.common.Pair;
 import org.apache.doris.journal.JournalCursor;
 import org.apache.doris.journal.JournalEntity;
 import org.apache.doris.master.Checkpoint;
+import org.apache.doris.persist.EditLog;
+import org.apache.doris.persist.EditLogFileInputStream;
 import org.apache.doris.persist.EditLogFileOutputStream;
+import org.apache.doris.persist.OperationType;
 import org.apache.doris.persist.Storage;
+import org.apache.doris.persist.meta.MetaReader;
 import org.apache.doris.rpc.RpcException;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.collect.Queues;
+import org.apache.commons.codec.digest.DigestUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
+import java.io.DataInputStream;
+import java.io.EOFException;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -222,17 +233,7 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
                 LOG.warn("failed to abort snapshot for job: {}", job, e1);
             }
             // delete edit log file and zip file
-            File[] files = {getEditLogFile(logId), getImageZipFile(snapshotId)};
-            for (File file : files) {
-                try {
-                    if (file.exists()) {
-                        file.delete();
-                        LOG.info("delete file: {}", file.getAbsolutePath());
-                    }
-                } catch (Exception e1) {
-                    LOG.warn("failed to delete file: {} for job: {}", file.getAbsolutePath(), job, e1);
-                }
-            }
+            deleteFiles(getEditLogFile(logId), getImageZipFile(snapshotId));
         } finally {
             job.setBeginSnapshotResponse(null);
             job.setLogId(0);
@@ -323,11 +324,7 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
         }
 
         // 3. compress files
-        File zipFile = getImageZipFile(snapshotId);
-        compressFiles(files, zipFile);
-        if (!zipFile.exists()) {
-            throw new DdlException("zip file does not exist: " + zipFile.getAbsoluteFile());
-        }
+        File zipFile = compressFiles(snapshotId, files);
 
         // 4, upload zip file
         RemoteBase remote = RemoteBase.newInstance(new RemoteBase.ObjectInfo(objInfo));
@@ -340,10 +337,7 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
         }
 
         // 5. delete edit log file and zip file
-        if (snapshotEditLogFile != null) {
-            snapshotEditLogFile.delete();
-        }
-        zipFile.delete();
+        deleteFiles(snapshotEditLogFile, zipFile);
     }
 
     private File getEditLogFile(long logId) {
@@ -351,7 +345,15 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
     }
 
     private File getImageZipFile(String snapshotId) {
-        return new File(this.snapshotDir, snapshotId + ".zip");
+        File directory = new File(this.snapshotDir);
+        if (directory.exists() && directory.isDirectory()) {
+            File[] files = directory.listFiles(
+                    (dir, name) -> name.startsWith(snapshotId + ".") && name.endsWith(".zip"));
+            if (files.length > 0) {
+                return files[0];
+            }
+        }
+        return null;
     }
 
     private long getImageVersion() throws DdlException {
@@ -373,9 +375,7 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
         }
 
         File snapshotEditLogFile = getEditLogFile(toJournalId);
-        if (snapshotEditLogFile.exists()) {
-            snapshotEditLogFile.delete();
-        }
+        deleteFile(snapshotEditLogFile);
         if (!snapshotEditLogFile.createNewFile()) {
             LOG.warn("failed to create snapshot edits log file {}", snapshotEditLogFile.getAbsolutePath());
             throw new Exception("failed to create snapshot edits log file " + snapshotEditLogFile.getAbsolutePath());
@@ -407,14 +407,8 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
                     LOG.warn("failed to close output stream for id: {}", snapshotId, ex);
                 }
             }
-            try {
-                if (snapshotEditLogFile.exists()) {
-                    snapshotEditLogFile.delete();
-                }
-            } catch (Exception ex) {
-                LOG.warn("failed to delete snapshot file for id: {}", snapshotId, ex);
-            }
-            throw new Exception(e.getMessage());
+            deleteFile(snapshotEditLogFile);
+            throw e;
         }
     }
 
@@ -432,6 +426,168 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
         }
     }
 
+    // ==== for clone cluster snapshot ====
+
+    @Override
+    public void cloneSnapshot(String clusterSnapshotFile) throws Exception {
+        CloneSnapshotState cloneSnapshotState = parseClusterSnapshotFile(clusterSnapshotFile);
+        Cloud.CloneInstanceResponse response = cloneSnapshot(cloneSnapshotState);
+        this.cloneSnapshotDir = Config.meta_dir + CLONE_SNAPSHOT_DIR;
+        createDir(this.cloneSnapshotDir);
+        Pair<File, File> files = downloadImage(cloneSnapshotState.getFromSnapshotId(), response);
+        loadSnapshotImage(files.first, files.second);
+        truncateDir(this.cloneSnapshotDir);
+    }
+
+    private CloneSnapshotState parseClusterSnapshotFile(String clusterSnapshotFile) {
+        LOG.info("load cluster snapshot from file: {}", clusterSnapshotFile);
+        File file = new File(clusterSnapshotFile);
+        if (!file.exists()) {
+            LOG.error("cluster snapshot file {} does not exist", clusterSnapshotFile);
+            System.exit(-1);
+        }
+
+        CloneSnapshotState cloneSnapshotState = null;
+        try {
+            cloneSnapshotState = new ObjectMapper().readValue(file, CloneSnapshotState.class);
+            cloneSnapshotState.check();
+        } catch (Exception e) {
+            LOG.error("failed to parse cluster snapshot file {}", clusterSnapshotFile, e);
+            System.exit(-1);
+        }
+        return cloneSnapshotState;
+    }
+
+    private Cloud.CloneInstanceResponse cloneSnapshot(CloneSnapshotState cloneSnapshotState) throws Exception {
+        try {
+            Cloud.CloneInstanceRequest.Builder requestBuilder = Cloud.CloneInstanceRequest.newBuilder()
+                    .setFromSnapshotId(cloneSnapshotState.getFromSnapshotId())
+                    .setFromInstanceId(cloneSnapshotState.getFromInstanceId())
+                    .setNewInstanceId(cloneSnapshotState.getInstanceId());
+            if (cloneSnapshotState.isSucceed()) {
+                requestBuilder.setCloneType(Cloud.CloneInstanceRequest.CloneType.ROLLBACK);
+            } else if (cloneSnapshotState.isReadOnly()) {
+                requestBuilder.setCloneType(Cloud.CloneInstanceRequest.CloneType.READ_ONLY);
+            } else {
+                requestBuilder.setCloneType(Cloud.CloneInstanceRequest.CloneType.WRITABLE)
+                        .setObjInfo(cloneSnapshotState.getObjectStoreInfoPB());
+            }
+            Cloud.CloneInstanceResponse response = MetaServiceProxy.getInstance().cloneInstance(requestBuilder.build());
+            if (response.getStatus().getCode() != Cloud.MetaServiceCode.OK) {
+                LOG.warn("cloneInstance response: {} ", response);
+                throw new DdlException(response.getStatus().getMsg());
+            }
+            return response;
+        } catch (RpcException e) {
+            throw new DdlException(e.getMessage());
+        }
+    }
+
+    private Pair<File, File> downloadImage(String snapshotId, Cloud.CloneInstanceResponse response) throws Exception {
+        LOG.info("start to download snapshot id: {}", snapshotId);
+        // download zip file
+        RemoteBase remote = RemoteBase.newInstance(new RemoteBase.ObjectInfo(response.getObjInfo()));
+        try {
+            String imageUrl = response.getImageUrl();
+            if (imageUrl.startsWith("/")) {
+                imageUrl = imageUrl.substring(1);
+            }
+            ListObjectsResult listObjectsResult = remote.listObjects(imageUrl, null);
+            for (ObjectFile objectFile : listObjectsResult.getObjectInfoList()) {
+                String lastPart = objectFile.getKey().substring(objectFile.getKey().lastIndexOf("/") + 1);
+                String localPath = cloneSnapshotDir + lastPart;
+                LOG.info("download objectFile: {}  to local path: {}", objectFile.toString(), localPath);
+                remote.getObject(objectFile.getKey(), localPath);
+            }
+        } finally {
+            remote.close();
+        }
+
+        // check zip file and md5
+        File dir = new File(this.cloneSnapshotDir);
+        File[] files = dir.listFiles();
+        if (files.length != 1) {
+            LOG.error("clone snapshot directory: {} contains {} files, should only have 1 zip file",
+                    dir.getAbsolutePath(), files.length);
+            System.exit(-1);
+        }
+        File zipFile = files[0];
+        if (!zipFile.getName().endsWith(".zip")) {
+            LOG.error("clone snapshot file: {} is not a zip file", zipFile.getAbsolutePath());
+            System.exit(-1);
+        }
+        compareFileMd5(zipFile, parseFileName(zipFile, 3, 1));
+
+        // decompress zip file
+        decompressZip(zipFile, this.cloneSnapshotDir);
+        deleteFile(zipFile);
+
+        // check image file, edit log file and md5
+        files = dir.listFiles();
+        if (files.length == 0 || files.length > 2) {
+            LOG.error("clone snapshot directory: {} contains {} files", dir.getAbsolutePath(), files.length);
+            System.exit(-1);
+        }
+        File imageFile = null;
+        File editLogFile = null;
+        for (File file : files) {
+            if (file.getName().startsWith("image.")) {
+                imageFile = file;
+            } else {
+                editLogFile = file;
+            }
+            compareFileMd5(file, parseFileName(file, 3, 2));
+        }
+        return Pair.of(imageFile, editLogFile);
+    }
+
+    private void loadSnapshotImage(File imageFile, File editLogFile) throws IOException, DdlException {
+        CloudSnapshotEnv cloudSnapshotEnv = new CloudSnapshotEnv(true);
+        // load image
+        long imageJournalId = 0;
+        if (imageFile != null) {
+            imageJournalId = Long.parseLong(parseFileName(imageFile, 3, 1));
+            MetaReader.read(imageFile, cloudSnapshotEnv);
+            LOG.info("finished load image from cluster snapshot: {}, imageJournalId: {}",
+                    imageFile.getAbsolutePath(), imageJournalId);
+        }
+
+        // replay edit log
+        long replayedJournalId = imageJournalId;
+        if (editLogFile != null) {
+            DataInputStream currentStream = new DataInputStream(
+                    new BufferedInputStream(new EditLogFileInputStream(editLogFile)));
+            try {
+                while (true) {
+                    JournalEntity entity = new JournalEntity();
+                    entity.readFields(currentStream);
+                    if (entity.getOpCode() == OperationType.OP_LOCAL_EOF) {
+                        break;
+                    }
+                    replayedJournalId++;
+                    EditLog.loadJournal(cloudSnapshotEnv, replayedJournalId, entity);
+                }
+            } catch (IOException e) {
+                try {
+                    currentStream.close();
+                } catch (IOException e1) {
+                    LOG.error("failed to close cluster snapshot edit log", e1);
+                }
+                if (!(e instanceof EOFException)) {
+                    LOG.error("failed to replay cluster snapshot edit log", e);
+                    System.exit(-1);
+                }
+            }
+            LOG.info("finished replay edit logs from cluster snapshot: {}, replayedJournalId: {}",
+                    editLogFile.getAbsolutePath(), replayedJournalId);
+        }
+
+        // generate new image
+        cloudSnapshotEnv.setReplayedJournalId(replayedJournalId);
+        String latestImageFilePath = cloudSnapshotEnv.saveImage();
+        LOG.info("save image to {}, replayedJournalId: {}", latestImageFilePath, replayedJournalId);
+    }
+
     private void createDir(String dir) {
         truncateDir(dir);
         File directory = new File(dir);
@@ -445,18 +601,33 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
         if (directory.exists()) {
             if (directory.isDirectory()) {
                 for (File file : directory.listFiles()) {
-                    if (!file.delete()) {
-                        LOG.warn("failed to delete file: {}", file.getAbsolutePath());
-                    } else {
-                        LOG.info("delete file: {}", file.getAbsolutePath());
-                    }
+                    deleteFile(file);
                 }
             }
-            if (!directory.delete()) {
-                LOG.warn("failed to delete directory: {}", directory.getAbsolutePath());
-            } else {
-                LOG.info("delete directory: {}", directory.getAbsolutePath());
+            deleteFile(directory);
+        }
+    }
+
+    private void deleteFiles(File... files) {
+        for (File file : files) {
+            deleteFile(file);
+        }
+    }
+
+    private void deleteFile(File file) {
+        if (file == null) {
+            return;
+        }
+        try {
+            if (file.exists()) {
+                if (file.delete()) {
+                    LOG.info("delete file: {}", file.getAbsolutePath());
+                } else {
+                    LOG.warn("failed to delete file: {}", file.getAbsolutePath());
+                }
             }
+        } catch (Exception e) {
+            LOG.warn("failed to delete file: {}", file.getAbsolutePath(), e);
         }
     }
 
@@ -475,15 +646,43 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
         return newPrefix + newImageUrl + fileName;
     }
 
-    private void compressFiles(List<File> sourceFiles, File zipFile) throws IOException {
-        try (FileOutputStream fos = new FileOutputStream(zipFile);
+    private String parseFileName(File file, int expectedParts, int returnPart) {
+        String[] split = file.getName().split("\\.");
+        if (split.length != expectedParts) {
+            LOG.error("file name {} is invalid", file.getAbsolutePath());
+            System.exit(-1);
+        }
+        return split[returnPart];
+    }
+
+    private void compareFileMd5(File file, String md5) throws IOException {
+        String calculatedMd5 = calculateMd5(file);
+        if (!md5.equals(calculatedMd5)) {
+            LOG.error("file {} md5 is invalid, expected: {}, actual: {}", file.getAbsolutePath(), md5,
+                    calculatedMd5);
+            System.exit(-1);
+        }
+    }
+
+    private String calculateMd5(File file) throws IOException {
+        try (FileInputStream fis = new FileInputStream(file)) {
+            return DigestUtils.md5Hex(fis);
+        }
+    }
+
+    private File compressFiles(String snapshotId, List<File> sourceFiles) throws IOException {
+        // the file name is: image.{version}.{md5}, edits.{logId}.{md5}, {snapshotId}.{md5}.zip
+        String zipFileName = this.snapshotDir + snapshotId;
+        try (FileOutputStream fos = new FileOutputStream(zipFileName);
                 ZipOutputStream zos = new ZipOutputStream(fos)) {
             for (File fileToZip : sourceFiles) {
                 if (!fileToZip.exists()) {
                     throw new IOException("source file does not exist: " + fileToZip.getAbsolutePath());
                 }
                 try (FileInputStream fis = new FileInputStream(fileToZip)) {
-                    ZipEntry zipEntry = new ZipEntry(fileToZip.getName());
+                    // calculate md5
+                    String md5 = calculateMd5(fileToZip);
+                    ZipEntry zipEntry = new ZipEntry(fileToZip.getName() + "." + md5);
                     zos.putNextEntry(zipEntry);
 
                     byte[] buffer = new byte[1024];
@@ -495,6 +694,14 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
                 }
             }
         }
+        File zipFile = new File(zipFileName);
+        if (!zipFile.exists()) {
+            throw new IOException("zip file does not exist: " + zipFile.getAbsoluteFile());
+        }
+        String md5 = calculateMd5(zipFile);
+        File destFile = new File(zipFileName + "." + md5 + ".zip");
+        zipFile.renameTo(destFile);
+        return destFile;
     }
 
     private void decompressZip(File zipFile, String destDir) throws IOException {
