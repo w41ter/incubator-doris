@@ -2,37 +2,26 @@
 
 #include <gen_cpp/cloud.pb.h>
 
+#include <charconv>
+#include <chrono>
+#include <numeric>
+#include <string_view>
+
 #include "common/encryption_util.h"
 #include "common/util.h"
 #include "meta-service/meta_service_helper.h"
 #include "meta-store/keys.h"
+#include "meta-store/meta_reader.h"
 #include "meta-store/txn_kv_error.h"
 #include "meta-store/versioned_value.h"
 #include "snapshot_helper.h"
 
+using namespace doris::cloud;
 namespace versioned = doris::cloud::versioned;
-
-using doris::cloud::MetaServiceCode;
-using doris::cloud::Transaction;
-using doris::cloud::TxnErrorCode;
-using doris::cloud::ErrCategory;
-using doris::cloud::Versionstamp;
-using doris::cloud::InstanceInfoPB;
-using doris::cloud::SnapshotPB;
-using doris::cloud::SnapshotInfoPB;
-using doris::cloud::SnapshotStatus;
-using doris::cloud::SnapshotSwitchStatus;
-using doris::cloud::SnapshotType;
-using doris::cloud::ObjectStoreInfoPB;
-using doris::cloud::FullRangeGetOptions;
-using doris::cloud::RangeKeySelector;
-using doris::cloud::encode_versioned_key;
-using doris::cloud::decode_versioned_key;
-using doris::cloud::hex;
 
 namespace selectdb {
 
-static bool decrypt_object_store_info_ak_sk(doris::cloud::ObjectStoreInfoPB* obj_info) {
+static bool decrypt_object_store_info_ak_sk(ObjectStoreInfoPB* obj_info) {
     if (!obj_info->has_encryption_info()) {
         return true;
     }
@@ -40,7 +29,7 @@ static bool decrypt_object_store_info_ak_sk(doris::cloud::ObjectStoreInfoPB* obj
     auto& ak = obj_info->ak();
     auto& sk = obj_info->sk();
     auto& encryption_info = obj_info->encryption_info();
-    doris::cloud::AkSkPair plain_ak_sk_pair;
+    AkSkPair plain_ak_sk_pair;
     if (int ret = decrypt_ak_sk_helper(ak, sk, encryption_info, &plain_ak_sk_pair); ret != 0) {
         LOG(WARNING) << "failed to decrypt object store info ak/sk, err=" << ret;
         return false;
@@ -52,9 +41,122 @@ static bool decrypt_object_store_info_ak_sk(doris::cloud::ObjectStoreInfoPB* obj
     return true;
 }
 
+// Set snapshot info in response
+static MetaServiceCode set_snapshot_info_in_response(CloneInstanceResponse* response,
+                                                     const SnapshotPB& snapshot_pb,
+                                                     const InstanceInfoPB& from_instance_info,
+                                                     Transaction* txn, std::string* error_msg) {
+    // Set snapshot image URL
+    response->set_image_url(snapshot_pb.image_url());
+
+    std::string snapshot_resource_id = snapshot_pb.resource_id();
+    ObjectStoreInfoPB* obj_info = response->mutable_obj_info();
+
+    // Find corresponding snapshot storage info from the from-instance storage configuration
+    bool found_snapshot_storage = false;
+    if (!from_instance_info.enable_storage_vault()) {
+        for (const auto& source_obj_info : from_instance_info.obj_info()) {
+            if (source_obj_info.id() == snapshot_resource_id) {
+                *obj_info = source_obj_info;
+                if (!decrypt_object_store_info_ak_sk(obj_info)) {
+                    LOG_WARNING("failed to decrypt snapshot object store info ak/sk");
+                    if (error_msg != nullptr) {
+                        *error_msg = "failed to decrypt snapshot object store info";
+                    }
+                    return MetaServiceCode::UNDEFINED_ERR;
+                }
+                found_snapshot_storage = true;
+                return MetaServiceCode::OK;
+            }
+        }
+    } else {
+        for (const auto& resource_id : from_instance_info.resource_ids()) {
+            if (resource_id == snapshot_resource_id) {
+                auto vault_key = storage_vault_key({from_instance_info.instance_id(), resource_id});
+                std::string val;
+                auto err = txn->get(vault_key, &val);
+
+                if (err != TxnErrorCode::TXN_OK) {
+                    LOG_WARNING("Failed to get storage vault with key=")
+                            .tag("vault_key", hex(vault_key))
+                            .tag("error", err);
+                    if (error_msg != nullptr) {
+                        *error_msg =
+                                fmt::format("failed to get storage vault, resource_id={} err={}",
+                                            snapshot_resource_id, err);
+                    }
+                    return cast_as<ErrCategory::READ>(err);
+                }
+
+                StorageVaultPB storage_vault;
+                if (!storage_vault.ParseFromString(val)) {
+                    LOG_WARNING("Failed to parse StorageVaultPB from string");
+                    if (error_msg != nullptr) {
+                        *error_msg = "failed to parse StorageVaultPB";
+                    }
+                    return MetaServiceCode::PROTOBUF_PARSE_ERR;
+                }
+
+                if (!storage_vault.has_obj_info()) {
+                    if (error_msg != nullptr) {
+                        *error_msg = "storage vault missing object store info";
+                    }
+                    return MetaServiceCode::UNDEFINED_ERR;
+                }
+
+                *obj_info = storage_vault.obj_info();
+                if (!decrypt_object_store_info_ak_sk(obj_info)) {
+                    LOG_WARNING("failed to decrypt snapshot object store info ak/sk");
+                    if (error_msg != nullptr) {
+                        *error_msg = "failed to decrypt snapshot object store info";
+                    }
+                    return MetaServiceCode::UNDEFINED_ERR;
+                }
+                found_snapshot_storage = true;
+                return MetaServiceCode::OK;
+            }
+        }
+    }
+
+    if (!found_snapshot_storage) {
+        LOG_WARNING("snapshot storage info not found").tag("resource_id", snapshot_resource_id);
+        if (error_msg != nullptr) {
+            *error_msg = fmt::format("snapshot storage info not found for resource_id={}",
+                                     snapshot_resource_id);
+        }
+        return MetaServiceCode::UNDEFINED_ERR;
+    }
+
+    return MetaServiceCode::OK;
+}
+
+// Find the next available resource ID from an instance's resource_ids
+static std::string next_available_resource_id(const InstanceInfoPB& instance) {
+    auto parse_id = [](int prev, std::string_view value) {
+        int last_id = 0;
+        if (auto [_, ec] = std::from_chars(value.data(), value.data() + value.size(), last_id);
+            ec != std::errc {}) {
+            LOG_WARNING("Invalid resource id format: {}", value);
+            last_id = 0;
+            DCHECK(false);
+        }
+        return std::max(prev, last_id);
+    };
+
+    auto object_info_max = std::accumulate(
+            instance.obj_info().begin(), instance.obj_info().end(), 0,
+            [&](int prev, const ObjectStoreInfoPB& obj) { return parse_id(prev, obj.id()); });
+
+    auto total_max = std::accumulate(
+            instance.resource_ids().begin(), instance.resource_ids().end(), object_info_max,
+            [&](int prev, const std::string& id) { return parse_id(prev, id); });
+
+    return std::to_string(total_max + 1);
+}
+
 void SnapshotManager::begin_snapshot(std::string_view instance_id,
-                                     const doris::cloud::BeginSnapshotRequest& request,
-                                     doris::cloud::BeginSnapshotResponse* response) {
+                                     const BeginSnapshotRequest& request,
+                                     BeginSnapshotResponse* response) {
     auto* status = response->mutable_status();
     status->set_code(MetaServiceCode::OK);
     status->set_msg("OK");
@@ -91,7 +193,7 @@ void SnapshotManager::begin_snapshot(std::string_view instance_id,
     }
 
     // get instance pb to check if it exists and get source snapshot info
-    std::string key = doris::cloud::instance_key({instance_id});
+    std::string key = instance_key({instance_id});
     LOG(INFO) << "get instance_key=" << hex(key);
 
     std::string val;
@@ -107,12 +209,6 @@ void SnapshotManager::begin_snapshot(std::string_view instance_id,
     if (!instance.ParseFromString(val)) {
         status->set_code(MetaServiceCode::PROTOBUF_PARSE_ERR);
         status->set_msg("failed to parse InstanceInfoPB");
-        return;
-    }
-
-    if (instance.enable_storage_vault()) {
-        status->set_code(MetaServiceCode::INVALID_ARGUMENT);
-        status->set_msg("snapshot not support for storage vault instance");
         return;
     }
 
@@ -134,10 +230,62 @@ void SnapshotManager::begin_snapshot(std::string_view instance_id,
         return;
     }
 
-    DCHECK(instance.obj_info_size() > 0) << "instance must have at least one obj_info";
+    ObjectStoreInfoPB obj_info;
+    std::string snapshot_resource_id;
+    if (!instance.enable_storage_vault()) {
+        if (instance.obj_info_size() == 0) {
+            status->set_code(MetaServiceCode::UNDEFINED_ERR);
+            status->set_msg("instance has no object store configuration");
+            return;
+        }
+        // Choose the last store obj as the storage to save the snapshot images.
+        obj_info = instance.obj_info(instance.obj_info_size() - 1);
+        snapshot_resource_id = obj_info.id();
+    } else {
+        if (instance.has_default_storage_vault_id() &&
+            !instance.default_storage_vault_id().empty()) {
+            snapshot_resource_id = instance.default_storage_vault_id();
+        } else if (instance.resource_ids_size() > 0) {
+            snapshot_resource_id = instance.resource_ids(0);
+        }
 
-    // Choose the last store obj as the storage to save the snapshot images.
-    ObjectStoreInfoPB obj_info(instance.obj_info(instance.obj_info_size() - 1));
+        if (snapshot_resource_id.empty()) {
+            status->set_code(MetaServiceCode::UNDEFINED_ERR);
+            status->set_msg("storage vault instance missing resource id");
+            return;
+        }
+
+        std::string vault_key;
+        storage_vault_key({std::string(instance_id), snapshot_resource_id}, &vault_key);
+        std::string vault_val;
+        err = txn->get(vault_key, &vault_val);
+        if (err != TxnErrorCode::TXN_OK) {
+            status->set_code(cast_as<ErrCategory::READ>(err));
+            status->set_msg(fmt::format("failed to get storage vault, resource_id={} err={}",
+                                        snapshot_resource_id, err));
+            LOG(WARNING) << status->msg();
+            return;
+        }
+
+        StorageVaultPB storage_vault;
+        if (!storage_vault.ParseFromString(vault_val)) {
+            status->set_code(MetaServiceCode::PROTOBUF_PARSE_ERR);
+            status->set_msg("failed to parse StorageVaultPB");
+            return;
+        }
+
+        if (!storage_vault.has_obj_info()) {
+            status->set_code(MetaServiceCode::UNDEFINED_ERR);
+            status->set_msg("storage vault missing object store info");
+            return;
+        }
+
+        obj_info = storage_vault.obj_info();
+        if (!obj_info.has_id() || obj_info.id().empty()) {
+            obj_info.set_id(snapshot_resource_id);
+        }
+    }
+
     if (!decrypt_object_store_info_ak_sk(&obj_info)) {
         status->set_code(MetaServiceCode::UNDEFINED_ERR);
         status->set_msg("failed to decrypt object info ak/sk");
@@ -162,7 +310,10 @@ void SnapshotManager::begin_snapshot(std::string_view instance_id,
     //
     // This create a reference to the object store, so any update or deletion of the object store
     // must be blocked until all snapshots referencing it are deleted.
-    snapshot_pb.set_resource_id(obj_info.id());
+    if (snapshot_resource_id.empty()) {
+        snapshot_resource_id = obj_info.id();
+    }
+    snapshot_pb.set_resource_id(snapshot_resource_id);
 
     std::string snapshot_full_info_val;
     if (!snapshot_pb.SerializeToString(&snapshot_full_info_val)) {
@@ -301,8 +452,8 @@ void SnapshotManager::update_snapshot(std::string_view instance_id,
 }
 
 void SnapshotManager::commit_snapshot(std::string_view instance_id,
-                                      const doris::cloud::CommitSnapshotRequest& request,
-                                      doris::cloud::CommitSnapshotResponse* response) {
+                                      const CommitSnapshotRequest& request,
+                                      CommitSnapshotResponse* response) {
     auto* status = response->mutable_status();
     status->set_code(MetaServiceCode::OK);
     status->set_msg("OK");
@@ -424,8 +575,8 @@ void SnapshotManager::commit_snapshot(std::string_view instance_id,
 }
 
 void SnapshotManager::abort_snapshot(std::string_view instance_id,
-                                     const doris::cloud::AbortSnapshotRequest& request,
-                                     doris::cloud::AbortSnapshotResponse* response) {
+                                     const AbortSnapshotRequest& request,
+                                     AbortSnapshotResponse* response) {
     auto* status = response->mutable_status();
     status->set_code(MetaServiceCode::OK);
     status->set_msg("OK");
@@ -530,8 +681,8 @@ void SnapshotManager::abort_snapshot(std::string_view instance_id,
 }
 
 void SnapshotManager::drop_snapshot(std::string_view instance_id,
-                                    const doris::cloud::DropSnapshotRequest& request,
-                                    doris::cloud::DropSnapshotResponse* response) {
+                                    const DropSnapshotRequest& request,
+                                    DropSnapshotResponse* response) {
     auto* status = response->mutable_status();
     status->set_code(MetaServiceCode::OK);
     status->set_msg("OK");
@@ -612,8 +763,8 @@ void SnapshotManager::drop_snapshot(std::string_view instance_id,
 }
 
 void SnapshotManager::list_snapshot(std::string_view instance_id,
-                                    const doris::cloud::ListSnapshotRequest& request,
-                                    doris::cloud::ListSnapshotResponse* response) {
+                                    const ListSnapshotRequest& request,
+                                    ListSnapshotResponse* response) {
     auto* status = response->mutable_status();
     status->set_code(MetaServiceCode::OK);
     status->set_msg("OK");
@@ -816,7 +967,28 @@ void SnapshotManager::list_snapshot(std::string_view instance_id,
         }
     }
 
+    // Enhance snapshot info with derivation relationship information
+    MetaReader reader(instance_id, txn_kv_.get());
     for (auto& [snapshot_id, snapshot_info] : snapshots_map) {
+        // Find count of derived instances using this snapshot
+        Versionstamp snapshot_versionstamp;
+        int derived_count = 0;
+        if (parse_snapshot_versionstamp(snapshot_id, &snapshot_versionstamp)) {
+            derived_count = reader.count_snapshot_references(txn.get(), snapshot_versionstamp);
+        }
+        // TODO: Add these fields to SnapshotInfoPB proto definition
+        // if (derived_count > 0) {
+        //     snapshot_info.set_has_derived_instances(true);
+        //     snapshot_info.set_derived_instance_count(derived_count);
+        // }
+
+        // Log derived instance information for now
+        if (derived_count > 0) {
+            LOG_INFO("snapshot has derived instances")
+                    .tag("snapshot_id", snapshot_id)
+                    .tag("derived_count", derived_count);
+        }
+
         *response->add_snapshots() = std::move(snapshot_info);
     }
 
@@ -827,14 +999,891 @@ void SnapshotManager::list_snapshot(std::string_view instance_id,
             .tag("include_aborted", include_aborted);
 }
 
-void SnapshotManager::clone_instance(const doris::cloud::CloneInstanceRequest& request,
-                                     doris::cloud::CloneInstanceResponse* response) {
-    response->mutable_status()->set_code(MetaServiceCode::UNDEFINED_ERR);
-    response->mutable_status()->set_msg("Not implemented");
+// ============================================================================
+// Helper functions for clone_instance
+// ============================================================================
+
+MetaServiceCode SnapshotManager::validate_clone_request(const CloneInstanceRequest& request,
+                                                        std::string* error_msg) {
+    // Validate basic parameters
+    if (!request.has_clone_type()) {
+        *error_msg = "clone_type not specified";
+        return MetaServiceCode::INVALID_ARGUMENT;
+    }
+
+    CloneInstanceRequest::CloneType clone_type = request.clone_type();
+    if (clone_type != CloneInstanceRequest::READ_ONLY &&
+        clone_type != CloneInstanceRequest::WRITABLE &&
+        clone_type != CloneInstanceRequest::ROLLBACK) {
+        *error_msg = "invalid clone_type";
+        return MetaServiceCode::INVALID_ARGUMENT;
+    }
+
+    if (!request.has_from_instance_id() || request.from_instance_id().empty()) {
+        *error_msg = "from_instance_id not specified";
+        return MetaServiceCode::INVALID_ARGUMENT;
+    }
+
+    if (!request.has_from_snapshot_id() || request.from_snapshot_id().empty()) {
+        *error_msg = "from_snapshot_id not specified";
+        return MetaServiceCode::INVALID_ARGUMENT;
+    }
+
+    if (!request.has_new_instance_id() || request.new_instance_id().empty()) {
+        *error_msg = "new_instance_id not specified";
+        return MetaServiceCode::INVALID_ARGUMENT;
+    }
+
+    if (clone_type == CloneInstanceRequest::WRITABLE) {
+        return validate_writable_clone_request(request, error_msg);
+    }
+
+    return MetaServiceCode::OK;
+}
+
+MetaServiceCode SnapshotManager::validate_writable_clone_request(
+        const CloneInstanceRequest& request, std::string* error_msg) {
+    // Check obj_info requirement - request.obj_info must be set
+    if (!request.has_obj_info()) {
+        *error_msg = "WRITABLE clone requires obj_info";
+        return MetaServiceCode::INVALID_ARGUMENT;
+    }
+
+    // Validate object storage information if obj_info is provided
+    const auto& obj_info = request.obj_info();
+    if (!obj_info.has_ak() || obj_info.ak().empty()) {
+        *error_msg = "obj_info.ak is required";
+        return MetaServiceCode::INVALID_ARGUMENT;
+    }
+
+    if (!obj_info.has_sk() || obj_info.sk().empty()) {
+        *error_msg = "obj_info.sk is required";
+        return MetaServiceCode::INVALID_ARGUMENT;
+    }
+
+    if (!obj_info.has_bucket() || obj_info.bucket().empty()) {
+        *error_msg = "obj_info.bucket is required";
+        return MetaServiceCode::INVALID_ARGUMENT;
+    }
+
+    if (!obj_info.has_endpoint() || obj_info.endpoint().empty()) {
+        *error_msg = "obj_info.endpoint is required";
+        return MetaServiceCode::INVALID_ARGUMENT;
+    }
+
+    return MetaServiceCode::OK;
+}
+
+TxnErrorCode SnapshotManager::validate_source_snapshot(Transaction* txn,
+                                                       const std::string& from_instance_id,
+                                                       const Versionstamp& snapshot_versionstamp,
+                                                       SnapshotPB* snapshot_pb,
+                                                       std::string* error_msg) {
+    MetaReader reader(from_instance_id);
+    TxnErrorCode err = reader.get_snapshot(txn, snapshot_versionstamp, snapshot_pb);
+    if (err != TxnErrorCode::TXN_OK) {
+        if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
+            *error_msg = fmt::format("snapshot not found: instance_id={} snapshot_id={}",
+                                     from_instance_id, snapshot_versionstamp.to_string());
+        } else {
+            *error_msg = "failed to get snapshot";
+        }
+        return err;
+    }
+
+    // Validate snapshot status
+    if (snapshot_pb->status() != SnapshotStatus::SNAPSHOT_NORMAL) {
+        *error_msg = fmt::format("snapshot status is not NORMAL, current status: {}",
+                                 SnapshotStatus_Name(snapshot_pb->status()));
+        return TxnErrorCode::TXN_KEY_NOT_FOUND; // Use as invalid state indicator
+    }
+
+    LOG_INFO("snapshot validation completed successfully")
+            .tag("snapshot_id", snapshot_versionstamp.to_string())
+            .tag("snapshot_status", SnapshotStatus_Name(snapshot_pb->status()))
+            .tag("create_at", snapshot_pb->create_at())
+            .tag("image_url", snapshot_pb->image_url());
+
+    return TxnErrorCode::TXN_OK;
+}
+
+TxnErrorCode SnapshotManager::validate_source_instance(Transaction* txn,
+                                                       const std::string& from_instance_id,
+                                                       const std::string& from_snapshot_id,
+                                                       CloneInstanceRequest::CloneType clone_type,
+                                                       InstanceInfoPB* from_instance_info,
+                                                       std::string* error_msg) {
+    // Get source instance information
+    InstanceKeyInfo source_key_info {from_instance_id};
+    std::string from_instance_key;
+    instance_key(source_key_info, &from_instance_key);
+
+    std::string from_instance_value;
+    TxnErrorCode err = txn->get(from_instance_key, &from_instance_value);
+    if (err != TxnErrorCode::TXN_OK) {
+        if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
+            *error_msg = fmt::format("source instance not found: {}", from_instance_id);
+        } else {
+            *error_msg = "failed to get source instance";
+        }
+        return err;
+    }
+
+    // Parse source instance information
+    if (!from_instance_info->ParseFromArray(from_instance_value.data(),
+                                            from_instance_value.size())) {
+        *error_msg = "failed to parse source InstanceInfoPB";
+        return TxnErrorCode::TXN_UNIDENTIFIED_ERROR;
+    }
+
+    // Validate source instance status
+    if (from_instance_info->status() != InstanceInfoPB::NORMAL) {
+        *error_msg = fmt::format("source instance status is not NORMAL: {}",
+                                 InstanceInfoPB::Status_Name(from_instance_info->status()));
+        return TxnErrorCode::TXN_KEY_NOT_FOUND;
+    }
+
+    // Type-specific validation
+    if (clone_type == CloneInstanceRequest::ROLLBACK) {
+        // Validate source instance does not already have a successor instance
+        if (from_instance_info->has_succeed_instance_id() &&
+            !from_instance_info->succeed_instance_id().empty()) {
+            *error_msg = fmt::format(
+                    "source instance already has a successor instance: {}, ROLLBACK only one "
+                    "successor is "
+                    "allowed",
+                    from_instance_info->succeed_instance_id());
+            return TxnErrorCode::TXN_KEY_NOT_FOUND;
+        }
+    }
+
+    return TxnErrorCode::TXN_OK;
+}
+
+TxnErrorCode SnapshotManager::check_target_instance_existence(
+        Transaction* txn, const std::string& new_instance_id, const std::string& from_instance_id,
+        const std::string& from_snapshot_id, bool is_readonly, bool* already_exists,
+        CloneInstanceResponse* response, const SnapshotPB& snapshot_pb,
+        const InstanceInfoPB& from_instance_info, std::string* error_msg) {
+    std::string new_instance_key;
+    InstanceKeyInfo new_key_info {new_instance_id};
+    instance_key(new_key_info, &new_instance_key);
+
+    std::string existing_val;
+    TxnErrorCode err = txn->get(new_instance_key, &existing_val);
+
+    if (err == TxnErrorCode::TXN_OK) {
+        // Instance exists, check if it's an idempotent operation
+        InstanceInfoPB existing_instance;
+        if (existing_instance.ParseFromString(existing_val) &&
+            existing_instance.source_instance_id() == from_instance_id &&
+            existing_instance.source_snapshot_id() == from_snapshot_id &&
+            existing_instance.ready_only() == is_readonly) {
+            // Idempotent operation
+            LOG_INFO("Clone already exists with same configuration")
+                    .tag("clone_type", is_readonly ? "READ_ONLY" : "WRITABLE");
+            std::string helper_err;
+            MetaServiceCode helper_code = set_snapshot_info_in_response(
+                    response, snapshot_pb, from_instance_info, txn, &helper_err);
+            if (helper_code != MetaServiceCode::OK) {
+                if (error_msg != nullptr) {
+                    *error_msg = std::move(helper_err);
+                }
+                *already_exists = true;
+                return TxnErrorCode::TXN_UNIDENTIFIED_ERROR;
+            }
+            *already_exists = true;
+            return TxnErrorCode::TXN_OK;
+        } else {
+            *error_msg = fmt::format("instance with id '{}' already exists", new_instance_id);
+            *already_exists = true;
+            return TxnErrorCode::TXN_CONFLICT;
+        }
+    } else if (err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        *error_msg = "failed to check new instance existence";
+        return err;
+    }
+
+    *already_exists = false;
+    return TxnErrorCode::TXN_OK;
+}
+
+InstanceInfoPB SnapshotManager::create_readonly_instance_info(
+        const std::string& new_instance_id, const InstanceInfoPB& from_instance_info,
+        const std::string& from_instance_id, const std::string& from_snapshot_id) {
+    InstanceInfoPB new_instance;
+
+    // Basic information
+    new_instance.set_instance_id(new_instance_id);
+    new_instance.set_name(fmt::format("clone_read_only_{}", new_instance_id));
+    new_instance.set_user_id(from_instance_info.user_id());
+    new_instance.set_ctime(std::time(nullptr));
+    new_instance.set_mtime(std::time(nullptr));
+    new_instance.set_status(InstanceInfoPB::NORMAL);
+    new_instance.set_ready_only(true); // READ_ONLY flag
+
+    // Derivation relationship information
+    new_instance.set_source_instance_id(from_instance_id);
+    new_instance.set_source_snapshot_id(from_snapshot_id);
+
+    // Set original instance relationship (root of snapshot chain)
+    if (from_instance_info.has_original_instance_id()) {
+        new_instance.set_original_instance_id(from_instance_info.original_instance_id());
+    } else {
+        new_instance.set_original_instance_id(from_instance_id);
+    }
+
+    // Inherit source instance storage configuration (READ_ONLY fully shared)
+    for (const auto& obj_info : from_instance_info.obj_info()) {
+        *new_instance.add_obj_info() = obj_info;
+    }
+    for (const auto& resource_id : from_instance_info.resource_ids()) {
+        new_instance.add_resource_ids(resource_id);
+    }
+    if (from_instance_info.has_enable_storage_vault()) {
+        new_instance.set_enable_storage_vault(from_instance_info.enable_storage_vault());
+    }
+    for (const auto& vault_name : from_instance_info.storage_vault_names()) {
+        new_instance.add_storage_vault_names(vault_name);
+    }
+    if (from_instance_info.has_default_storage_vault_id()) {
+        new_instance.set_default_storage_vault_id(from_instance_info.default_storage_vault_id());
+    }
+
+    // Inherit snapshot-related configuration
+    new_instance.set_multi_version_status(MultiVersionStatus::MULTI_VERSION_READ_WRITE);
+    new_instance.set_snapshot_switch_status(SnapshotSwitchStatus::SNAPSHOT_SWITCH_OFF);
+
+    // Read-only instances disable snapshots by default
+    if (from_instance_info.has_max_reserved_snapshot()) {
+        new_instance.set_max_reserved_snapshot(0);
+    }
+    if (from_instance_info.has_snapshot_interval_seconds()) {
+        new_instance.set_snapshot_interval_seconds(from_instance_info.snapshot_interval_seconds());
+    }
+
+    return new_instance;
+}
+
+InstanceInfoPB SnapshotManager::create_writable_instance_info(
+        const std::string& new_instance_id, const InstanceInfoPB& from_instance_info,
+        const std::string& from_instance_id, const std::string& from_snapshot_id) {
+    InstanceInfoPB new_instance;
+
+    // Basic information
+    new_instance.set_instance_id(new_instance_id);
+    new_instance.set_name(fmt::format("clone_writable_{}", new_instance_id));
+    new_instance.set_user_id(from_instance_info.user_id());
+    new_instance.set_ctime(std::time(nullptr));
+    new_instance.set_mtime(std::time(nullptr));
+    new_instance.set_status(InstanceInfoPB::NORMAL);
+    new_instance.set_ready_only(false); // WRITABLE flag
+
+    // Derivation relationship information
+    new_instance.set_source_instance_id(from_instance_id);
+    new_instance.set_source_snapshot_id(from_snapshot_id);
+
+    // Set original instance relationship (root of snapshot chain)
+    if (from_instance_info.has_original_instance_id()) {
+        new_instance.set_original_instance_id(from_instance_info.original_instance_id());
+    } else {
+        new_instance.set_original_instance_id(from_instance_id);
+    }
+
+    // Configure storage hierarchy (Copy-on-Write)
+    // Storage vault configuration will be finalized in setup_writable_storage
+    new_instance.set_enable_storage_vault(from_instance_info.enable_storage_vault());
+
+    // Set snapshot-related configuration
+    new_instance.set_multi_version_status(MultiVersionStatus::MULTI_VERSION_READ_WRITE);
+    new_instance.set_snapshot_switch_status(SnapshotSwitchStatus::SNAPSHOT_SWITCH_OFF);
+
+    // Inherit snapshot configuration parameters
+    if (from_instance_info.has_max_reserved_snapshot()) {
+        new_instance.set_max_reserved_snapshot(from_instance_info.max_reserved_snapshot());
+    } else {
+        new_instance.set_max_reserved_snapshot(1);
+    }
+    if (from_instance_info.has_snapshot_interval_seconds()) {
+        new_instance.set_snapshot_interval_seconds(from_instance_info.snapshot_interval_seconds());
+    }
+
+    return new_instance;
+}
+
+MetaServiceCode SnapshotManager::setup_writable_storage(Transaction* txn,
+                                                        const CloneInstanceRequest& request,
+                                                        const InstanceInfoPB& from_instance_info,
+                                                        InstanceInfoPB* new_instance,
+                                                        std::string* error_msg) {
+    // Setup storage for writable clone:
+    // - Obj info mode: copy obj_info and append user-provided obj_info if present
+    // - Storage vault mode: copy source storage vaults and create a new writable vault
+
+    const std::string& from_instance_id = request.from_instance_id();
+    const std::string& new_instance_id = new_instance->instance_id();
+
+    if (!from_instance_info.enable_storage_vault()) {
+        new_instance->set_enable_storage_vault(false);
+        new_instance->clear_resource_ids();
+        new_instance->clear_storage_vault_names();
+        new_instance->clear_default_storage_vault_id();
+
+        auto* target_obj_infos = new_instance->mutable_obj_info();
+        target_obj_infos->Clear();
+        for (const auto& source_obj_info : from_instance_info.obj_info()) {
+            *target_obj_infos->Add() = source_obj_info;
+        }
+
+        if (request.has_obj_info()) {
+            ObjectStoreInfoPB new_obj_info = request.obj_info();
+            std::string new_obj_id = next_available_resource_id(*new_instance);
+            new_obj_info.set_id(new_obj_id);
+            auto now_time = std::chrono::system_clock::now();
+            uint64_t now_seconds =
+                    std::chrono::duration_cast<std::chrono::seconds>(now_time.time_since_epoch())
+                            .count();
+            new_obj_info.set_ctime(now_seconds);
+            new_obj_info.set_mtime(now_seconds);
+            *target_obj_infos->Add() = new_obj_info;
+        }
+
+        LOG_INFO("WRITABLE clone legacy storage configuration completed")
+                .tag("new_instance_id", new_instance_id)
+                .tag("obj_info_count", new_instance->obj_info_size());
+
+        return MetaServiceCode::OK;
+    }
+
+    // Step 1: Copy source storage vaults and append to new instance
+    for (const auto& source_resource_id : from_instance_info.resource_ids()) {
+        // Get source storage vault
+        std::string source_vault_key_str;
+        storage_vault_key({from_instance_id, source_resource_id}, &source_vault_key_str);
+        std::string source_vault_val;
+        TxnErrorCode err = txn->get(source_vault_key_str, &source_vault_val);
+
+        if (err != TxnErrorCode::TXN_OK) {
+            *error_msg = fmt::format("failed to get source storage vault, resource_id={}, err={}",
+                                     source_resource_id, err);
+            return cast_as<ErrCategory::READ>(err);
+        }
+
+        StorageVaultPB source_vault;
+        if (!source_vault.ParseFromString(source_vault_val)) {
+            *error_msg = "failed to parse source StorageVaultPB";
+            return MetaServiceCode::PROTOBUF_PARSE_ERR;
+        }
+
+        // Generate new resource_id for new_instance (cannot reuse source's resource_id)
+        std::string new_resource_id = next_available_resource_id(*new_instance);
+
+        // Update vault id in the copied vault
+        source_vault.set_id(new_resource_id);
+
+        // Save to new instance with new resource_id
+        std::string new_vault_key_str;
+        storage_vault_key({new_instance_id, new_resource_id}, &new_vault_key_str);
+        std::string new_vault_val = source_vault.SerializeAsString();
+        txn->put(new_vault_key_str, new_vault_val);
+
+        // Add to new_instance configuration
+        new_instance->add_resource_ids(new_resource_id);
+        new_instance->add_storage_vault_names(source_vault.name());
+
+        LOG_INFO("Copied source storage vault with new resource_id")
+                .tag("new_instance_id", new_instance_id)
+                .tag("source_resource_id", source_resource_id)
+                .tag("new_resource_id", new_resource_id)
+                .tag("vault_name", source_vault.name());
+    }
+
+    // Step 2: Create new writable storage vault with user-provided obj_info
+    std::string new_resource_id = next_available_resource_id(*new_instance);
+    std::string new_storage_vault_id = new_resource_id;
+
+    // Get object store info from request
+    const auto& obj_info = request.obj_info();
+
+    // Create new storage vault
+    StorageVaultPB new_storage_vault;
+    new_storage_vault.set_id(new_storage_vault_id);
+    new_storage_vault.set_name(fmt::format("clone_vault_{}", new_storage_vault_id));
+    *new_storage_vault.mutable_obj_info() = obj_info;
+
+    // Save new writable storage vault
+    std::string new_vault_key_str;
+    storage_vault_key({new_instance_id, new_storage_vault_id}, &new_vault_key_str);
+    std::string new_vault_val = new_storage_vault.SerializeAsString();
+    txn->put(new_vault_key_str, new_vault_val);
+
+    // Add to instance configuration
+    new_instance->add_resource_ids(new_storage_vault_id);
+    new_instance->add_storage_vault_names(new_storage_vault.name());
+
+    // Ensure the writable clone points at the new writable storage vault
+    new_instance->set_default_storage_vault_id(new_storage_vault_id);
+
+    LOG_INFO("WRITABLE clone storage configuration completed")
+            .tag("new_instance_id", new_instance_id)
+            .tag("new_writable_resource_id", new_storage_vault_id)
+            .tag("new_writable_vault_name", new_storage_vault.name())
+            .tag("total_resource_ids", new_instance->resource_ids_size())
+            .tag("total_vault_names", new_instance->storage_vault_names_size())
+            .tag("default_storage_vault_id", new_instance->default_storage_vault_id());
+
+    return MetaServiceCode::OK;
+}
+
+MetaServiceCode SnapshotManager::clone_storage_vault_entries(
+        Transaction* txn, const std::string& from_instance_id, const std::string& new_instance_id,
+        const InstanceInfoPB& from_instance_info, std::string* error_msg) {
+    if (!from_instance_info.enable_storage_vault()) {
+        return MetaServiceCode::OK;
+    }
+
+    // storage_vault entries are stored under keys encoded as:
+    //   0x01 "storage_vault" ${instance_id} "vault" ${resource_id}
+    // so every instance has its own namespace. To let the new instance
+    // reference the same vault metadata, we must materialize a copy under
+    // the new instance_id with the identical resource_id.
+    for (const auto& resource_id : from_instance_info.resource_ids()) {
+        std::string source_vault_key_str;
+        storage_vault_key({from_instance_id, resource_id}, &source_vault_key_str);
+        std::string source_vault_val;
+        TxnErrorCode err = txn->get(source_vault_key_str, &source_vault_val);
+
+        if (err != TxnErrorCode::TXN_OK) {
+            *error_msg =
+                    fmt::format("failed to copy storage vault for rollback, resource_id={}, err={}",
+                                resource_id, err);
+            LOG_WARNING("Failed to copy storage vault for rollback")
+                    .tag("from_instance_id", from_instance_id)
+                    .tag("target_instance_id", new_instance_id)
+                    .tag("resource_id", resource_id)
+                    .tag("error", err);
+            return cast_as<ErrCategory::READ>(err);
+        }
+
+        std::string target_vault_key_str;
+        storage_vault_key({new_instance_id, resource_id}, &target_vault_key_str);
+        txn->put(target_vault_key_str, source_vault_val);
+    }
+
+    LOG_INFO("Copied storage vaults for rollback instance")
+            .tag("from_instance_id", from_instance_id)
+            .tag("target_instance_id", new_instance_id)
+            .tag("vault_count", from_instance_info.resource_ids_size());
+
+    return MetaServiceCode::OK;
+}
+
+void SnapshotManager::establish_snapshot_reference(Transaction* txn,
+                                                   const std::string& from_instance_id,
+                                                   const Versionstamp& snapshot_versionstamp,
+                                                   const std::string& new_instance_id) {
+    LOG_INFO("starting snapshot reference relationship processing")
+            .tag("from_snapshot_id", snapshot_versionstamp.to_string())
+            .tag("new_instance_id", new_instance_id);
+
+    // Write snapshot reference key to record reference relationship
+    versioned::SnapshotReferenceKeyInfo ref_key_info {from_instance_id, snapshot_versionstamp,
+                                                      new_instance_id};
+    std::string reference_key = versioned::snapshot_reference_key(ref_key_info);
+    std::string reference_val;
+
+    txn->put(reference_key, reference_val);
+
+    LOG_INFO("snapshot reference relationship established")
+            .tag("snapshot_id", snapshot_versionstamp.to_string())
+            .tag("instance_id", new_instance_id)
+            .tag("reference_key", hex(reference_key));
+}
+
+MetaServiceCode SnapshotManager::update_source_instance_successor(
+        Transaction* txn, const std::string& from_instance_key, InstanceInfoPB* from_instance_info,
+        const std::string& new_instance_id, std::string* error_msg) {
+    // Update source instance to record the successor instance
+    from_instance_info->set_succeed_instance_id(new_instance_id);
+    std::string updated_source_instance_val;
+    if (!from_instance_info->SerializeToString(&updated_source_instance_val)) {
+        *error_msg = "failed to serialize updated source InstanceInfoPB";
+        return MetaServiceCode::PROTOBUF_SERIALIZE_ERR;
+    }
+    txn->put(from_instance_key, updated_source_instance_val);
+    return MetaServiceCode::OK;
+}
+
+MetaServiceCode SnapshotManager::handle_readonly_clone(Transaction* txn,
+                                                       const CloneInstanceRequest& request,
+                                                       const SnapshotPB& snapshot_pb,
+                                                       const InstanceInfoPB& from_instance_info,
+                                                       CloneInstanceResponse* response,
+                                                       std::string* error_msg) {
+    const std::string& new_instance_id = request.new_instance_id();
+    const std::string& from_instance_id = request.from_instance_id();
+    const std::string& from_snapshot_id = request.from_snapshot_id();
+
+    LOG_INFO("starting READ_ONLY clone")
+            .tag("new_instance_id", new_instance_id)
+            .tag("from_instance_id", from_instance_id)
+            .tag("from_snapshot_id", from_snapshot_id);
+
+    // Check if target instance ID already exists
+    bool already_exists = false;
+    TxnErrorCode err = check_target_instance_existence(
+            txn, new_instance_id, from_instance_id, from_snapshot_id, true, &already_exists,
+            response, snapshot_pb, from_instance_info, error_msg);
+
+    if (err != TxnErrorCode::TXN_OK) {
+        if (already_exists && err == TxnErrorCode::TXN_CONFLICT) {
+            return MetaServiceCode::ALREADY_EXISTED;
+        }
+        return cast_as<ErrCategory::READ>(err);
+    }
+
+    if (already_exists) {
+        return MetaServiceCode::OK; // Idempotent case
+    }
+
+    // Create new read-only instance
+    InstanceInfoPB new_instance = create_readonly_instance_info(new_instance_id, from_instance_info,
+                                                                from_instance_id, from_snapshot_id);
+
+    // Serialize and save new instance
+    std::string new_instance_val;
+    if (!new_instance.SerializeToString(&new_instance_val)) {
+        *error_msg = "failed to serialize new READ_ONLY InstanceInfoPB";
+        return MetaServiceCode::PROTOBUF_SERIALIZE_ERR;
+    }
+
+    std::string new_instance_key;
+    InstanceKeyInfo new_key_info {new_instance_id};
+    instance_key(new_key_info, &new_instance_key);
+    txn->put(new_instance_key, new_instance_val);
+
+    // Update source instance to record the successor instance
+    InstanceKeyInfo source_key_info {from_instance_id};
+    std::string from_instance_key;
+    instance_key(source_key_info, &from_instance_key);
+
+    MetaServiceCode storage_code = clone_storage_vault_entries(
+            txn, from_instance_id, new_instance_id, from_instance_info, error_msg);
+    if (storage_code != MetaServiceCode::OK) {
+        return storage_code;
+    }
+
+    // Set snapshot info in response
+    std::string helper_error;
+    MetaServiceCode helper_code = set_snapshot_info_in_response(
+            response, snapshot_pb, from_instance_info, txn, &helper_error);
+    if (helper_code != MetaServiceCode::OK) {
+        if (error_msg != nullptr) {
+            *error_msg = std::move(helper_error);
+        }
+        return helper_code;
+    }
+
+    LOG_INFO("READ_ONLY clone prepared successfully")
+            .tag("new_instance_id", new_instance_id)
+            .tag("new_instance_name", new_instance.name())
+            .tag("ready_only", new_instance.ready_only())
+            .tag("source_instance_id", new_instance.source_instance_id())
+            .tag("source_snapshot_id", new_instance.source_snapshot_id())
+            .tag("original_instance_id", new_instance.original_instance_id())
+            .tag("image_url", snapshot_pb.image_url())
+            .tag("snapshot_resource_id", snapshot_pb.resource_id());
+
+    return MetaServiceCode::OK;
+}
+
+MetaServiceCode SnapshotManager::handle_writable_clone(Transaction* txn,
+                                                       const CloneInstanceRequest& request,
+                                                       const SnapshotPB& snapshot_pb,
+                                                       const InstanceInfoPB& from_instance_info,
+                                                       CloneInstanceResponse* response,
+                                                       std::string* error_msg) {
+    const std::string& new_instance_id = request.new_instance_id();
+    const std::string& from_instance_id = request.from_instance_id();
+    const std::string& from_snapshot_id = request.from_snapshot_id();
+
+    LOG_INFO("starting WRITABLE clone")
+            .tag("new_instance_id", new_instance_id)
+            .tag("from_instance_id", from_instance_id)
+            .tag("from_snapshot_id", from_snapshot_id);
+
+    // Check if target instance ID already exists
+    bool already_exists = false;
+    TxnErrorCode err = check_target_instance_existence(
+            txn, new_instance_id, from_instance_id, from_snapshot_id, false, &already_exists,
+            response, snapshot_pb, from_instance_info, error_msg);
+
+    if (err != TxnErrorCode::TXN_OK) {
+        if (already_exists && err == TxnErrorCode::TXN_CONFLICT) {
+            return MetaServiceCode::ALREADY_EXISTED;
+        }
+        return cast_as<ErrCategory::READ>(err);
+    }
+
+    if (already_exists) {
+        return MetaServiceCode::OK; // Idempotent case
+    }
+
+    // Create new writable instance
+    InstanceInfoPB new_instance = create_writable_instance_info(new_instance_id, from_instance_info,
+                                                                from_instance_id, from_snapshot_id);
+
+    // Setup writable storage - copy source vaults and create new writable vault
+    MetaServiceCode code =
+            setup_writable_storage(txn, request, from_instance_info, &new_instance, error_msg);
+    if (code != MetaServiceCode::OK) {
+        return code;
+    }
+
+    // Serialize and save new instance
+    std::string new_instance_val;
+    if (!new_instance.SerializeToString(&new_instance_val)) {
+        *error_msg = "failed to serialize new WRITABLE InstanceInfoPB";
+        return MetaServiceCode::PROTOBUF_SERIALIZE_ERR;
+    }
+
+    std::string new_instance_key;
+    InstanceKeyInfo new_key_info {new_instance_id};
+    instance_key(new_key_info, &new_instance_key);
+    txn->put(new_instance_key, new_instance_val);
+
+    // Update source instance to record the successor instance
+    InstanceKeyInfo source_key_info {from_instance_id};
+    std::string from_instance_key;
+    instance_key(source_key_info, &from_instance_key);
+
+    InstanceInfoPB mutable_from_instance_info = from_instance_info;
+    code = update_source_instance_successor(txn, from_instance_key, &mutable_from_instance_info,
+                                            new_instance_id, error_msg);
+    if (code != MetaServiceCode::OK) {
+        return code;
+    }
+
+    // Set snapshot info in response
+    std::string helper_error;
+    MetaServiceCode helper_code = set_snapshot_info_in_response(
+            response, snapshot_pb, from_instance_info, txn, &helper_error);
+    if (helper_code != MetaServiceCode::OK) {
+        if (error_msg != nullptr) {
+            *error_msg = std::move(helper_error);
+        }
+        return helper_code;
+    }
+
+    LOG_INFO("WRITABLE clone instance prepared")
+            .tag("new_instance_id", new_instance_id)
+            .tag("new_instance_name", new_instance.name())
+            .tag("ready_only", new_instance.ready_only())
+            .tag("source_instance_id", new_instance.source_instance_id())
+            .tag("source_snapshot_id", new_instance.source_snapshot_id())
+            .tag("original_instance_id", new_instance.original_instance_id())
+            .tag("image_url", snapshot_pb.image_url())
+            .tag("snapshot_resource_id", snapshot_pb.resource_id());
+
+    return MetaServiceCode::OK;
+}
+
+MetaServiceCode SnapshotManager::handle_rollback_clone(
+        Transaction* txn, const CloneInstanceRequest& request, const SnapshotPB& snapshot_pb,
+        const InstanceInfoPB& from_instance_info, const Versionstamp& snapshot_versionstamp,
+        CloneInstanceResponse* response, std::string* error_msg) {
+    const std::string& new_instance_id = request.new_instance_id();
+    const std::string& from_instance_id = request.from_instance_id();
+    const std::string& from_snapshot_id = request.from_snapshot_id();
+
+    LOG_INFO("Creating ROLLBACK clone")
+            .tag("from_instance_id", from_instance_id)
+            .tag("new_instance_id", new_instance_id)
+            .tag("from_snapshot_id", from_snapshot_id);
+
+    // Create new instance by copying from source instance
+    InstanceInfoPB target_instance_info = from_instance_info;
+
+    // Update key fields for the new instance
+    target_instance_info.set_instance_id(new_instance_id);
+    target_instance_info.set_original_instance_id(from_instance_info.instance_id());
+    target_instance_info.set_source_snapshot_id(snapshot_versionstamp.to_string());
+    target_instance_info.set_source_instance_id(from_instance_id);
+    target_instance_info.set_ctime(std::time(nullptr));
+
+    // Prepare target instance key
+    InstanceKeyInfo target_key_info {new_instance_id};
+    std::string target_instance_key_str;
+    instance_key(target_key_info, &target_instance_key_str);
+
+    // Serialize updated instance info
+    std::string updated_target_instance_val = target_instance_info.SerializeAsString();
+    if (updated_target_instance_val.empty()) {
+        *error_msg = "Failed to serialize rollback instance info";
+        return MetaServiceCode::PROTOBUF_SERIALIZE_ERR;
+    }
+
+    // Update source instance to record the successor instance
+    InstanceKeyInfo source_key_info {from_instance_id};
+    std::string from_instance_key;
+    instance_key(source_key_info, &from_instance_key);
+
+    MetaServiceCode storage_code = clone_storage_vault_entries(
+            txn, from_instance_id, new_instance_id, from_instance_info, error_msg);
+    if (storage_code != MetaServiceCode::OK) {
+        return storage_code;
+    }
+
+    // Update rollback instance in transaction
+    txn->put(target_instance_key_str, updated_target_instance_val);
+
+    // Return storage info after rollback
+    if (target_instance_info.obj_info_size() > 0) {
+        *response->mutable_obj_info() = target_instance_info.obj_info(0);
+    }
+    response->set_image_url(snapshot_pb.image_url());
+
+    LOG_INFO("ROLLBACK clone prepared successfully")
+            .tag("target_instance_id", new_instance_id)
+            .tag("snapshot_id", from_snapshot_id)
+            .tag("rollback_to_ctime", target_instance_info.ctime())
+            .tag("image_url", snapshot_pb.image_url())
+            .tag("snapshot_resource_id", snapshot_pb.resource_id());
+
+    return MetaServiceCode::OK;
+}
+
+void SnapshotManager::clone_instance(const CloneInstanceRequest& request,
+                                     CloneInstanceResponse* response) {
+    auto* status = response->mutable_status();
+    status->set_code(MetaServiceCode::OK);
+    status->set_msg("OK");
+
+    std::string error_msg;
+
+    // 1. Validate request parameters
+    MetaServiceCode code = validate_clone_request(request, &error_msg);
+    if (code != MetaServiceCode::OK) {
+        status->set_code(code);
+        status->set_msg(error_msg);
+        return;
+    }
+
+    // 2. Create transaction
+    std::unique_ptr<Transaction> txn;
+    TxnErrorCode err = txn_kv_->create_txn(&txn);
+    if (err != TxnErrorCode::TXN_OK) {
+        status->set_code(cast_as<ErrCategory::CREATE>(err));
+        status->set_msg("failed to create transaction");
+        return;
+    }
+
+    // 3. Parse and validate snapshot
+    Versionstamp snapshot_versionstamp;
+    if (!parse_snapshot_versionstamp(request.from_snapshot_id(), &snapshot_versionstamp)) {
+        status->set_code(MetaServiceCode::INVALID_ARGUMENT);
+        status->set_msg("failed to parse snapshot_id to versionstamp");
+        return;
+    }
+
+    SnapshotPB snapshot_pb;
+    err = validate_source_snapshot(txn.get(), request.from_instance_id(), snapshot_versionstamp,
+                                   &snapshot_pb, &error_msg);
+    if (err != TxnErrorCode::TXN_OK) {
+        if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
+            status->set_code(MetaServiceCode::INVALID_ARGUMENT);
+        } else {
+            status->set_code(cast_as<ErrCategory::READ>(err));
+        }
+        status->set_msg(error_msg);
+        return;
+    }
+
+    // Validate snapshot belongs to source instance
+    if (snapshot_pb.instance_id() != request.from_instance_id()) {
+        status->set_code(MetaServiceCode::INVALID_ARGUMENT);
+        status->set_msg("snapshot does not belong to the specified source instance");
+        return;
+    }
+
+    // 4. Validate source instance
+    InstanceInfoPB from_instance_info;
+    err = validate_source_instance(txn.get(), request.from_instance_id(),
+                                   request.from_snapshot_id(), request.clone_type(),
+                                   &from_instance_info, &error_msg);
+    if (err != TxnErrorCode::TXN_OK) {
+        if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
+            status->set_code(MetaServiceCode::CLUSTER_NOT_FOUND);
+        } else {
+            status->set_code(cast_as<ErrCategory::READ>(err));
+        }
+        status->set_msg(error_msg);
+        return;
+    }
+
+    // 5. Handle clone by type
+    switch (request.clone_type()) {
+    case CloneInstanceRequest::READ_ONLY:
+        code = handle_readonly_clone(txn.get(), request, snapshot_pb, from_instance_info, response,
+                                     &error_msg);
+        break;
+    case CloneInstanceRequest::WRITABLE:
+        code = handle_writable_clone(txn.get(), request, snapshot_pb, from_instance_info, response,
+                                     &error_msg);
+        break;
+    case CloneInstanceRequest::ROLLBACK:
+        code = handle_rollback_clone(txn.get(), request, snapshot_pb, from_instance_info,
+                                     snapshot_versionstamp, response, &error_msg);
+        break;
+    default:
+        code = MetaServiceCode::INVALID_ARGUMENT;
+        error_msg = "invalid clone_type";
+    }
+
+    if (code != MetaServiceCode::OK) {
+        status->set_code(code);
+        status->set_msg(error_msg);
+        return;
+    }
+
+    // 6. Establish snapshot reference relationship
+    establish_snapshot_reference(txn.get(), request.from_instance_id(), snapshot_versionstamp,
+                                 request.new_instance_id());
+
+    // 7. Commit transaction
+    LOG_INFO("committing clone_instance transaction")
+            .tag("clone_type", CloneInstanceRequest::CloneType_Name(request.clone_type()));
+
+    err = txn->commit();
+    if (err != TxnErrorCode::TXN_OK) {
+        status->set_code(cast_as<ErrCategory::COMMIT>(err));
+        status->set_msg(fmt::format("failed to commit clone transaction, err={}", err));
+        LOG_WARNING("clone transaction commit failed")
+                .tag("error_code", err)
+                .tag("clone_type", CloneInstanceRequest::CloneType_Name(request.clone_type()))
+                .tag("new_instance_id", request.new_instance_id())
+                .tag("message", "all changes have been rolled back");
+        return;
+    }
+
+    // 8. Notify instance refresh
+    notify_refresh_instance(txn_kv_, request.new_instance_id(), nullptr);
+    if (request.clone_type() == CloneInstanceRequest::ROLLBACK) {
+        notify_refresh_instance(txn_kv_, request.from_instance_id(), nullptr);
+    }
+
+    // Log operation completion
+    LOG_INFO("clone_instance operation completed successfully")
+            .tag("operation_type", CloneInstanceRequest::CloneType_Name(request.clone_type()))
+            .tag("from_instance_id", request.from_instance_id())
+            .tag("from_snapshot_id", request.from_snapshot_id())
+            .tag("new_instance_id", request.new_instance_id())
+            .tag("request_ip", request.has_request_ip() ? request.request_ip() : "")
+            .tag("transaction_committed", true);
 }
 
 std::pair<MetaServiceCode, std::string> SnapshotManager::set_multi_version_status(
-        std::string_view instance_id, doris::cloud::MultiVersionStatus multi_version_status) {
+        std::string_view instance_id, MultiVersionStatus multi_version_status) {
     LOG_INFO("set_multi_version_status")
             .tag("instance_id", instance_id)
             .tag("multi_version_status", multi_version_status);
@@ -845,9 +1894,9 @@ std::pair<MetaServiceCode, std::string> SnapshotManager::set_multi_version_statu
         return {cast_as<ErrCategory::CREATE>(err), "failed to create txn"};
     }
 
-    doris::cloud::InstanceKeyInfo key_info {std::string(instance_id)};
+    InstanceKeyInfo key_info {std::string(instance_id)};
     std::string instance_key_str;
-    doris::cloud::instance_key(key_info, &instance_key_str);
+    instance_key(key_info, &instance_key_str);
 
     std::string instance_val;
     err = txn->get(instance_key_str, &instance_val);
@@ -886,5 +1935,4 @@ std::pair<MetaServiceCode, std::string> SnapshotManager::set_multi_version_statu
 
     return {MetaServiceCode::OK, "success"};
 }
-
 } // namespace selectdb

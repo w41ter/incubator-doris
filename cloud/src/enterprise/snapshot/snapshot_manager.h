@@ -58,6 +58,83 @@ public:
                                        doris::cloud::StorageVaultAccessor* accessor,
                                        doris::cloud::Versionstamp snapshot_version,
                                        const doris::cloud::SnapshotPB& snapshot_pb) override;
+
+private:
+    // Validation functions
+    doris::cloud::MetaServiceCode validate_clone_request(
+            const doris::cloud::CloneInstanceRequest& request, std::string* error_msg);
+
+    doris::cloud::MetaServiceCode validate_writable_clone_request(
+            const doris::cloud::CloneInstanceRequest& request, std::string* error_msg);
+
+    doris::cloud::TxnErrorCode validate_source_snapshot(
+            doris::cloud::Transaction* txn, const std::string& from_instance_id,
+            const doris::cloud::Versionstamp& snapshot_versionstamp,
+            doris::cloud::SnapshotPB* snapshot_pb, std::string* error_msg);
+
+    doris::cloud::TxnErrorCode validate_source_instance(
+            doris::cloud::Transaction* txn, const std::string& from_instance_id,
+            const std::string& from_snapshot_id,
+            doris::cloud::CloneInstanceRequest::CloneType clone_type,
+            doris::cloud::InstanceInfoPB* from_instance_info, std::string* error_msg);
+
+    // Clone type handlers
+    doris::cloud::MetaServiceCode handle_readonly_clone(
+            doris::cloud::Transaction* txn, const doris::cloud::CloneInstanceRequest& request,
+            const doris::cloud::SnapshotPB& snapshot_pb,
+            const doris::cloud::InstanceInfoPB& from_instance_info,
+            doris::cloud::CloneInstanceResponse* response, std::string* error_msg);
+
+    doris::cloud::MetaServiceCode handle_writable_clone(
+            doris::cloud::Transaction* txn, const doris::cloud::CloneInstanceRequest& request,
+            const doris::cloud::SnapshotPB& snapshot_pb,
+            const doris::cloud::InstanceInfoPB& from_instance_info,
+            doris::cloud::CloneInstanceResponse* response, std::string* error_msg);
+
+    doris::cloud::MetaServiceCode handle_rollback_clone(
+            doris::cloud::Transaction* txn, const doris::cloud::CloneInstanceRequest& request,
+            const doris::cloud::SnapshotPB& snapshot_pb,
+            const doris::cloud::InstanceInfoPB& from_instance_info,
+            const doris::cloud::Versionstamp& snapshot_versionstamp,
+            doris::cloud::CloneInstanceResponse* response, std::string* error_msg);
+
+    // Helper functions
+    doris::cloud::TxnErrorCode check_target_instance_existence(
+            doris::cloud::Transaction* txn, const std::string& new_instance_id,
+            const std::string& from_instance_id, const std::string& from_snapshot_id,
+            bool is_readonly, bool* already_exists, doris::cloud::CloneInstanceResponse* response,
+            const doris::cloud::SnapshotPB& snapshot_pb,
+            const doris::cloud::InstanceInfoPB& from_instance_info, std::string* error_msg);
+
+    doris::cloud::InstanceInfoPB create_readonly_instance_info(
+            const std::string& new_instance_id,
+            const doris::cloud::InstanceInfoPB& from_instance_info,
+            const std::string& from_instance_id, const std::string& from_snapshot_id);
+
+    doris::cloud::InstanceInfoPB create_writable_instance_info(
+            const std::string& new_instance_id,
+            const doris::cloud::InstanceInfoPB& from_instance_info,
+            const std::string& from_instance_id, const std::string& from_snapshot_id);
+
+    doris::cloud::MetaServiceCode setup_writable_storage(
+            doris::cloud::Transaction* txn, const doris::cloud::CloneInstanceRequest& request,
+            const doris::cloud::InstanceInfoPB& from_instance_info,
+            doris::cloud::InstanceInfoPB* new_instance, std::string* error_msg);
+
+    doris::cloud::MetaServiceCode clone_storage_vault_entries(
+            doris::cloud::Transaction* txn, const std::string& from_instance_id,
+            const std::string& new_instance_id,
+            const doris::cloud::InstanceInfoPB& from_instance_info, std::string* error_msg);
+
+    void establish_snapshot_reference(doris::cloud::Transaction* txn,
+                                      const std::string& from_instance_id,
+                                      const doris::cloud::Versionstamp& snapshot_versionstamp,
+                                      const std::string& new_instance_id);
+
+    doris::cloud::MetaServiceCode update_source_instance_successor(
+            doris::cloud::Transaction* txn, const std::string& from_instance_key,
+            doris::cloud::InstanceInfoPB* from_instance_info, const std::string& new_instance_id,
+            std::string* error_msg);
 };
 
 } // namespace selectdb
