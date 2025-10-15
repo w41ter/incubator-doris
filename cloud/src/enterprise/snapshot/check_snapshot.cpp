@@ -466,37 +466,52 @@ int SnapshotManager::check_mvcc_meta_key(InstanceChecker* checker) {
                         .tag("snapshot_versionstamp", snapshpt_versionstamp_str);
                 continue;
             }
-            std::vector<doris::RowsetMetaCloudPB> rowset_metas;
+            std::vector<int64_t> tablet_ids;
 
             MetaReader snapshot_reader(instance_id, txn_kv_.get(), snapshot_versionstamp);
 
             // get all rowsets with this snapshot
-            TxnErrorCode err =
-                    snapshot_reader.get_all_tablet_rowset_metas(0, INT64_MAX, &rowset_metas, false);
-            if (err != TxnErrorCode::TXN_OK) {
-                LOG_WARNING("failed to get rowset metas by versionstamp")
-                        .tag("instance_id", instance_id)
-                        .tag("versionstamp", serialize_snapshot_versionstamp(snapshot_versionstamp))
-                        .tag("error_code", err);
-                continue;
-            }
+            TxnErrorCode err = snapshot_reader.get_all_tablet_ids(&tablet_ids, false);
 
-            total_rowsets += rowset_metas.size();
+            for (auto tablet_id : tablet_ids) {
+                std::vector<doris::RowsetMetaCloudPB> rowset_metas;
+                err = snapshot_reader.get_rowset_metas(tablet_id, 0, INT64_MAX - 1, &rowset_metas,
+                                                       false);
 
-            for (auto& rowset_meta : rowset_metas) {
-                if (rowset_meta.end_version() == 1) {
+                if (err != TxnErrorCode::TXN_OK) {
+                    LOG_WARNING("failed to get rowset metas by tablet id and versionstamp")
+                            .tag("instance_id", instance_id)
+                            .tag("versionstamp",
+                                 serialize_snapshot_versionstamp(snapshot_versionstamp))
+                            .tag("tablet_id", tablet_id)
+                            .tag("error_code", err);
                     continue;
                 }
-                std::string rowset_ref_count_key = versioned::data_rowset_ref_count_key(
-                        {instance_id, rowset_meta.tablet_id(), rowset_meta.rowset_id_v2()});
-                rowset_ref_count_map[rowset_ref_count_key] += 1;
-            }
-            int ret = check_rowsets_object(txn_kv_.get(), checker, instance_id, rowset_metas);
-            if (ret > 0) {
-                num_rowsets_loss++;
-                check_ret = 1;
-            } else if (ret < 0) {
-                check_ret = -1;
+
+                LOG_INFO("get rowset metas by versionstamp")
+                        .tag("instance_id", instance_id)
+                        .tag("versionstamp", serialize_snapshot_versionstamp(snapshot_versionstamp))
+                        .tag("tablet_id", tablet_id)
+                        .tag("num_rowsets", rowset_metas.size())
+                        .tag("error_code", err);
+
+                total_rowsets += rowset_metas.size();
+
+                for (auto& rowset_meta : rowset_metas) {
+                    if (rowset_meta.end_version() == 1) {
+                        continue;
+                    }
+                    std::string rowset_ref_count_key = versioned::data_rowset_ref_count_key(
+                            {instance_id, rowset_meta.tablet_id(), rowset_meta.rowset_id_v2()});
+                    rowset_ref_count_map[rowset_ref_count_key] += 1;
+                }
+                int ret = check_rowsets_object(txn_kv_.get(), checker, instance_id, rowset_metas);
+                if (ret > 0) {
+                    num_rowsets_loss++;
+                    check_ret = 1;
+                } else if (ret < 0) {
+                    check_ret = -1;
+                }
             }
         }
     }
