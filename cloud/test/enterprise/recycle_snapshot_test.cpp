@@ -1627,3 +1627,271 @@ TEST(RecycleSnapshotTest, CheckMvccMetaKeyEmptyRowsets) {
     // Empty rowsets should be skipped, so should return 0
     ASSERT_EQ(snapshot_manager->check_mvcc_meta_key(checker.get()), 0);
 }
+
+// Test for inverted_check_mvcc_meta_key function with various scenarios
+TEST(RecycleSnapshotTest, InvertedCheckMvccMetaKeyNormal) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "inverted_check_mvcc_meta_key_normal_instance";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    MOCK_GET_INSTANCE_ID(instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+
+    // insert rowsets
+    std::vector<std::string> rowset_ids;
+    for (int i = 0; i < 3; i++) {
+        std::string label = fmt::format("label_{}", i);
+        std::string rowset_id;
+        insert_rowset(meta_service.get(), cloud_unique_id, db_id, label, table_id, partition_id,
+                      tablet_id, &rowset_id);
+        rowset_ids.push_back(rowset_id);
+    }
+
+    // create a normal snapshot
+    SnapshotContext ctx;
+    begin_snapshot(meta_service.get(), cloud_unique_id, "inverted-check-test", &ctx);
+    commit_snapshot(meta_service.get(), cloud_unique_id, ctx.snapshot_id, ctx.image_url, 100);
+
+    std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    // prepare snapshot files in accessor
+    std::string image_path = "snapshot/" + ctx.snapshot_id + "/image.img";
+    accessor->put_file(image_path, "snapshot_content");
+
+    // prepare legitimate rowset files in accessor
+    for (const auto& rowset_id : rowset_ids) {
+        std::string segment_path = fmt::format("data/{}/{}_{}.dat", tablet_id, rowset_id, 0);
+        accessor->put_file(segment_path, "segment_content");
+    }
+
+    auto checker = get_instance_checker(meta_service.get(), instance_id, accessor);
+    auto snapshot_manager = std::make_shared<selectdb::SnapshotManager>(txn_kv);
+
+    // Normal case: all files in storage have corresponding metadata
+    ASSERT_EQ(snapshot_manager->inverted_check_mvcc_meta_key(checker.get()), 0);
+}
+
+TEST(RecycleSnapshotTest, InvertedCheckMvccMetaKeyOrphanedFiles) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "inverted_check_mvcc_meta_key_orphaned_instance";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    MOCK_GET_INSTANCE_ID(instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+
+    // insert a legitimate rowset
+    std::string rowset_id;
+    insert_rowset(meta_service.get(), cloud_unique_id, db_id, "label_1", table_id, partition_id,
+                  tablet_id, &rowset_id);
+
+    // create a normal snapshot
+    SnapshotContext ctx;
+    begin_snapshot(meta_service.get(), cloud_unique_id, "inverted-check-orphaned-test", &ctx);
+    commit_snapshot(meta_service.get(), cloud_unique_id, ctx.snapshot_id, ctx.image_url, 100);
+
+    std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    // prepare snapshot files in accessor
+    std::string image_path = "snapshot/" + ctx.snapshot_id + "/image.img";
+    accessor->put_file(image_path, "snapshot_content");
+
+    // prepare legitimate rowset file
+    std::string segment_path = fmt::format("data/{}/{}_{}.dat", tablet_id, rowset_id, 0);
+    accessor->put_file(segment_path, "segment_content");
+
+    // add orphaned files that don't have corresponding metadata
+    std::string orphaned_file1 = fmt::format("data/{}/orphaned_rowset_1_{}.dat", tablet_id, 0);
+    std::string orphaned_file2 = fmt::format("data/{}/orphaned_rowset_2_{}.dat", tablet_id, 0);
+    accessor->put_file(orphaned_file1, "orphaned_content1");
+    accessor->put_file(orphaned_file2, "orphaned_content2");
+
+    auto checker = get_instance_checker(meta_service.get(), instance_id, accessor);
+    auto snapshot_manager = std::make_shared<selectdb::SnapshotManager>(txn_kv);
+
+    // Should return 1 indicating orphaned files detected
+    ASSERT_EQ(snapshot_manager->inverted_check_mvcc_meta_key(checker.get()), 1);
+}
+
+TEST(RecycleSnapshotTest, InvertedCheckMvccMetaKeyNoSnapshots) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "inverted_check_mvcc_meta_key_no_snapshots_instance";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    MOCK_GET_INSTANCE_ID(instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+
+    std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    // add some files in storage without any snapshots
+    accessor->put_file("data/123/some_rowset_0.dat", "content");
+
+    auto checker = get_instance_checker(meta_service.get(), instance_id, accessor);
+    auto snapshot_manager = std::make_shared<selectdb::SnapshotManager>(txn_kv);
+
+    // Should return 0 when no snapshots exist (no tablets to check)
+    ASSERT_EQ(snapshot_manager->inverted_check_mvcc_meta_key(checker.get()), 0);
+}
+
+TEST(RecycleSnapshotTest, InvertedCheckMvccMetaKeyAbortedSnapshot) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "inverted_check_mvcc_meta_key_aborted_instance";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    MOCK_GET_INSTANCE_ID(instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+
+    // insert a rowset
+    std::string rowset_id;
+    insert_rowset(meta_service.get(), cloud_unique_id, db_id, "label_1", table_id, partition_id,
+                  tablet_id, &rowset_id);
+
+    // create and abort a snapshot
+    SnapshotContext ctx;
+    begin_snapshot(meta_service.get(), cloud_unique_id, "inverted-check-aborted-test", &ctx);
+    abort_snapshot(meta_service.get(), cloud_unique_id, ctx.snapshot_id, "test abort");
+
+    std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    // add files in storage
+    std::string segment_path = fmt::format("data/{}/{}_{}.dat", tablet_id, rowset_id, 0);
+    accessor->put_file(segment_path, "segment_content");
+
+    auto checker = get_instance_checker(meta_service.get(), instance_id, accessor);
+    auto snapshot_manager = std::make_shared<selectdb::SnapshotManager>(txn_kv);
+
+    // Aborted snapshots should be skipped, so should return 0
+    ASSERT_EQ(snapshot_manager->inverted_check_mvcc_meta_key(checker.get()), 0);
+}
+
+TEST(RecycleSnapshotTest, InvertedCheckMvccMetaKeyInvalidPaths) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "inverted_check_mvcc_meta_key_invalid_paths_instance";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    MOCK_GET_INSTANCE_ID(instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+
+    // insert a rowset
+    std::string rowset_id;
+    insert_rowset(meta_service.get(), cloud_unique_id, db_id, "label_1", table_id, partition_id,
+                  tablet_id, &rowset_id);
+
+    // create a normal snapshot
+    SnapshotContext ctx;
+    begin_snapshot(meta_service.get(), cloud_unique_id, "inverted-check-invalid-test", &ctx);
+    commit_snapshot(meta_service.get(), cloud_unique_id, ctx.snapshot_id, ctx.image_url, 100);
+
+    std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    // prepare snapshot files in accessor
+    std::string image_path = "snapshot/" + ctx.snapshot_id + "/image.img";
+    accessor->put_file(image_path, "snapshot_content");
+
+    // prepare legitimate rowset file
+    std::string segment_path = fmt::format("data/{}/{}_{}.dat", tablet_id, rowset_id, 0);
+    accessor->put_file(segment_path, "segment_content");
+
+    // add files with invalid path formats (should cause -1 return but be handled gracefully)
+    accessor->put_file("data/invalid.dat", "invalid_content");
+    accessor->put_file("data//empty_tablet.dat", "empty_content");
+
+    auto checker = get_instance_checker(meta_service.get(), instance_id, accessor);
+    auto snapshot_manager = std::make_shared<selectdb::SnapshotManager>(txn_kv);
+
+    // Invalid paths should be handled gracefully, legitimate files should pass
+    ASSERT_EQ(snapshot_manager->inverted_check_mvcc_meta_key(checker.get()), 0);
+}
+
+TEST(RecycleSnapshotTest, InvertedCheckMvccMetaKeyMultipleTablets) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "inverted_check_mvcc_meta_key_multiple_tablets_instance";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    MOCK_GET_INSTANCE_ID(instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4;
+    std::vector<int64_t> tablet_ids = {5, 6, 7};
+
+    // create partition/index/tablets
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+
+    std::vector<std::string> rowset_ids;
+    for (auto tablet_id : tablet_ids) {
+        create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                      tablet_id);
+
+        // insert a rowset for each tablet
+        std::string label = fmt::format("label_tablet_{}", tablet_id);
+        std::string rowset_id;
+        insert_rowset(meta_service.get(), cloud_unique_id, db_id, label, table_id, partition_id,
+                      tablet_id, &rowset_id);
+        rowset_ids.push_back(rowset_id);
+    }
+
+    // create a normal snapshot
+    SnapshotContext ctx;
+    begin_snapshot(meta_service.get(), cloud_unique_id, "inverted-check-multiple-test", &ctx);
+    commit_snapshot(meta_service.get(), cloud_unique_id, ctx.snapshot_id, ctx.image_url, 100);
+
+    std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    // prepare snapshot files in accessor
+    std::string image_path = "snapshot/" + ctx.snapshot_id + "/image.img";
+    accessor->put_file(image_path, "snapshot_content");
+
+    // prepare legitimate rowset files for each tablet
+    for (size_t i = 0; i < tablet_ids.size(); i++) {
+        std::string segment_path =
+                fmt::format("data/{}/{}_{}.dat", tablet_ids[i], rowset_ids[i], 0);
+        accessor->put_file(segment_path, "segment_content");
+    }
+
+    // add one orphaned file in tablet 5
+    std::string orphaned_file = fmt::format("data/{}/orphaned_rowset_{}.dat", tablet_ids[0], 0);
+    accessor->put_file(orphaned_file, "orphaned_content");
+
+    auto checker = get_instance_checker(meta_service.get(), instance_id, accessor);
+    auto snapshot_manager = std::make_shared<selectdb::SnapshotManager>(txn_kv);
+
+    // Should return 1 due to the orphaned file
+    ASSERT_EQ(snapshot_manager->inverted_check_mvcc_meta_key(checker.get()), 1);
+}

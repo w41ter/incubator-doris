@@ -746,10 +746,20 @@ void SnapshotManager::drop_snapshot(std::string_view instance_id,
         return;
     }
 
-    // Delete the snapshot
-    txn->remove(snapshot_key);
+    // Mark snapshot as RECYCLED instead of directly deleting it
+    // This allows the recycler to clean up the object storage data
+    snapshot_pb.set_status(SnapshotStatus::SNAPSHOT_RECYCLED);
 
-    LOG_INFO("drop snapshot completed")
+    std::string updated_snapshot_val;
+    if (!snapshot_pb.SerializeToString(&updated_snapshot_val)) {
+        status->set_msg("failed to serialize updated SnapshotPB");
+        status->set_code(MetaServiceCode::PROTOBUF_SERIALIZE_ERR);
+        return;
+    }
+
+    txn->put(snapshot_key, updated_snapshot_val);
+
+    LOG_INFO("drop snapshot completed, marked as RECYCLED")
             .tag("snapshot_key", hex(snapshot_full_key))
             .tag("instance_id", instance_id)
             .tag("snapshot_id", snapshot_id);
@@ -1562,7 +1572,6 @@ MetaServiceCode SnapshotManager::handle_readonly_clone(Transaction* txn,
     instance_key(new_key_info, &new_instance_key);
     txn->put(new_instance_key, new_instance_val);
 
-    // Update source instance to record the successor instance
     InstanceKeyInfo source_key_info {from_instance_id};
     std::string from_instance_key;
     instance_key(source_key_info, &from_instance_key);
@@ -1652,18 +1661,6 @@ MetaServiceCode SnapshotManager::handle_writable_clone(Transaction* txn,
     instance_key(new_key_info, &new_instance_key);
     txn->put(new_instance_key, new_instance_val);
 
-    // Update source instance to record the successor instance
-    InstanceKeyInfo source_key_info {from_instance_id};
-    std::string from_instance_key;
-    instance_key(source_key_info, &from_instance_key);
-
-    InstanceInfoPB mutable_from_instance_info = from_instance_info;
-    code = update_source_instance_successor(txn, from_instance_key, &mutable_from_instance_info,
-                                            new_instance_id, error_msg);
-    if (code != MetaServiceCode::OK) {
-        return code;
-    }
-
     // Set snapshot info in response
     std::string helper_error;
     MetaServiceCode helper_code = set_snapshot_info_in_response(
@@ -1728,10 +1725,17 @@ MetaServiceCode SnapshotManager::handle_rollback_clone(
     std::string from_instance_key;
     instance_key(source_key_info, &from_instance_key);
 
-    MetaServiceCode storage_code = clone_storage_vault_entries(
-            txn, from_instance_id, new_instance_id, from_instance_info, error_msg);
-    if (storage_code != MetaServiceCode::OK) {
-        return storage_code;
+    InstanceInfoPB mutable_from_instance_info = from_instance_info;
+    MetaServiceCode code = update_source_instance_successor(
+            txn, from_instance_key, &mutable_from_instance_info, new_instance_id, error_msg);
+    if (code != MetaServiceCode::OK) {
+        return code;
+    }
+
+    code = clone_storage_vault_entries(txn, from_instance_id, new_instance_id, from_instance_info,
+                                       error_msg);
+    if (code != MetaServiceCode::OK) {
+        return code;
     }
 
     // Update rollback instance in transaction
