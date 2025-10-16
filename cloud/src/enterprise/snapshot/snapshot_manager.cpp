@@ -1572,7 +1572,6 @@ MetaServiceCode SnapshotManager::handle_readonly_clone(Transaction* txn,
     instance_key(new_key_info, &new_instance_key);
     txn->put(new_instance_key, new_instance_val);
 
-    // Update source instance to record the successor instance
     InstanceKeyInfo source_key_info {from_instance_id};
     std::string from_instance_key;
     instance_key(source_key_info, &from_instance_key);
@@ -1662,18 +1661,6 @@ MetaServiceCode SnapshotManager::handle_writable_clone(Transaction* txn,
     instance_key(new_key_info, &new_instance_key);
     txn->put(new_instance_key, new_instance_val);
 
-    // Update source instance to record the successor instance
-    InstanceKeyInfo source_key_info {from_instance_id};
-    std::string from_instance_key;
-    instance_key(source_key_info, &from_instance_key);
-
-    InstanceInfoPB mutable_from_instance_info = from_instance_info;
-    code = update_source_instance_successor(txn, from_instance_key, &mutable_from_instance_info,
-                                            new_instance_id, error_msg);
-    if (code != MetaServiceCode::OK) {
-        return code;
-    }
-
     // Set snapshot info in response
     std::string helper_error;
     MetaServiceCode helper_code = set_snapshot_info_in_response(
@@ -1738,10 +1725,17 @@ MetaServiceCode SnapshotManager::handle_rollback_clone(
     std::string from_instance_key;
     instance_key(source_key_info, &from_instance_key);
 
-    MetaServiceCode storage_code = clone_storage_vault_entries(
-            txn, from_instance_id, new_instance_id, from_instance_info, error_msg);
-    if (storage_code != MetaServiceCode::OK) {
-        return storage_code;
+    InstanceInfoPB mutable_from_instance_info = from_instance_info;
+    MetaServiceCode code = update_source_instance_successor(
+            txn, from_instance_key, &mutable_from_instance_info, new_instance_id, error_msg);
+    if (code != MetaServiceCode::OK) {
+        return code;
+    }
+
+    code = clone_storage_vault_entries(txn, from_instance_id, new_instance_id, from_instance_info,
+                                       error_msg);
+    if (code != MetaServiceCode::OK) {
+        return code;
     }
 
     // Update rollback instance in transaction
