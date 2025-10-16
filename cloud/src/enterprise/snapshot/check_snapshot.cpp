@@ -6,12 +6,16 @@
 #include <gen_cpp/cloud.pb.h>
 #include <gen_cpp/olap_file.pb.h>
 
+#include <algorithm>
+#include <cstdio>
+
 #include "common/defer.h"
 #include "common/logging.h"
 #include "common/stopwatch.h"
 #include "common/util.h"
 #include "meta-service/meta_service_schema.h"
 #include "meta-store/blob_message.h"
+#include "meta-store/document_message.h"
 #include "meta-store/keys.h"
 #include "meta-store/meta_reader.h"
 #include "meta-store/txn_kv.h"
@@ -28,6 +32,11 @@ using namespace std::chrono;
 
 namespace selectdb {
 
+struct TabletRowsetsCache {
+    int64_t tablet_id {0};
+    std::unordered_set<std::string> rowset_ids;
+};
+
 bool is_snapshot_normal(const SnapshotPB& snapshot_pb) {
     switch (snapshot_pb.status()) {
     case SnapshotStatus::SNAPSHOT_PREPARE:
@@ -42,8 +51,8 @@ bool is_snapshot_normal(const SnapshotPB& snapshot_pb) {
     }
 }
 
-int check_snapshot_file_exist(TxnKv* txn_kv, std::string_view instance_id,
-                              const std::string& snapshot_id) {
+int check_snapshot_key_exist(TxnKv* txn_kv, std::string_view instance_id,
+                             const std::string& snapshot_id) {
     if (!txn_kv || instance_id.empty() || snapshot_id.empty()) {
         return -1;
     }
@@ -80,6 +89,82 @@ int check_snapshot_file_exist(TxnKv* txn_kv, std::string_view instance_id,
                 .tag("snapshot_versionstamp", snapshot_id);
 
         return -1;
+    }
+
+    return 0;
+}
+
+int check_rowset_key_exist(TxnKv* txn_kv, std::string_view instance_id, const std::string& path,
+                           TabletRowsetsCache& tablet_rowsets_cache) {
+    if (!txn_kv || instance_id.empty() || path.empty()) {
+        return -1;
+    }
+
+    // Return 0 if check success, return 1 if file is garbage data, negative if error occurred
+    std::vector<std::string> str;
+    butil::SplitString(path, '/', &str);
+    // data/{tablet_id}/{rowset_id}_{seg_num}.dat
+    if (str.size() < 3) {
+        // clang-format off
+            LOG(WARNING) << "split path error, str.size() should be less than 3,"
+                         << " value = " << str.size();
+        // clang-format on
+        return -1;
+    }
+
+    int64_t tablet_id = atol(str[1].c_str());
+    if (tablet_id <= 0) {
+        LOG(WARNING) << "failed to parse tablet_id, key=" << path;
+        return -1;
+    }
+
+    if (!str[2].ends_with(".dat")) {
+        // skip check not segment file
+        return 0;
+    }
+
+    std::string rowset_id;
+    if (auto pos = str.back().find('_'); pos != std::string::npos) {
+        rowset_id = str.back().substr(0, pos);
+    } else {
+        LOG(WARNING) << "failed to parse rowset_id, key=" << path;
+        return -1;
+    }
+
+    if (tablet_rowsets_cache.tablet_id == tablet_id) {
+        if (tablet_rowsets_cache.rowset_ids.contains(rowset_id)) {
+            return 0;
+        } else {
+            LOG(WARNING) << "rowset not exists, key=" << path;
+            return -1;
+        }
+    }
+    // Get all rowset id of this tablet
+    tablet_rowsets_cache.tablet_id = tablet_id;
+    tablet_rowsets_cache.rowset_ids.clear();
+    std::unique_ptr<Transaction> txn;
+    TxnErrorCode err = txn_kv->create_txn(&txn);
+    if (err != TxnErrorCode::TXN_OK) {
+        LOG(WARNING) << "failed to create txn";
+        return -1;
+    }
+    MetaReader reader(instance_id, txn_kv);
+    std::vector<doris::RowsetMetaCloudPB> rowset_metas;
+    err = reader.get_rowset_metas(txn.get(), tablet_id, 0, INT64_MAX, &rowset_metas, false);
+    std::ranges::transform(
+            rowset_metas,
+            std::inserter(tablet_rowsets_cache.rowset_ids, tablet_rowsets_cache.rowset_ids.end()),
+            [](const doris::RowsetMetaCloudPB& meta) { return meta.rowset_id_v2(); });
+    if (err != TxnErrorCode::TXN_OK) {
+        LOG(WARNING) << "failed to get all tablet rowset metas"
+                     << ", error_code=" << err;
+        return -1;
+    }
+
+    if (!tablet_rowsets_cache.rowset_ids.contains(rowset_id)) {
+        // Garbage data leak
+        LOG(WARNING) << "rowset should be recycled, key=" << path;
+        return 1;
     }
 
     return 0;
@@ -250,7 +335,7 @@ int check_rowset_ref_count_map(const std::unordered_map<std::string, int64_t>& r
         if (is_loss > 0 || is_diff > 0) {
             LOG(INFO) << "rowset ref count key check result: "
                       << (is_loss > 0 ? std::to_string(is_loss) + " key loss; " : "") +
-                                 (is_diff > 0 ? std::to_string(is_diff) + " key diff; " : "")
+                                 (is_diff > 0 ? std::to_string(is_diff) + " key diff, " : "")
                       << " total rowset ref count keys=" << rowset_ref_count_map.size();
         }
     };
@@ -409,8 +494,8 @@ int SnapshotManager::inverted_check_snapshots(InstanceChecker* checker) {
             }
 
             already_checked_snapshot_vs = str[1];
-            int ret = check_snapshot_file_exist(txn_kv_.get(), instance_id,
-                                                already_checked_snapshot_vs);
+            int ret = check_snapshot_key_exist(txn_kv_.get(), instance_id,
+                                               already_checked_snapshot_vs);
             if (ret == 1) {
                 num_leak++;
                 check_res = 1;
@@ -427,7 +512,7 @@ int SnapshotManager::inverted_check_snapshots(InstanceChecker* checker) {
     return num_leak > 0 ? 1 : check_res;
 }
 
-int SnapshotManager::check_mvcc_meta_key(InstanceChecker* checker) {
+int check_mvcc_meta_rowset_key(InstanceChecker* checker, TxnKv* txn_kv) {
     int check_ret = 0;
     std::string instance_id(checker->instance_id().data(), checker->instance_id().size());
     AnnotateTag tag("instance_id", instance_id);
@@ -446,8 +531,9 @@ int SnapshotManager::check_mvcc_meta_key(InstanceChecker* checker) {
     };
 
     std::vector<std::pair<SnapshotPB, Versionstamp>> snapshots;
+    // rowset ref count key -> reference count
     std::unordered_map<std::string, int64_t> rowset_ref_count_map;
-    MetaReader reader(instance_id, txn_kv_.get());
+    MetaReader reader(instance_id, txn_kv);
     TxnErrorCode err = reader.get_snapshots(&snapshots);
     if (err != TxnErrorCode::TXN_OK) {
         LOG_WARNING("failed to get snapshots").tag("error_code", err);
@@ -457,18 +543,18 @@ int SnapshotManager::check_mvcc_meta_key(InstanceChecker* checker) {
     for (auto&& [snapshot_pb, snapshot_versionstamp] : snapshots) {
         if (is_snapshot_normal(snapshot_pb)) {
             // first to check snapshot file exist
-            std::string snapshpt_versionstamp_str =
+            std::string snapshot_versionstamp_str =
                     serialize_snapshot_versionstamp(snapshot_versionstamp);
-            if (check_snapshot_file_exist(txn_kv_.get(), instance_id, snapshpt_versionstamp_str) !=
-                0) {
-                LOG_WARNING("failed to check rowset objects because snapshot file not exist")
+            if (check_snapshot_key_exist(txn_kv, instance_id, snapshot_versionstamp_str) != 0) {
+                LOG_WARNING("failed to check rowset objects because snapshot key not exist")
                         .tag("instance_id", instance_id)
-                        .tag("snapshot_versionstamp", snapshpt_versionstamp_str);
+                        .tag("snapshot_versionstamp", snapshot_versionstamp_str);
                 continue;
             }
             std::vector<int64_t> tablet_ids;
+            std::vector<doris::RowsetMetaCloudPB> rowset_metas;
 
-            MetaReader snapshot_reader(instance_id, txn_kv_.get(), snapshot_versionstamp);
+            MetaReader snapshot_reader(instance_id, txn_kv, snapshot_versionstamp);
 
             // get all rowsets with this snapshot
             TxnErrorCode err = snapshot_reader.get_all_tablet_ids(&tablet_ids, false);
@@ -505,7 +591,7 @@ int SnapshotManager::check_mvcc_meta_key(InstanceChecker* checker) {
                             {instance_id, rowset_meta.tablet_id(), rowset_meta.rowset_id_v2()});
                     rowset_ref_count_map[rowset_ref_count_key] += 1;
                 }
-                int ret = check_rowsets_object(txn_kv_.get(), checker, instance_id, rowset_metas);
+                int ret = check_rowsets_object(txn_kv, checker, instance_id, rowset_metas);
                 if (ret > 0) {
                     num_rowsets_loss++;
                     check_ret = 1;
@@ -520,7 +606,7 @@ int SnapshotManager::check_mvcc_meta_key(InstanceChecker* checker) {
         LOG_WARNING("failed to check rowset objects");
     }
 
-    check_ret = check_rowset_ref_count_map(rowset_ref_count_map, txn_kv_.get(), instance_id);
+    check_ret = check_rowset_ref_count_map(rowset_ref_count_map, txn_kv, instance_id);
 
     if (check_ret != 0) {
         LOG_WARNING("failed to check rowset ref count keys");
@@ -529,9 +615,117 @@ int SnapshotManager::check_mvcc_meta_key(InstanceChecker* checker) {
     return num_rowsets_loss > 0 ? 1 : check_ret;
 }
 
+int inverted_check_mvcc_meta_rowset_key(InstanceChecker* checker, TxnKv* txn_kv) {
+    int check_ret = 0;
+    std::string instance_id(checker->instance_id().data(), checker->instance_id().size());
+    AnnotateTag tag("instance_id", instance_id);
+    LOG_INFO("begin to inverted check mvcc meta keys");
+    std::vector<StorageVaultAccessor*> accessors;
+    checker->get_all_accessor(&accessors);
+
+    std::vector<int64_t> tablet_ids;
+
+    std::vector<std::pair<SnapshotPB, Versionstamp>> snapshots;
+    MetaReader reader(instance_id, txn_kv);
+    TxnErrorCode err = reader.get_snapshots(&snapshots);
+    if (err != TxnErrorCode::TXN_OK) {
+        LOG_WARNING("failed to get snapshots").tag("error_code", err);
+        return -1;
+    }
+
+    err = reader.get_all_tablet_ids(&tablet_ids, false);
+
+    if (err != TxnErrorCode::TXN_OK) {
+        LOG_WARNING("failed to get all tablet ids by versioned tablet index key")
+                .tag("instance_id", instance_id)
+                .tag("error_code", err);
+        return -1;
+    }
+
+    for (auto& accessor : accessors) {
+        for (const auto& tablet_id : tablet_ids) {
+            doris::TabletMetaCloudPB tablet_meta;
+            Versionstamp tablet_versionstamp;
+            MetaReader snapshot_reader(instance_id, txn_kv);
+
+            // first: check tablet meta key exist
+            err = snapshot_reader.get_tablet_meta(tablet_id, &tablet_meta, &tablet_versionstamp);
+            if (err != TxnErrorCode::TXN_OK) {
+                if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
+                    // meta tablet key not exist, but meta tablet index key exist
+                    LOG_WARNING("tablet key not found, meta_tablet_key loss")
+                            .tag("instance_id", instance_id)
+                            .tag("tablet_id", tablet_id);
+                    check_ret = 1;
+                } else {
+                    LOG_WARNING("failed to get tablet meta")
+                            .tag("instance_id", instance_id)
+                            .tag("tablet_id", tablet_id);
+                    return -1;
+                }
+                continue;
+            }
+
+            // second: check rowset keys exist
+            std::unique_ptr<ListIterator> list_iter;
+            std::string tablet_path = "data/" + std::to_string(tablet_meta.tablet_id()) + "/";
+            int ret = accessor->list_directory(tablet_path, &list_iter);
+            if (ret != 0) {
+                LOG_WARNING("failed to list data directory")
+                        .tag("instance_id", instance_id)
+                        .tag("tablet_path", tablet_path)
+                        .tag("error_code", ret)
+                        .tag("uri", accessor->uri());
+                return -1;
+            }
+
+            TabletRowsetsCache tablet_rowsets_cache;
+
+            for (auto file = list_iter->next(); file.has_value(); file = list_iter->next()) {
+                if (check_rowset_key_exist(txn_kv, instance_id, file->path, tablet_rowsets_cache) !=
+                    0) {
+                    LOG_WARNING("failed to check rowset key because rowset key not exist")
+                            .tag("instance_id", instance_id)
+                            .tag("rowset_key", file->path);
+                    check_ret = 1;
+                }
+            }
+
+            if (!list_iter->is_valid()) {
+                LOG(WARNING) << "failed to list data directory. uri=" << accessor->uri();
+                return -1;
+            }
+        }
+    }
+    return check_ret;
+}
+
+int SnapshotManager::check_mvcc_meta_key(InstanceChecker* checker) {
+    int ret = 0;
+
+    int check_res = check_mvcc_meta_rowset_key(checker, txn_kv_.get());
+    if (check_res == 1) {
+        LOG(INFO) << "failed to check mvcc meta rowset key";
+        ret = 1;
+    } else if (check_res == -1) {
+        LOG(INFO) << "error occurred when check mvcc meta rowset key";
+        ret = -1;
+    }
+    return ret;
+}
+
 int SnapshotManager::inverted_check_mvcc_meta_key(InstanceChecker* checker) {
-    // TODO:wyxxxcat
-    return 0;
+    int ret = 0;
+
+    int check_res = inverted_check_mvcc_meta_rowset_key(checker, txn_kv_.get());
+    if (check_res == 1) {
+        LOG(INFO) << "failed to inverted check mvcc meta rowset key";
+        ret = 1;
+    } else if (check_res == -1) {
+        LOG(INFO) << "error occurred when inverted check mvcc meta rowset key";
+        ret = -1;
+    }
+    return ret;
 }
 
 } // namespace selectdb
