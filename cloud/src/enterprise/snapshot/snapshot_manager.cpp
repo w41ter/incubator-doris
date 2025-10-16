@@ -746,10 +746,20 @@ void SnapshotManager::drop_snapshot(std::string_view instance_id,
         return;
     }
 
-    // Delete the snapshot
-    txn->remove(snapshot_key);
+    // Mark snapshot as RECYCLED instead of directly deleting it
+    // This allows the recycler to clean up the object storage data
+    snapshot_pb.set_status(SnapshotStatus::SNAPSHOT_RECYCLED);
 
-    LOG_INFO("drop snapshot completed")
+    std::string updated_snapshot_val;
+    if (!snapshot_pb.SerializeToString(&updated_snapshot_val)) {
+        status->set_msg("failed to serialize updated SnapshotPB");
+        status->set_code(MetaServiceCode::PROTOBUF_SERIALIZE_ERR);
+        return;
+    }
+
+    txn->put(snapshot_key, updated_snapshot_val);
+
+    LOG_INFO("drop snapshot completed, marked as RECYCLED")
             .tag("snapshot_key", hex(snapshot_full_key))
             .tag("instance_id", instance_id)
             .tag("snapshot_id", snapshot_id);
