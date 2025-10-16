@@ -120,6 +120,10 @@ Status DataTypeArraySerDe::deserialize_one_cell_from_json(IColumn& column, Slice
                 quote_char = c;
                 has_quote = !has_quote;
             } else if (has_quote && quote_char == c) {
+                // skip the quote character if it is escaped
+                if (idx > 0 && slice[idx - 1] == options.escape_char) {
+                    continue;
+                }
                 quote_char = 0;
                 has_quote = !has_quote;
             }
