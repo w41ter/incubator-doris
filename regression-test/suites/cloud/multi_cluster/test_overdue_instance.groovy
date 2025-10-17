@@ -119,7 +119,7 @@ suite('test_overdue') {
     try {
         try {
             def alter_request = JsonOutput.toJson(new AlterRequest(instance_id: instance_id, op: "SET_NORMAL"))
-            def result = http_post(context.config.metaServiceHttpAddress, "/MetaService/http/set_instance_status?token=greedisgood9999", alter_request)
+            result = http_post(context.config.metaServiceHttpAddress, "/MetaService/http/set_instance_status?token=greedisgood9999", alter_request)
             def obj = new JsonSlurper().parseText(result)
             logger.info("try to set warehouse normal, the result is {}", obj)
             sleep(40000)
@@ -129,7 +129,7 @@ suite('test_overdue') {
         }
 
         // when warehouse is noraml
-        def result = sql """ show databases """
+        result = sql """ show databases """
         logger.info("when warehouse is normal the result of sql from root is {}", result)
 
         result = connect(user = "${user}", password = '', url = context.config.jdbcUrl) {
