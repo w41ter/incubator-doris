@@ -1741,11 +1741,16 @@ MetaServiceCode SnapshotManager::handle_rollback_clone(
     // Update rollback instance in transaction
     txn->put(target_instance_key_str, updated_target_instance_val);
 
-    // Return storage info after rollback
-    if (target_instance_info.obj_info_size() > 0) {
-        *response->mutable_obj_info() = target_instance_info.obj_info(0);
+    // Set snapshot info in response
+    std::string helper_error;
+    MetaServiceCode helper_code = set_snapshot_info_in_response(
+            response, snapshot_pb, from_instance_info, txn, &helper_error);
+    if (helper_code != MetaServiceCode::OK) {
+        if (error_msg != nullptr) {
+            *error_msg = fmt::format("failed to set snapshot info: {}", helper_error);
+        }
+        return helper_code;
     }
-    response->set_image_url(snapshot_pb.image_url());
 
     LOG_INFO("ROLLBACK clone prepared successfully")
             .tag("target_instance_id", new_instance_id)
