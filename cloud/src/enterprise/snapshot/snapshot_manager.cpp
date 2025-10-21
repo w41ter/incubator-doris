@@ -738,6 +738,13 @@ void SnapshotManager::drop_snapshot(std::string_view instance_id,
         return;
     }
 
+    if (snapshot_pb.status() == SnapshotStatus::SNAPSHOT_RECYCLED) {
+        // Already dropped, return success to handle RPC retry
+        status->set_code(MetaServiceCode::TXN_ID_NOT_FOUND);
+        status->set_msg("snapshot not found, snapshot_id=" + snapshot_id);
+        return;
+    }
+
     // Check if snapshot can be dropped (should be in final state)
     if (snapshot_pb.status() != SnapshotStatus::SNAPSHOT_NORMAL &&
         snapshot_pb.status() != SnapshotStatus::SNAPSHOT_ABORTED) {
@@ -828,7 +835,10 @@ void SnapshotManager::list_snapshot(std::string_view instance_id,
             status->set_code(MetaServiceCode::PROTOBUF_PARSE_ERR);
             status->set_msg("failed to parse SnapshotPB");
             return;
+        } else if (snapshot_pb.status() == SnapshotStatus::SNAPSHOT_RECYCLED) {
+            return; // Skip recycled snapshot
         }
+
         LOG_INFO("get snapshot versioned key")
                 .tag("snapshot_key", hex(snapshot_full_key))
                 .tag("instance_id", instance_id);
@@ -920,16 +930,18 @@ void SnapshotManager::list_snapshot(std::string_view instance_id,
                 continue;
             }
 
-            LOG_INFO("get snapshot versioned key")
-                    .tag("snapshot_key", hex(snapshot_full_key))
-                    .tag("instance_id", version_stamp.to_string());
-
             SnapshotPB snapshot_pb;
             if (!snapshot_pb.ParseFromString(std::string(snapshot_val))) {
                 LOG(WARNING) << "failed to parse SnapshotPB for snapshot_id="
                              << version_stamp.to_string();
                 continue;
+            } else if (snapshot_pb.status() == SnapshotStatus::SNAPSHOT_RECYCLED) {
+                continue; // Skip recycled snapshot
             }
+
+            LOG_INFO("get snapshot versioned key")
+                    .tag("snapshot_key", hex(snapshot_full_key))
+                    .tag("instance_id", version_stamp.to_string());
 
             if (!include_aborted && snapshot_pb.status() == SnapshotStatus::SNAPSHOT_ABORTED) {
                 continue;
