@@ -1888,9 +1888,10 @@ void SnapshotManager::clone_instance(const CloneInstanceRequest& request,
     }
 
     // 8. Notify instance refresh
-    notify_refresh_instance(txn_kv_, request.new_instance_id(), nullptr);
+    notify_refresh_instance(txn_kv_, request.new_instance_id(), nullptr, /*include_self=*/true);
     if (request.clone_type() == CloneInstanceRequest::ROLLBACK) {
-        notify_refresh_instance(txn_kv_, request.from_instance_id(), nullptr);
+        notify_refresh_instance(txn_kv_, request.from_instance_id(), nullptr,
+                                /*include_self=*/true);
     }
 
     // Log operation completion
@@ -1947,8 +1948,8 @@ std::pair<MetaServiceCode, std::string> SnapshotManager::set_multi_version_statu
         return {cast_as<ErrCategory::COMMIT>(err), "failed to commit txn"};
     }
 
-    // Asynchronously notify ResourceManager to refresh instance cache
-    notify_refresh_instance(txn_kv_, std::string(instance_id), nullptr);
+    // Notify ResourceManager to refresh instance cache
+    notify_refresh_instance(txn_kv_, std::string(instance_id), nullptr, /*include_self=*/true);
 
     LOG_INFO("set_multi_version_status completed")
             .tag("instance_id", instance_id)
