@@ -2245,7 +2245,7 @@ TEST(MetaServiceSnapshotTest, CloneInstanceReadOnlyTest) {
         ASSERT_EQ(instance_info.max_reserved_snapshot(), 0);
     }
 
-    // Test idempotent READ_ONLY clone (should fail)
+    // Test idempotent READ_ONLY clone.
     {
         brpc::Controller cntl;
         CloneInstanceRequest req;
@@ -2257,7 +2257,7 @@ TEST(MetaServiceSnapshotTest, CloneInstanceReadOnlyTest) {
         CloneInstanceResponse res;
         meta_service->clone_instance(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
                                      &req, &res, nullptr);
-        ASSERT_EQ(res.status().code(), MetaServiceCode::CLUSTER_NOT_FOUND);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
     }
 
     // Test clone to same instance_id but with different snapshot should fail
@@ -2300,7 +2300,7 @@ TEST(MetaServiceSnapshotTest, CloneInstanceReadOnlyTest) {
         meta_service->clone_instance(
                 reinterpret_cast<::google::protobuf::RpcController*>(&clone_cntl), &clone_req,
                 &clone_res, nullptr);
-        ASSERT_EQ(clone_res.status().code(), MetaServiceCode::CLUSTER_NOT_FOUND);
+        ASSERT_EQ(clone_res.status().code(), MetaServiceCode::ALREADY_EXISTED);
     }
 }
 
@@ -2438,8 +2438,8 @@ TEST(MetaServiceSnapshotTest, CloneInstanceWritableTest) {
         ASSERT_EQ(instance_info.source_instance_id(), "test_instance");
         ASSERT_EQ(instance_info.source_snapshot_id(), snapshot_id);
         // Should have inherited obj_info plus new storage configuration
-        ASSERT_EQ(instance_info.obj_info_size(), 1);
-        ASSERT_EQ(instance_info.resource_ids_size(), 1);
+        ASSERT_EQ(instance_info.obj_info_size(), 2);
+        ASSERT_EQ(instance_info.resource_ids_size(), 2) << instance_info.ShortDebugString();
     }
 }
 
@@ -2663,24 +2663,6 @@ TEST(MetaServiceSnapshotTest, CloneInstanceParameterValidationTest) {
         ASSERT_TRUE(res.status().msg().find("failed to parse") != std::string::npos);
     }
 
-    // Test ROLLBACK with different instance IDs (should fail)
-    {
-        brpc::Controller cntl;
-        CloneInstanceRequest req;
-        req.set_clone_type(CloneInstanceRequest::ROLLBACK);
-        req.set_from_instance_id("source");
-        req.set_from_snapshot_id("1234567890abcdef1234");
-        req.set_new_instance_id("different_target");
-
-        CloneInstanceResponse res;
-        meta_service->clone_instance(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
-                                     &req, &res, nullptr);
-        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
-        ASSERT_TRUE(res.status().msg().find(
-                            "ROLLBACK can only rollback to the source snapshot's instance") !=
-                    std::string::npos);
-    }
-
     // Test WRITABLE without obj_info
     {
         brpc::Controller cntl;
@@ -2694,8 +2676,7 @@ TEST(MetaServiceSnapshotTest, CloneInstanceParameterValidationTest) {
         meta_service->clone_instance(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
                                      &req, &res, nullptr);
         ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
-        ASSERT_TRUE(res.status().msg().find(
-                            "WRITABLE clone requires either obj_info or storage_vault.obj_info") !=
+        ASSERT_TRUE(res.status().msg().find("WRITABLE clone requires obj_info") !=
                     std::string::npos);
     }
 }

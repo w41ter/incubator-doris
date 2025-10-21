@@ -1335,31 +1335,38 @@ MetaServiceCode SnapshotManager::setup_writable_storage(Transaction* txn,
 
     if (!from_instance_info.enable_storage_vault()) {
         new_instance->set_enable_storage_vault(false);
-        new_instance->clear_resource_ids();
         new_instance->clear_storage_vault_names();
         new_instance->clear_default_storage_vault_id();
 
+        new_instance->mutable_resource_ids()->CopyFrom(from_instance_info.resource_ids());
+        new_instance->clear_obj_info();
+
         auto* target_obj_infos = new_instance->mutable_obj_info();
-        target_obj_infos->Clear();
         for (const auto& source_obj_info : from_instance_info.obj_info()) {
             *target_obj_infos->Add() = source_obj_info;
+            if (std::find(from_instance_info.resource_ids().begin(),
+                          from_instance_info.resource_ids().end(),
+                          source_obj_info.id()) == from_instance_info.resource_ids().end()) {
+                // To keep compatible, supplement resource_ids if missing
+                new_instance->add_resource_ids(source_obj_info.id());
+            }
         }
 
-        if (request.has_obj_info()) {
-            ObjectStoreInfoPB new_obj_info = request.obj_info();
-            std::string new_obj_id = next_available_resource_id(*new_instance);
-            new_obj_info.set_id(new_obj_id);
-            auto now_time = std::chrono::system_clock::now();
-            uint64_t now_seconds =
-                    std::chrono::duration_cast<std::chrono::seconds>(now_time.time_since_epoch())
-                            .count();
-            new_obj_info.set_ctime(now_seconds);
-            new_obj_info.set_mtime(now_seconds);
-            *target_obj_infos->Add() = new_obj_info;
-        }
+        ObjectStoreInfoPB new_obj_info = request.obj_info();
+        std::string new_obj_id = next_available_resource_id(*new_instance);
+        new_obj_info.set_id(new_obj_id);
+        auto now_time = std::chrono::system_clock::now();
+        uint64_t now_seconds =
+                std::chrono::duration_cast<std::chrono::seconds>(now_time.time_since_epoch())
+                        .count();
+        new_obj_info.set_ctime(now_seconds);
+        new_obj_info.set_mtime(now_seconds);
+        *target_obj_infos->Add() = new_obj_info;
+        new_instance->add_resource_ids(new_obj_id);
 
         LOG_INFO("WRITABLE clone legacy storage configuration completed")
                 .tag("new_instance_id", new_instance_id)
+                .tag("new_resource_id", new_obj_id)
                 .tag("obj_info_count", new_instance->obj_info_size());
 
         return MetaServiceCode::OK;
@@ -1385,26 +1392,19 @@ MetaServiceCode SnapshotManager::setup_writable_storage(Transaction* txn,
             return MetaServiceCode::PROTOBUF_PARSE_ERR;
         }
 
-        // Generate new resource_id for new_instance (cannot reuse source's resource_id)
-        std::string new_resource_id = next_available_resource_id(*new_instance);
-
-        // Update vault id in the copied vault
-        source_vault.set_id(new_resource_id);
-
-        // Save to new instance with new resource_id
-        std::string new_vault_key_str;
-        storage_vault_key({new_instance_id, new_resource_id}, &new_vault_key_str);
+        // Should reuse the source's resource_id.
+        // Save to new instance storage vault with source resource_id
+        std::string new_vault_key_str = storage_vault_key({new_instance_id, source_resource_id});
         std::string new_vault_val = source_vault.SerializeAsString();
         txn->put(new_vault_key_str, new_vault_val);
 
         // Add to new_instance configuration
-        new_instance->add_resource_ids(new_resource_id);
+        new_instance->add_resource_ids(source_resource_id);
         new_instance->add_storage_vault_names(source_vault.name());
 
         LOG_INFO("Copied source storage vault with new resource_id")
                 .tag("new_instance_id", new_instance_id)
                 .tag("source_resource_id", source_resource_id)
-                .tag("new_resource_id", new_resource_id)
                 .tag("vault_name", source_vault.name());
     }
 
