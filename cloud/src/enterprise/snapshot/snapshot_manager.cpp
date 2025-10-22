@@ -1957,4 +1957,5 @@ std::pair<MetaServiceCode, std::string> SnapshotManager::set_multi_version_statu
 
     return {MetaServiceCode::OK, "success"};
 }
+
 } // namespace selectdb

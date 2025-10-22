@@ -61,6 +61,8 @@ public:
                                        doris::cloud::Versionstamp snapshot_version,
                                        const doris::cloud::SnapshotPB& snapshot_pb) override;
 
+    int migrate_to_versioned_keys(doris::cloud::InstanceDataMigrator* migrator) override;
+
 private:
     // Validation functions
     doris::cloud::MetaServiceCode validate_clone_request(

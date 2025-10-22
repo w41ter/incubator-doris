@@ -29,6 +29,10 @@
 #include "recycler/s3_accessor.h"
 #include "recycler/util.h"
 
+#ifdef FEATURE_ENTERPRISE_SNAPSHOT
+#include "enterprise/snapshot/snapshot_manager.h"
+#endif
+
 namespace doris::cloud {
 
 SnapshotDataMigrator::SnapshotDataMigrator(std::shared_ptr<TxnKv> txn_kv)
@@ -309,7 +313,11 @@ int InstanceDataMigrator::do_migrate() {
                 .tag("cost(sec)", stop_watch.elapsed_seconds());
     };
 
+#ifdef FEATURE_ENTERPRISE_SNAPSHOT
+    selectdb::SnapshotManager snapshot_mgr(txn_kv_);
+#else
     SnapshotManager snapshot_mgr(txn_kv_);
+#endif
     int res = snapshot_mgr.migrate_to_versioned_keys(this);
     if (res != 0) {
         LOG_WARNING("failed to migrate snapshot keys").tag("instance_id", instance_id_);
