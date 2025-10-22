@@ -19,6 +19,7 @@
 
 #include "meta-store/versionstamp.h"
 #include "recycler/checker.h"
+#include "recycler/meta_checker.h"
 #include "recycler/recycler.h"
 
 namespace doris::cloud {
