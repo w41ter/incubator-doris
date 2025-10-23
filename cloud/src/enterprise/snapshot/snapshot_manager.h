@@ -45,6 +45,7 @@ public:
     // Return 0 for success otherwise error.
     int recycle_snapshots(doris::cloud::InstanceRecycler* recycler) override;
 
+#ifdef BUILD_CHECK_META
     int check_snapshots(doris::cloud::InstanceChecker* checker) override;
 
     int inverted_check_snapshots(doris::cloud::InstanceChecker* checker) override;
@@ -54,6 +55,7 @@ public:
     int inverted_check_mvcc_meta_key(doris::cloud::InstanceChecker* checker) override;
 
     int check_meta(doris::cloud::MetaChecker* meta_checker) override;
+#endif
 
     // Recycle snapshot meta and data, return 0 for success otherwise error.
     int recycle_snapshot_meta_and_data(std::string_view instance_id, std::string_view resource_id,
