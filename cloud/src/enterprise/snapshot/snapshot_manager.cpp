@@ -992,23 +992,31 @@ void SnapshotManager::list_snapshot(std::string_view instance_id,
     // Enhance snapshot info with derivation relationship information
     MetaReader reader(instance_id, txn_kv_.get());
     for (auto& [snapshot_id, snapshot_info] : snapshots_map) {
-        // Find count of derived instances using this snapshot
+        // Find derived instance IDs using this snapshot
         Versionstamp snapshot_versionstamp;
-        int derived_count = 0;
         if (parse_snapshot_versionstamp(snapshot_id, &snapshot_versionstamp)) {
-            derived_count = reader.count_snapshot_references(txn.get(), snapshot_versionstamp);
-        }
-        // TODO: Add these fields to SnapshotInfoPB proto definition
-        // if (derived_count > 0) {
-        //     snapshot_info.set_has_derived_instances(true);
-        //     snapshot_info.set_derived_instance_count(derived_count);
-        // }
+            std::vector<std::string> derived_instance_ids;
+            TxnErrorCode err = reader.find_derived_instance_ids(txn.get(), snapshot_versionstamp,
+                                                                &derived_instance_ids);
+            if (err != TxnErrorCode::TXN_OK) {
+                status->set_code(MetaServiceCode::KV_TXN_GET_ERR);
+                status->set_msg(
+                        fmt::format("failed to find derived instance ids for snapshot {}, err={}",
+                                    snapshot_id, err));
+                LOG_WARNING(status->msg()).tag("instance_id", instance_id);
+                return;
+            }
 
-        // Log derived instance information for now
-        if (derived_count > 0) {
-            LOG_INFO("snapshot has derived instances")
-                    .tag("snapshot_id", snapshot_id)
-                    .tag("derived_count", derived_count);
+            if (!derived_instance_ids.empty()) {
+                // Add derived instance IDs to the snapshot info
+                for (const auto& instance_id : derived_instance_ids) {
+                    snapshot_info.add_derived_instance_ids(instance_id);
+                }
+
+                LOG_INFO("snapshot has derived instances")
+                        .tag("snapshot_id", snapshot_id)
+                        .tag("derived_count", derived_instance_ids.size());
+            }
         }
 
         *response->add_snapshots() = std::move(snapshot_info);

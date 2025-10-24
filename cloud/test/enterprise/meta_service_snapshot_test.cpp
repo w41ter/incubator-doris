@@ -2752,4 +2752,82 @@ TEST(MetaServiceSnapshotTest, CloneInstanceExistingTargetTest) {
     }
 }
 
+TEST(MetaServiceSnapshotTest, GetInstanceWithPredecessorSuccessorTest) {
+    auto meta_service = get_meta_service(true);
+
+    // Setup SyncPoint for encryption
+    auto* sp = SyncPoint::get_instance();
+    sp->enable_processing();
+    sp->set_call_back("encrypt_ak_sk:get_encryption_key", [](auto&& args) {
+        auto* ret = try_any_cast<int*>(args[0]);
+        *ret = 0;
+        auto* key = try_any_cast<std::string*>(args[1]);
+        *key = "selectdbselectdbselectdbselectdb";
+        auto* key_id = try_any_cast<int64_t*>(args[2]);
+        *key_id = 1;
+    });
+    sp->set_call_back("decrypt_ak_sk:get_encryption_key", [](auto&& args) {
+        auto* key = try_any_cast<std::string*>(args[0]);
+        *key = "selectdbselectdbselectdbselectdb";
+        auto* ret = try_any_cast<int*>(args[1]);
+        *ret = 0;
+    });
+
+    DORIS_CLOUD_DEFER {
+        sp->disable_processing();
+        sp->clear_all_call_backs();
+    };
+
+    // Create test instance with predecessor and successor
+    {
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(meta_service->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+
+        // Create instance with predecessor and successor
+        InstanceInfoPB instance;
+        instance.set_instance_id("test_instance");
+        instance.set_name("test_instance");
+        instance.set_user_id("test_user");
+        instance.set_source_instance_id("parent_instance");     // predecessor
+        instance.set_succeed_instance_id("successor_instance"); // successor
+
+        // Add basic obj_info
+        auto* obj = instance.add_obj_info();
+        obj->set_ak("test_ak");
+        obj->set_sk("test_sk");
+        obj->set_bucket("test_bucket");
+        obj->set_endpoint("test_endpoint");
+        obj->set_provider(ObjectStoreInfoPB::OSS);
+
+        std::string key = instance_key("test_instance");
+        std::string value = instance.SerializeAsString();
+        txn->put(key, value);
+        ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+    }
+
+    // Test get_instance returns predecessor and successor IDs
+    {
+        std::string instance_id = "test_instance";
+        std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+        brpc::Controller cntl;
+        GetInstanceRequest req;
+        GetInstanceResponse res;
+        req.set_cloud_unique_id(cloud_unique_id);
+
+        meta_service->get_instance(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                   &req, &res, nullptr);
+
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+        ASSERT_TRUE(res.has_instance());
+        EXPECT_EQ(res.instance().instance_id(), "test_instance");
+
+        // Verify predecessor and successor are returned in instance
+        ASSERT_TRUE(res.instance().has_source_instance_id());
+        EXPECT_EQ(res.instance().source_instance_id(), "parent_instance");
+
+        ASSERT_TRUE(res.instance().has_succeed_instance_id());
+        EXPECT_EQ(res.instance().succeed_instance_id(), "successor_instance");
+    }
+}
+
 } // namespace doris::cloud
