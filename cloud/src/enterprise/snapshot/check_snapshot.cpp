@@ -1,5 +1,5 @@
 #include "check_helper.h"
-
+#include "meta_check_snapshot.h"
 using namespace doris::cloud;
 using namespace std::chrono;
 
@@ -161,15 +161,15 @@ int SnapshotManager::inverted_check_mvcc_meta_key(InstanceChecker* checker) {
 
 int SnapshotManager::check_meta(MetaChecker* meta_checker) {
     bool check_res = true;
+#ifdef BUILD_CHECK_META
     std::string instance_id = meta_checker->instance_id();
-
     if (do_check_meta(instance_id, meta_checker, txn_kv_.get()) != 0) {
         LOG(WARNING) << "do_check_meta failed";
         check_res = false;
     } else {
         LOG(INFO) << "do_check_meta success";
     }
-
+#endif
     return check_res ? 0 : -1;
 }
 } // namespace selectdb

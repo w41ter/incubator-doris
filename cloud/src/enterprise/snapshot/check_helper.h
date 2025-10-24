@@ -39,6 +39,17 @@ struct TabletRowsetsCache {
     std::unordered_set<std::string> rowset_ids;
 };
 
+struct RowsetIndexesFormatV1 {
+    std::string rowset_id;
+    std::unordered_set<int64_t> segment_ids;
+    std::unordered_set<std::string> index_ids;
+};
+
+struct RowsetIndexesFormatV2 {
+    std::string rowset_id;
+    std::unordered_set<int64_t> segment_ids;
+};
+
 bool is_snapshot_normal(const SnapshotPB& snapshot_pb) {
     switch (snapshot_pb.status()) {
     case SnapshotStatus::SNAPSHOT_PREPARE:
@@ -77,13 +88,6 @@ int check_rowsets_object(TxnKv* txn_kv, InstanceChecker* checker, const std::str
     };
 
     int check_ret = 0;
-    std::unique_ptr<Transaction> txn;
-    TxnErrorCode err = txn_kv->create_txn(&txn);
-    if (err != TxnErrorCode::TXN_OK) {
-        LOG_WARNING("failed to create txn for recycle snapshot").tag("error_code", err);
-        return -1;
-    }
-
     MetaReader reader(instance_id, txn_kv);
 
     for (auto& rs_meta : rowset_metas) {
@@ -312,6 +316,239 @@ int check_rowset_ref_count_map(const std::unordered_map<std::string, int64_t>& r
     return (is_loss > 0 || is_diff > 0) ? 1 : 0;
 }
 
+int check_inverted_index_file_storage_format_v1(TxnKv* txn_kv, const std::string& instance_id,
+                                                int64_t tablet_id, const std::string& file_path,
+                                                const std::string& rowset_info,
+                                                RowsetIndexesFormatV1& rowset_index_cache_v1) {
+    // format v1: data/{tablet_id}/{rowset_id}_{seg_num}_{idx_id}{idx_suffix}.idx
+    std::string rowset_id;
+    int64_t segment_id;
+    std::string index_id_with_suffix_name;
+    // {rowset_id}_{seg_num}_{idx_id}{idx_suffix}.idx
+    std::vector<std::string> str;
+    butil::SplitString(rowset_info.substr(0, rowset_info.size() - 4), '_', &str);
+    if (str.size() < 3) {
+        LOG(WARNING) << "Split rowset info with '_' error, str size < 3, rowset_info = "
+                     << rowset_info;
+        return -1;
+    }
+    rowset_id = str[0];
+    segment_id = std::atoll(str[1].c_str());
+    index_id_with_suffix_name = str[2];
+
+    if (rowset_index_cache_v1.rowset_id == rowset_id) {
+        if (rowset_index_cache_v1.segment_ids.contains(segment_id)) {
+            if (auto it = rowset_index_cache_v1.index_ids.find(index_id_with_suffix_name);
+                it == rowset_index_cache_v1.index_ids.end()) {
+                // clang-format off
+                LOG(WARNING) << fmt::format("index_id with suffix name not found, rowset_info = {}, obj_key = {}", rowset_info, file_path);
+                // clang-format on
+                return -1;
+            }
+        } else {
+            // clang-format off
+            LOG(WARNING) << fmt::format("segment id not found, rowset_info = {}, obj_key = {}", rowset_info, file_path);
+            // clang-format on
+            return -1;
+        }
+    }
+
+    rowset_index_cache_v1.rowset_id = rowset_id;
+    rowset_index_cache_v1.segment_ids.clear();
+    rowset_index_cache_v1.index_ids.clear();
+
+    std::vector<doris::RowsetMetaCloudPB> rowset_metas;
+    MetaReader reader(instance_id, txn_kv);
+    TxnErrorCode err = reader.get_rowset_metas(tablet_id, 0, INT64_MAX - 1, &rowset_metas, false);
+    if (err != TxnErrorCode::TXN_OK) {
+        LOG(WARNING) << "failed to get rowset metas by tablet id"
+                     << ", error_code=" << err;
+        return -1;
+    }
+    for (const auto& rs_meta : rowset_metas) {
+        TabletIndexPB tablet_index;
+        err = reader.get_tablet_index(rs_meta.tablet_id(), &tablet_index, false);
+        if (err != TxnErrorCode::TXN_OK) {
+            if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
+                LOG(WARNING) << "tablet index not found, tablet_id= " << rs_meta.tablet_id();
+            } else {
+                LOG(WARNING) << "failed to get tablet index, tablet_id= " << rs_meta.tablet_id();
+                return -1;
+            }
+            continue;
+        }
+        doris::TabletSchemaCloudPB tablet_schema;
+        err = reader.get_tablet_schema(tablet_index.index_id(), rs_meta.schema_version(),
+                                       &tablet_schema, false);
+        if (err != TxnErrorCode::TXN_OK) {
+            LOG(WARNING) << "failed to get tablet schema, index_id=" << tablet_index.index_id()
+                         << ", schema_version=" << rs_meta.schema_version();
+            continue;
+        }
+
+        for (size_t i = 0; i < rs_meta.num_segments(); i++) {
+            rowset_index_cache_v1.segment_ids.insert(i);
+        }
+
+        for (const auto& i : tablet_schema.index()) {
+            if (i.has_index_type() && i.index_type() == doris::IndexType::INVERTED) {
+                LOG(INFO) << fmt::format("record index info, index_id: {}, index_suffix_name: {}",
+                                         i.index_id(), i.index_suffix_name());
+                rowset_index_cache_v1.index_ids.insert(
+                        fmt::format("{}{}", i.index_id(), i.index_suffix_name()));
+            }
+        }
+    }
+
+    if (!rowset_index_cache_v1.segment_ids.contains(segment_id)) {
+        // Garbage data leak
+        // clang-format off
+        LOG(WARNING) << "rowset_index_cache_v1.segment_ids don't contains segment_id, rowset should be recycled,"
+                     << " key = " << file_path
+                     << " segment_id = " << segment_id;
+        // clang-format on
+        return 1;
+    }
+
+    if (!rowset_index_cache_v1.index_ids.contains(index_id_with_suffix_name)) {
+        // Garbage data leak
+        // clang-format off
+        LOG(WARNING) << "rowset_index_cache_v1.index_ids don't contains index_id_with_suffix_name,"
+                     << " rowset with inde meta should be recycled, key=" << file_path
+                     << " index_id_with_suffix_name=" << index_id_with_suffix_name;
+        // clang-format on
+        return 1;
+    }
+
+    return 0;
+}
+
+int check_inverted_index_file_storage_format_v2(TxnKv* txn_kv, const std::string& instance_id,
+                                                int64_t tablet_id, const std::string& file_path,
+                                                const std::string& rowset_info,
+                                                RowsetIndexesFormatV2& rowset_index_cache_v2) {
+    std::string rowset_id;
+    int64_t segment_id;
+    // {rowset_id}_{seg_num}.idx
+    std::vector<std::string> str;
+    butil::SplitString(rowset_info.substr(0, rowset_info.size() - 4), '_', &str);
+    if (str.size() < 2) {
+        // clang-format off
+        LOG(WARNING) << "Split rowset info with '_' error, str size < 2, rowset_info = " << rowset_info;
+        // clang-format on
+        return -1;
+    }
+    rowset_id = str[0];
+    segment_id = std::atoll(str[1].c_str());
+
+    if (rowset_index_cache_v2.rowset_id == rowset_id) {
+        if (!rowset_index_cache_v2.segment_ids.contains(segment_id)) {
+            // clang-format off
+            LOG(WARNING) << fmt::format("index file not found, rowset_info = {}, obj_key = {}", rowset_info, file_path);
+            // clang-format on
+            return -1;
+        }
+    }
+
+    rowset_index_cache_v2.rowset_id = rowset_id;
+    rowset_index_cache_v2.segment_ids.clear();
+
+    std::unique_ptr<Transaction> txn;
+    TxnErrorCode err = txn_kv->create_txn(&txn);
+    if (err != TxnErrorCode::TXN_OK) {
+        LOG(WARNING) << "failed to create txn";
+        return -1;
+    }
+    std::unique_ptr<RangeGetIterator> it;
+    auto begin = meta_rowset_key({instance_id, tablet_id, 0});
+    auto end = meta_rowset_key({instance_id, tablet_id, INT64_MAX});
+    do {
+        TxnErrorCode err = txn->get(begin, end, &it);
+        if (err != TxnErrorCode::TXN_OK) {
+            LOG(WARNING) << "failed to get rowset kv, err=" << err;
+            return -1;
+        }
+        if (!it->has_next()) {
+            break;
+        }
+        while (it->has_next()) {
+            // recycle corresponding resources
+            auto [k, v] = it->next();
+            doris::RowsetMetaCloudPB rs_meta;
+            if (!rs_meta.ParseFromArray(v.data(), v.size())) {
+                LOG(WARNING) << "malformed rowset meta value, key=" << hex(k);
+                return -1;
+            }
+
+            for (size_t i = 0; i < rs_meta.num_segments(); i++) {
+                rowset_index_cache_v2.segment_ids.insert(i);
+            }
+
+            if (!it->has_next()) {
+                begin = k;
+                begin.push_back('\x00'); // Update to next smallest key for iteration
+                break;
+            }
+        }
+    } while (it->more());
+
+    if (!rowset_index_cache_v2.segment_ids.contains(segment_id)) {
+        // Garbage data leak
+        LOG(WARNING) << "rowset with index meta should be recycled, key=" << file_path;
+        return 1;
+    }
+
+    return 0;
+}
+
+int check_inverted_index_file(TxnKv* txn_kv, const std::string& instance_id,
+                              const std::string& path, RowsetIndexesFormatV1& rowset_index_cache_v1,
+                              RowsetIndexesFormatV2& rowset_index_cache_v2) {
+    std::vector<std::string> str;
+    butil::SplitString(path, '/', &str);
+    // format v1: data/{tablet_id}/{rowset_id}_{seg_num}_{idx_id}{idx_suffix}.idx
+    // format v2: data/{tablet_id}/{rowset_id}_{seg_num}.idx
+    if (str.size() < 3) {
+        // clang-format off
+            LOG(WARNING) << "split obj_key error, str.size() should be less than 3,"
+                         << " value = " << str.size();
+        // clang-format on
+        return -1;
+    }
+
+    int64_t tablet_id = atol(str[1].c_str());
+    if (tablet_id <= 0) {
+        LOG(WARNING) << "failed to parse tablet_id, key=" << path;
+        return -1;
+    }
+
+    // v1: {rowset_id}_{seg_num}_{idx_id}{idx_suffix}.idx
+    // v2: {rowset_id}_{seg_num}.idx
+    std::string rowset_info = str.back();
+
+    if (!rowset_info.ends_with(".idx")) {
+        return 0; // Not an index file
+    }
+
+    doris::InvertedIndexStorageFormatPB inverted_index_storage_format =
+            std::count(rowset_info.begin(), rowset_info.end(), '_') > 1
+                    ? doris::InvertedIndexStorageFormatPB::V1
+                    : doris::InvertedIndexStorageFormatPB::V2;
+
+    size_t pos = rowset_info.find_last_of('_');
+    if (pos == std::string::npos || pos + 1 >= str.back().size() - 4) {
+        LOG(WARNING) << "Invalid index_id format, key=" << path;
+        return -1;
+    }
+    if (inverted_index_storage_format == doris::InvertedIndexStorageFormatPB::V1) {
+        return check_inverted_index_file_storage_format_v1(txn_kv, instance_id, tablet_id, path,
+                                                           rowset_info, rowset_index_cache_v1);
+    } else {
+        return check_inverted_index_file_storage_format_v2(txn_kv, instance_id, tablet_id, path,
+                                                           rowset_info, rowset_index_cache_v2);
+    }
+}
+
 int check_mvcc_meta_rowset_key(InstanceChecker* checker, TxnKv* txn_kv) {
     int check_ret = 0;
     std::string instance_id(checker->instance_id().data(), checker->instance_id().size());
@@ -500,6 +737,14 @@ int inverted_check_mvcc_meta_rowset_key(InstanceChecker* checker, TxnKv* txn_kv)
     checker->get_all_accessor(&accessors);
 
     std::vector<int64_t> tablet_ids;
+    int64_t num_loss = 0;
+    int64_t num_scan = 0;
+
+    DORIS_CLOUD_DEFER {
+        LOG_INFO("inverted check cluster snapshots")
+                .tag("total_scan_files", num_scan)
+                .tag("total_loss_files", num_loss);
+    };
 
     std::vector<std::pair<SnapshotPB, Versionstamp>> snapshots;
     MetaReader reader(instance_id, txn_kv);
@@ -556,17 +801,28 @@ int inverted_check_mvcc_meta_rowset_key(InstanceChecker* checker, TxnKv* txn_kv)
             }
 
             TabletRowsetsCache tablet_rowsets_cache;
+            RowsetIndexesFormatV1 rowset_index_cache_v1;
+            RowsetIndexesFormatV2 rowset_index_cache_v2;
 
             for (auto file = list_iter->next(); file.has_value(); file = list_iter->next()) {
+                num_scan++;
                 if (check_rowset_key_exist(txn_kv, instance_id, file->path, tablet_rowsets_cache) !=
                     0) {
+                    num_loss++;
                     LOG_WARNING("failed to check rowset key because rowset key not exist")
                             .tag("instance_id", instance_id)
                             .tag("rowset_key", file->path);
                     check_ret = 1;
                 }
+                if (check_inverted_index_file(txn_kv, instance_id, file->path,
+                                              rowset_index_cache_v1, rowset_index_cache_v2) != 0) {
+                    num_loss++;
+                    LOG_WARNING("failed to check inverted index file")
+                            .tag("instance_id", instance_id)
+                            .tag("index_file_key", file->path);
+                    check_ret = 1;
+                }
             }
-
             if (!list_iter->is_valid()) {
                 LOG(WARNING) << "failed to list data directory. uri=" << accessor->uri();
                 return -1;
@@ -574,337 +830,6 @@ int inverted_check_mvcc_meta_rowset_key(InstanceChecker* checker, TxnKv* txn_kv)
         }
     }
     return check_ret;
-}
-
-int init_mvcc_tablet_index_info(const std::string& instance_id, TxnKv* txn_kv,
-                                std::vector<TabletInfo>* tablets_info) {
-    std::vector<int64_t> tablet_ids;
-
-    MetaReader reader(instance_id, txn_kv);
-    TxnErrorCode err = reader.get_all_tablet_ids(&tablet_ids, false);
-    if (err != TxnErrorCode::TXN_OK) {
-        LOG_WARNING("failed to get all tablet ids by versioned tablet index key")
-                .tag("instance_id", instance_id)
-                .tag("error_code", err);
-        return -1;
-    }
-
-    for (int64_t tablet_id : tablet_ids) {
-        TabletIndexPB tablet_index;
-        err = reader.get_tablet_index(tablet_id, &tablet_index, false);
-        if (err != TxnErrorCode::TXN_OK) {
-            LOG_WARNING("failed to get tablet index")
-                    .tag("instance_id", instance_id)
-                    .tag("tablet_id", tablet_id)
-                    .tag("error_code", err);
-            return -1;
-        }
-        TabletInfo tablet_info;
-        tablet_info.tablet_id = tablet_id;
-        tablet_info.db_id = tablet_index.db_id();
-        tablet_info.table_id = tablet_index.table_id();
-        tablets_info->emplace_back(tablet_info);
-    }
-    return 0;
-}
-
-int init_mvcc_tablet_meta_info(const std::string& instance_id, TxnKv* txn_kv,
-                               std::vector<TabletInfo>* tablet_metas) {
-    std::vector<int64_t> tablet_ids;
-
-    MetaReader reader(instance_id, txn_kv);
-    TxnErrorCode err = reader.get_all_tablet_ids(&tablet_ids, false);
-    if (err != TxnErrorCode::TXN_OK) {
-        LOG_WARNING("failed to get all tablet ids by versioned tablet index key")
-                .tag("instance_id", instance_id)
-                .tag("error_code", err);
-        return -1;
-    }
-
-    for (int64_t tablet_id : tablet_ids) {
-        doris::TabletMetaCloudPB tablet_meta;
-        Versionstamp versionstamp;
-        err = reader.get_tablet_meta(tablet_id, &tablet_meta, &versionstamp);
-        if (err != TxnErrorCode::TXN_OK) {
-            LOG_WARNING("failed to get tablet meta")
-                    .tag("instance_id", instance_id)
-                    .tag("tablet_id", tablet_id)
-                    .tag("error_code", err);
-            return -1;
-        }
-        TabletInfo tablet_info;
-        tablet_info.tablet_id = tablet_id;
-        tablet_info.table_id = tablet_meta.table_id();
-        tablet_info.partition_id = tablet_meta.partition_id();
-        tablet_info.index_id = tablet_meta.index_id();
-        tablet_info.schema_version = tablet_meta.schema_version();
-        tablet_metas->emplace_back(tablet_info);
-    }
-    return 0;
-}
-
-int init_mvcc_partition_info(const std::string& instance_id, TxnKv* txn_kv,
-                             std::vector<PartitionInfo>* partitions_info) {
-    std::vector<int64_t> tablet_ids;
-
-    MetaReader reader(instance_id, txn_kv);
-    TxnErrorCode err = reader.get_all_tablet_ids(&tablet_ids, false);
-    if (err != TxnErrorCode::TXN_OK) {
-        LOG_WARNING("failed to get all tablet ids by versioned tablet index key")
-                .tag("instance_id", instance_id)
-                .tag("error_code", err);
-        return -1;
-    }
-
-    for (int64_t tablet_id : tablet_ids) {
-        TabletIndexPB tablet_index;
-        err = reader.get_tablet_index(tablet_id, &tablet_index, false);
-        if (err != TxnErrorCode::TXN_OK) {
-            LOG_WARNING("failed to get tablet meta")
-                    .tag("instance_id", instance_id)
-                    .tag("tablet_id", tablet_id)
-                    .tag("error_code", err);
-            return -1;
-        }
-        PartitionInfo partition_info;
-        partition_info.tablet_id = tablet_id;
-        partition_info.table_id = tablet_index.table_id();
-        partition_info.db_id = tablet_index.db_id();
-        partition_info.partition_id = tablet_index.partition_id();
-        partitions_info->emplace_back(partition_info);
-    }
-    return 0;
-}
-
-int init_mvcc_table_info(const std::string& instance_id, TxnKv* txn_kv,
-                         std::vector<TableInfo>* tables_info) {
-    std::vector<int64_t> tablet_ids;
-
-    MetaReader reader(instance_id, txn_kv);
-    TxnErrorCode err = reader.get_all_tablet_ids(&tablet_ids, false);
-    if (err != TxnErrorCode::TXN_OK) {
-        LOG_WARNING("failed to get all tablet ids by versioned tablet index key")
-                .tag("instance_id", instance_id)
-                .tag("error_code", err);
-        return -1;
-    }
-
-    for (int64_t tablet_id : tablet_ids) {
-        TabletIndexPB tablet_index;
-        err = reader.get_tablet_index(tablet_id, &tablet_index, false);
-        if (err != TxnErrorCode::TXN_OK) {
-            LOG_WARNING("failed to get tablet meta")
-                    .tag("instance_id", instance_id)
-                    .tag("tablet_id", tablet_id)
-                    .tag("error_code", err);
-            return -1;
-        }
-        TableInfo table_info;
-        table_info.table_id = tablet_index.table_id();
-        table_info.db_id = tablet_index.db_id();
-        tables_info->emplace_back(table_info);
-    }
-    return 0;
-}
-
-int do_check_meta(const std::string& instance_id, MetaChecker* meta_checker, TxnKv* txn_kv) {
-    int check_ret = 0;
-    {
-        std::vector<TabletInfo> tablets_info;
-        if (init_mvcc_tablet_index_info(instance_id, txn_kv, &tablets_info) != 0) {
-            LOG(WARNING) << "init_mvcc_tablet_index_info failed";
-            return -1;
-        }
-        // check MetaTabletIdxKey inverted
-        if (!meta_checker->do_meta_tablet_key_index_check(tablets_info)) {
-            check_ret = 1;
-            LOG(WARNING) << "do_meta_tablet_key_index_check failed";
-        } else {
-            LOG(INFO) << "do_meta_tablet_key_index_check success";
-        }
-
-        if (init_mvcc_tablet_meta_info(instance_id, txn_kv, &tablets_info) != 0) {
-            LOG(WARNING) << "init_mvcc_tablet_meta_info failed";
-            return -1;
-        }
-        // check MetaTabletKey
-        if (!meta_checker->do_meta_tablet_key_check(tablets_info)) {
-            check_ret = 1;
-            LOG(WARNING) << "do_meta_tablet_key_check failed";
-        } else {
-            LOG(INFO) << "do_meta_tablet_key_check success";
-        }
-        // check MetaSchemaKey
-        if (!meta_checker->do_meta_schema_key_check(tablets_info)) {
-            check_ret = 1;
-            LOG(WARNING) << "do_meta_schema_key_check failed";
-        } else {
-            LOG(INFO) << "do_meta_schema_key_check success";
-        }
-    }
-
-    {
-        std::vector<PartitionInfo> partitions_info;
-        if (!init_mvcc_partition_info(instance_id, txn_kv, &partitions_info)) {
-            LOG(WARNING) << "init_mvcc_partition_info failed";
-            return -1;
-        }
-        // check PartitionVersionKey
-        if (!meta_checker->do_version_partition_key_check(partitions_info)) {
-            check_ret = 1;
-            LOG(WARNING) << "do_version_partition_key_check failed";
-        } else {
-            LOG(INFO) << "do_version_partition_key_check success";
-        }
-    }
-
-    {
-        std::vector<TableInfo> tables_info;
-        if (!init_mvcc_table_info(instance_id, txn_kv, &tables_info)) {
-            LOG(WARNING) << "init_mvcc_table_info failed";
-            return -1;
-        }
-        // check TableVersionKey
-        if (!meta_checker->do_version_table_key_check(tables_info)) {
-            check_ret = 1;
-            LOG(WARNING) << "do_version_table_key_check failed";
-        } else {
-            LOG(INFO) << "do_version_table_key_check success";
-        }
-    }
-    return check_ret;
-}
-
-int do_mvcc_meta_tablet_index_key_inverted_check(const std::string& instance_id, TxnKv* txn_kv,
-                                                 MetaChecker* meta_checker) {
-    int check_res = 0;
-    MetaReader reader(instance_id, txn_kv);
-    // check tablet idx
-    for (const auto& tablet_info : meta_checker->tablets_info_ref()) {
-        TabletIndexPB tablet_idx;
-        TxnErrorCode err = reader.get_tablet_index(tablet_info.tablet_id, &tablet_idx, false);
-        if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
-            LOG(WARNING) << "tablet idx not found: " << tablet_info.tablet_id;
-            check_res = 1;
-            continue;
-        } else if (err != TxnErrorCode::TXN_OK) [[unlikely]] {
-            LOG(WARNING) << "failed to get tablet idx, err: " << err;
-            return -1;
-        }
-
-        if (tablet_info.db_id != tablet_idx.db_id()) [[unlikely]] {
-            LOG(WARNING) << "tablet idx check failed, fe db id: " << tablet_info.db_id
-                         << " tablet idx db id: " << tablet_idx.db_id();
-            check_res = 1;
-            continue;
-        }
-
-        if (tablet_info.table_id != tablet_idx.table_id()) [[unlikely]] {
-            LOG(WARNING) << "tablet idx check failed, fe table id: " << tablet_info.table_id
-                         << " tablet idx table id: " << tablet_idx.table_id();
-            check_res = 1;
-            continue;
-        }
-
-        if (tablet_info.partition_id != tablet_idx.partition_id()) [[unlikely]] {
-            LOG(WARNING) << "tablet idx check failed, fe part id: " << tablet_info.partition_id
-                         << " tablet idx part id: " << tablet_idx.partition_id();
-            check_res = 1;
-            continue;
-        }
-
-        if (tablet_info.index_id != tablet_idx.index_id()) [[unlikely]] {
-            LOG(WARNING) << "tablet idx check failed, fe index id: " << tablet_info.index_id
-                         << " tablet idx index id: " << tablet_idx.index_id();
-            check_res = 1;
-            continue;
-        }
-
-        if (tablet_info.tablet_id != tablet_idx.tablet_id()) [[unlikely]] {
-            LOG(WARNING) << "tablet idx check failed, fe tablet id: " << tablet_info.tablet_id
-                         << " tablet idx tablet id: " << tablet_idx.tablet_id();
-            check_res = 1;
-            continue;
-        }
-    }
-    return check_res;
-}
-
-int do_mvcc_meta_tablet_key_inverted_check(const std::string& instance_id, TxnKv* txn_kv,
-                                           MetaChecker* meta_checker) {
-    int check_res = 0;
-    MetaReader reader(instance_id, txn_kv);
-    for (const auto& tablet_info : meta_checker->tablets_info_ref()) {
-        doris::TabletMetaCloudPB tablet_meta;
-        Versionstamp versionstamp;
-        TxnErrorCode err =
-                reader.get_tablet_meta(tablet_info.tablet_id, &tablet_meta, &versionstamp, false);
-        if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
-            LOG(WARNING) << "tablet meta not found: " << tablet_info.tablet_id;
-            check_res = 1;
-            continue;
-        } else if (err != TxnErrorCode::TXN_OK) [[unlikely]] {
-            LOG(WARNING) << "failed to get tablet, err: " << err;
-            return -1;
-            continue;
-        }
-    }
-
-    return check_res;
-}
-
-int do_mvcc_meta_schema_key_inverted_check(const std::string& instance_id, TxnKv* txn_kv,
-                                           MetaChecker* meta_checker) {
-    int check_res = 0;
-    MetaReader reader(instance_id, txn_kv);
-
-    for (const auto& tablet_info : meta_checker->tablets_info_ref()) {
-        doris::TabletSchemaCloudPB tablet_schema;
-        TxnErrorCode err = reader.get_tablet_schema(
-                tablet_info.index_id, tablet_info.schema_version, &tablet_schema, false);
-        if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
-            LOG(WARNING) << "tablet schema not found: " << tablet_info.debug_string();
-            check_res = 1;
-            continue;
-        } else if (err != TxnErrorCode::TXN_OK) [[unlikely]] {
-            LOG(WARNING) << "failed to get tablet schema, err: " << err;
-            return -1;
-        }
-    }
-    return check_res;
-}
-
-int do_inverted_check_meta(const std::string& instance_id, MetaChecker* meta_checker,
-                           TxnKv* txn_kv) {
-    meta_checker->init_db_meta();
-    meta_checker->init_tablet_and_partition_info_from_fe_meta();
-
-    int check_res = 0;
-    // check MetaTabletIdxKey
-    if (do_mvcc_meta_tablet_index_key_inverted_check(instance_id, txn_kv, meta_checker) != 0) {
-        check_res = -1;
-        LOG(WARNING) << "do_mvcc_meta_tablet_index_key_inverted_check failed";
-    } else {
-        LOG(INFO) << "do_mvcc_meta_tablet_index_key_inverted_check success";
-    }
-
-    // check MetaTabletKey
-    if (do_mvcc_meta_tablet_key_inverted_check(instance_id, txn_kv, meta_checker) != 0) {
-        check_res = -1;
-        LOG(WARNING) << "do_mvcc_meta_tablet_key_inverted_check failed";
-    } else {
-        LOG(INFO) << "do_mvcc_meta_tablet_key_inverted_check success";
-    }
-
-    // check MetaSchemaKey
-    if (do_mvcc_meta_schema_key_inverted_check(instance_id, txn_kv, meta_checker) != 0) {
-        check_res = -1;
-        LOG(WARNING) << "do_mvcc_meta_schema_key_inverted_check failed";
-    } else {
-        LOG(INFO) << "do_mvcc_meta_schema_key_inverted_check success";
-    }
-
-    return check_res;
 }
 
 } // namespace selectdb

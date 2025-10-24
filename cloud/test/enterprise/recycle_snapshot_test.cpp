@@ -47,6 +47,7 @@
 #include "meta-store/txn_kv.h"
 #include "meta-store/txn_kv_error.h"
 #include "meta-store/versioned_value.h"
+#include "meta-store/versionstamp.h"
 #include "mock_accessor.h"
 #include "rate-limiter/rate_limiter.h"
 #include "recycler/checker.h"
@@ -239,6 +240,7 @@ void add_tablet(CreateTabletsRequest& req, int64_t table_id, int64_t index_id, i
     auto schema = tablet->mutable_schema();
     schema->set_schema_version(0);
     auto first_rowset = tablet->add_rs_metas();
+    first_rowset->set_tablet_id(tablet_id);
     first_rowset->set_rowset_id(0); // required
     first_rowset->set_rowset_id_v2(next_rowset_id());
     first_rowset->set_start_version(0);
@@ -292,7 +294,8 @@ void commit_txn(MetaServiceProxy* meta_service, const std::string& cloud_unique_
 }
 
 doris::RowsetMetaCloudPB create_rowset(int64_t txn_id, int64_t tablet_id, int partition_id = 10,
-                                       int64_t version = -1, int num_rows = 100) {
+                                       int schema_version = 0, int64_t version = -1,
+                                       int num_rows = 100) {
     doris::RowsetMetaCloudPB rowset;
     rowset.set_rowset_id(0); // required
     rowset.set_rowset_id_v2(next_rowset_id());
@@ -309,7 +312,7 @@ doris::RowsetMetaCloudPB create_rowset(int64_t txn_id, int64_t tablet_id, int pa
     rowset.set_data_disk_size(num_rows * DATA_DISK_SIZE_CONST);
     rowset.set_index_disk_size(num_rows * INDEX_DISK_SIZE_CONST);
     rowset.set_total_disk_size(num_rows * DISK_SIZE_CONST);
-    rowset.mutable_tablet_schema()->set_schema_version(0);
+    rowset.mutable_tablet_schema()->set_schema_version(schema_version);
     rowset.set_txn_expiration(::time(nullptr)); // Required by DCHECK
     return rowset;
 }
@@ -1893,5 +1896,422 @@ TEST(RecycleSnapshotTest, InvertedCheckMvccMetaKeyMultipleTablets) {
     auto snapshot_manager = std::make_shared<selectdb::SnapshotManager>(txn_kv);
 
     // Should return 1 due to the orphaned file
+    ASSERT_EQ(snapshot_manager->inverted_check_mvcc_meta_key(checker.get()), 1);
+}
+
+// Test for check_inverted_index_file function - V1 format with complete data (normal case)
+TEST(RecycleSnapshotTest, CheckInvertedIndexFileV1Normal) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "check_inverted_index_file_v1_normal_instance";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    MOCK_GET_INSTANCE_ID(instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+
+    doris::TabletSchemaCloudPB tablet_schema;
+    tablet_schema.set_schema_version(1);
+    tablet_schema.set_inverted_index_storage_format(doris::InvertedIndexStorageFormatPB::V1);
+    auto* index_info = tablet_schema.add_index();
+    index_info->set_index_id(12345);
+    index_info->set_index_type(doris::IndexType::INVERTED);
+    index_info->set_index_suffix_name("suffix");
+
+    // insert a rowset
+    std::string rowset_id;
+    int64_t txn_id = 0;
+    ASSERT_NO_FATAL_FAILURE(
+            begin_txn(meta_service.get(), cloud_unique_id, db_id, "label_1", table_id, txn_id));
+    auto rowset = create_rowset(txn_id, tablet_id, partition_id, 1);
+    rowset.mutable_tablet_schema()->CopyFrom(tablet_schema);
+    rowset_id = rowset.rowset_id_v2();
+    ASSERT_NO_FATAL_FAILURE(prepare_rowset(meta_service.get(), cloud_unique_id, rowset));
+    ASSERT_NO_FATAL_FAILURE(commit_rowset(meta_service.get(), cloud_unique_id, rowset));
+    ASSERT_NO_FATAL_FAILURE(
+            commit_txn(meta_service.get(), cloud_unique_id, db_id, txn_id, "label_1"));
+
+    std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    // prepare legitimate segment and V1 index files
+    std::string segment_file = fmt::format("data/{}/{}_0.dat", tablet_id, rowset_id);
+    std::string index_file_v1 = fmt::format("data/{}/{}_0_12345suffix.idx", tablet_id, rowset_id);
+    accessor->put_file(segment_file, "segment_content");
+    accessor->put_file(index_file_v1, "index_content_v1");
+
+    auto checker = get_instance_checker(meta_service.get(), instance_id, accessor);
+    auto snapshot_manager = std::make_shared<selectdb::SnapshotManager>(txn_kv);
+
+    // Normal case: should return 0
+    ASSERT_EQ(snapshot_manager->inverted_check_mvcc_meta_key(checker.get()), 0);
+}
+
+// Test for V1 format missing rowset metadata (metadata loss)
+TEST(RecycleSnapshotTest, CheckInvertedIndexFileV1MissingRowsetMeta) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "check_inverted_index_file_v1_missing_meta_instance";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    MOCK_GET_INSTANCE_ID(instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+
+    doris::TabletSchemaCloudPB tablet_schema;
+    tablet_schema.set_schema_version(1);
+    tablet_schema.set_inverted_index_storage_format(doris::InvertedIndexStorageFormatPB::V1);
+    auto* index_info = tablet_schema.add_index();
+    index_info->set_index_id(12345);
+    index_info->set_index_type(doris::IndexType::INVERTED);
+    index_info->set_index_suffix_name("suffix");
+
+    // insert a rowset
+    std::string rowset_id;
+    int64_t txn_id = 0;
+    ASSERT_NO_FATAL_FAILURE(
+            begin_txn(meta_service.get(), cloud_unique_id, db_id, "label_1", table_id, txn_id));
+    auto rowset = create_rowset(txn_id, tablet_id, partition_id, 1);
+    rowset.mutable_tablet_schema()->CopyFrom(tablet_schema);
+    rowset_id = rowset.rowset_id_v2();
+    ASSERT_NO_FATAL_FAILURE(prepare_rowset(meta_service.get(), cloud_unique_id, rowset));
+    ASSERT_NO_FATAL_FAILURE(commit_rowset(meta_service.get(), cloud_unique_id, rowset));
+    ASSERT_NO_FATAL_FAILURE(
+            commit_txn(meta_service.get(), cloud_unique_id, db_id, txn_id, "label_1"));
+    std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    // add orphaned V1 index file without corresponding rowset metadata
+    std::string orphaned_index_v1 =
+            fmt::format("data/{}/orphaned_rowset_0_12345suffix.idx", tablet_id);
+    accessor->put_file(orphaned_index_v1, "orphaned_index_content");
+
+    auto checker = get_instance_checker(meta_service.get(), instance_id, accessor);
+    auto snapshot_manager = std::make_shared<selectdb::SnapshotManager>(txn_kv);
+
+    // Should return 1 indicating missing metadata
+    ASSERT_EQ(snapshot_manager->inverted_check_mvcc_meta_key(checker.get()), 1);
+}
+
+// Test for V1 format missing tablet schema (metadata loss)
+TEST(RecycleSnapshotTest, CheckInvertedIndexFileV1MissingTabletSchema) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "check_inverted_index_file_v1_missing_schema_instance";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    MOCK_GET_INSTANCE_ID(instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+
+    // Don't create tablet schema (missing schema metadata)
+
+    // insert a rowset
+    std::string rowset_id;
+    insert_rowset(meta_service.get(), cloud_unique_id, db_id, "label_1", table_id, partition_id,
+                  tablet_id, &rowset_id);
+
+    std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    // prepare segment file and V1 index file
+    std::string segment_file = fmt::format("data/{}/{}_0.dat", tablet_id, rowset_id);
+    std::string index_file_v1 = fmt::format("data/{}/{}_0_12345suffix.idx", tablet_id, rowset_id);
+    accessor->put_file(segment_file, "segment_content");
+    accessor->put_file(index_file_v1, "index_content_v1");
+
+    auto checker = get_instance_checker(meta_service.get(), instance_id, accessor);
+    auto snapshot_manager = std::make_shared<selectdb::SnapshotManager>(txn_kv);
+
+    // Should return -1 or 1 indicating missing schema metadata
+    int result = snapshot_manager->inverted_check_mvcc_meta_key(checker.get());
+    ASSERT_TRUE(result == -1 || result == 1);
+}
+
+// Test for V2 format with complete data (normal case)
+TEST(RecycleSnapshotTest, CheckInvertedIndexFileV2Normal) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "check_inverted_index_file_v2_normal_instance";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    MOCK_GET_INSTANCE_ID(instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+
+    doris::TabletSchemaCloudPB tablet_schema;
+    tablet_schema.set_schema_version(1);
+    tablet_schema.set_inverted_index_storage_format(doris::InvertedIndexStorageFormatPB::V1);
+    auto* index_info = tablet_schema.add_index();
+    index_info->set_index_id(12345);
+    index_info->set_index_type(doris::IndexType::INVERTED);
+    index_info->set_index_suffix_name("suffix");
+
+    // insert a rowset
+    std::string rowset_id;
+    int64_t txn_id = 0;
+    ASSERT_NO_FATAL_FAILURE(
+            begin_txn(meta_service.get(), cloud_unique_id, db_id, "label_1", table_id, txn_id));
+    auto rowset = create_rowset(txn_id, tablet_id, partition_id, 1);
+    rowset.mutable_tablet_schema()->CopyFrom(tablet_schema);
+    rowset_id = rowset.rowset_id_v2();
+    ASSERT_NO_FATAL_FAILURE(prepare_rowset(meta_service.get(), cloud_unique_id, rowset));
+    ASSERT_NO_FATAL_FAILURE(commit_rowset(meta_service.get(), cloud_unique_id, rowset));
+    ASSERT_NO_FATAL_FAILURE(
+            commit_txn(meta_service.get(), cloud_unique_id, db_id, txn_id, "label_1"));
+
+    std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    // prepare legitimate segment and V2 index files
+    std::string segment_file = fmt::format("data/{}/{}_0.dat", tablet_id, rowset_id);
+    std::string index_file_v2 = fmt::format("data/{}/{}_0.idx", tablet_id, rowset_id);
+    accessor->put_file(segment_file, "segment_content");
+    accessor->put_file(index_file_v2, "index_content_v2");
+
+    auto checker = get_instance_checker(meta_service.get(), instance_id, accessor);
+    auto snapshot_manager = std::make_shared<selectdb::SnapshotManager>(txn_kv);
+
+    // Normal case: should return 0
+    ASSERT_EQ(snapshot_manager->inverted_check_mvcc_meta_key(checker.get()), 0);
+}
+
+// Test for V2 format missing rowset metadata (metadata loss)
+TEST(RecycleSnapshotTest, CheckInvertedIndexFileV2MissingRowsetMeta) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "check_inverted_index_file_v2_missing_meta_instance";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    MOCK_GET_INSTANCE_ID(instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+
+    // Create tablet schema but don't insert rowset (missing rowset metadata)
+    std::unique_ptr<Transaction> txn;
+    ASSERT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+
+    doris::TabletSchemaCloudPB tablet_schema;
+    tablet_schema.set_schema_version(0);
+    tablet_schema.set_inverted_index_storage_format(doris::InvertedIndexStorageFormatPB::V2);
+    auto* index_info = tablet_schema.add_index();
+    index_info->set_index_id(12345);
+    index_info->set_index_type(doris::IndexType::INVERTED);
+
+    std::string schema_key = versioned::meta_schema_key({instance_id, index_id, 0});
+    ASSERT_TRUE(document_put(txn.get(), schema_key, std::move(tablet_schema)));
+    ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+
+    std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    // add orphaned V2 index file without corresponding rowset metadata
+    std::string orphaned_index_v2 = fmt::format("data/{}/orphaned_rowset_0.idx", tablet_id);
+    accessor->put_file(orphaned_index_v2, "orphaned_index_content");
+
+    auto checker = get_instance_checker(meta_service.get(), instance_id, accessor);
+    auto snapshot_manager = std::make_shared<selectdb::SnapshotManager>(txn_kv);
+
+    // Should return 1 indicating missing metadata
+    ASSERT_EQ(snapshot_manager->inverted_check_mvcc_meta_key(checker.get()), 1);
+}
+
+// Test for V1 format with invalid segment id (file/metadata inconsistency)
+TEST(RecycleSnapshotTest, CheckInvertedIndexFileV1InvalidSegment) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "check_inverted_index_file_v1_invalid_segment_instance";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    MOCK_GET_INSTANCE_ID(instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+
+    doris::TabletSchemaCloudPB tablet_schema;
+    tablet_schema.set_schema_version(1);
+    tablet_schema.set_inverted_index_storage_format(doris::InvertedIndexStorageFormatPB::V1);
+    auto* index_info = tablet_schema.add_index();
+    index_info->set_index_id(12345);
+    index_info->set_index_type(doris::IndexType::INVERTED);
+    index_info->set_index_suffix_name("suffix");
+
+    // insert a rowset
+    std::string rowset_id;
+    int64_t txn_id = 0;
+    ASSERT_NO_FATAL_FAILURE(
+            begin_txn(meta_service.get(), cloud_unique_id, db_id, "label_1", table_id, txn_id));
+    auto rowset = create_rowset(txn_id, tablet_id, partition_id, 1);
+    rowset.mutable_tablet_schema()->CopyFrom(tablet_schema);
+    rowset_id = rowset.rowset_id_v2();
+    ASSERT_NO_FATAL_FAILURE(prepare_rowset(meta_service.get(), cloud_unique_id, rowset));
+    ASSERT_NO_FATAL_FAILURE(commit_rowset(meta_service.get(), cloud_unique_id, rowset));
+    ASSERT_NO_FATAL_FAILURE(
+            commit_txn(meta_service.get(), cloud_unique_id, db_id, txn_id, "label_1"));
+
+    std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    // prepare legitimate segment file
+    std::string segment_file = fmt::format("data/{}/{}_0.dat", tablet_id, rowset_id);
+    accessor->put_file(segment_file, "segment_content");
+
+    // add V1 index file with invalid segment_id (segment_id 5 but rowset only has segment 0)
+    std::string invalid_index_v1 =
+            fmt::format("data/{}/{}_5_12345suffix.idx", tablet_id, rowset_id);
+    accessor->put_file(invalid_index_v1, "invalid_index_content");
+
+    auto checker = get_instance_checker(meta_service.get(), instance_id, accessor);
+    auto snapshot_manager = std::make_shared<selectdb::SnapshotManager>(txn_kv);
+
+    // Should return 1 indicating invalid segment_id
+    ASSERT_EQ(snapshot_manager->inverted_check_mvcc_meta_key(checker.get()), 1);
+}
+
+// Test for V2 format with invalid segment id (file/metadata inconsistency)
+TEST(RecycleSnapshotTest, CheckInvertedIndexFileV2InvalidSegment) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "check_inverted_index_file_v2_invalid_segment_instance";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    MOCK_GET_INSTANCE_ID(instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+
+    doris::TabletSchemaCloudPB tablet_schema;
+    tablet_schema.set_schema_version(1);
+    tablet_schema.set_inverted_index_storage_format(doris::InvertedIndexStorageFormatPB::V1);
+    auto* index_info = tablet_schema.add_index();
+    index_info->set_index_id(12345);
+    index_info->set_index_type(doris::IndexType::INVERTED);
+    index_info->set_index_suffix_name("suffix");
+
+    // insert a rowset
+    std::string rowset_id;
+    int64_t txn_id = 0;
+    ASSERT_NO_FATAL_FAILURE(
+            begin_txn(meta_service.get(), cloud_unique_id, db_id, "label_1", table_id, txn_id));
+    auto rowset = create_rowset(txn_id, tablet_id, partition_id, 1);
+    rowset.mutable_tablet_schema()->CopyFrom(tablet_schema);
+    rowset_id = rowset.rowset_id_v2();
+    ASSERT_NO_FATAL_FAILURE(prepare_rowset(meta_service.get(), cloud_unique_id, rowset));
+    ASSERT_NO_FATAL_FAILURE(commit_rowset(meta_service.get(), cloud_unique_id, rowset));
+    ASSERT_NO_FATAL_FAILURE(
+            commit_txn(meta_service.get(), cloud_unique_id, db_id, txn_id, "label_1"));
+
+    std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    // prepare legitimate segment file
+    std::string segment_file = fmt::format("data/{}/{}_0.dat", tablet_id, rowset_id);
+    accessor->put_file(segment_file, "segment_content");
+
+    // add V2 index file with invalid segment_id (segment_id 3 but rowset only has segment 0)
+    std::string invalid_index_v2 = fmt::format("data/{}/{}_3.idx", tablet_id, rowset_id);
+    accessor->put_file(invalid_index_v2, "invalid_index_content");
+
+    auto checker = get_instance_checker(meta_service.get(), instance_id, accessor);
+    auto snapshot_manager = std::make_shared<selectdb::SnapshotManager>(txn_kv);
+
+    // Should return 1 indicating invalid segment_id
+    ASSERT_EQ(snapshot_manager->inverted_check_mvcc_meta_key(checker.get()), 1);
+}
+
+// Test for V1 format with invalid index id (metadata inconsistency)
+TEST(RecycleSnapshotTest, CheckInvertedIndexFileV1InvalidIndexId) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "check_inverted_index_file_v1_invalid_index_instance";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    MOCK_GET_INSTANCE_ID(instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+
+    doris::TabletSchemaCloudPB tablet_schema;
+    tablet_schema.set_schema_version(1);
+    tablet_schema.set_inverted_index_storage_format(doris::InvertedIndexStorageFormatPB::V1);
+    auto* index_info = tablet_schema.add_index();
+    index_info->set_index_id(12345);
+    index_info->set_index_type(doris::IndexType::INVERTED);
+    index_info->set_index_suffix_name("suffix");
+
+    // insert a rowset
+    std::string rowset_id;
+    int64_t txn_id = 0;
+    ASSERT_NO_FATAL_FAILURE(
+            begin_txn(meta_service.get(), cloud_unique_id, db_id, "label_1", table_id, txn_id));
+    auto rowset = create_rowset(txn_id, tablet_id, partition_id, 1);
+    rowset.mutable_tablet_schema()->CopyFrom(tablet_schema);
+    rowset_id = rowset.rowset_id_v2();
+    ASSERT_NO_FATAL_FAILURE(prepare_rowset(meta_service.get(), cloud_unique_id, rowset));
+    ASSERT_NO_FATAL_FAILURE(commit_rowset(meta_service.get(), cloud_unique_id, rowset));
+    ASSERT_NO_FATAL_FAILURE(
+            commit_txn(meta_service.get(), cloud_unique_id, db_id, txn_id, "label_1"));
+
+    std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    // prepare legitimate segment file
+    std::string segment_file = fmt::format("data/{}/{}_0.dat", tablet_id, rowset_id);
+    accessor->put_file(segment_file, "segment_content");
+
+    // add V1 index file with invalid index_id+suffix (99999invalid_suffix not in tablet schema)
+    std::string invalid_index_v1 =
+            fmt::format("data/{}/{}_0_99999invalid_suffix.idx", tablet_id, rowset_id);
+    accessor->put_file(invalid_index_v1, "invalid_index_content");
+
+    auto checker = get_instance_checker(meta_service.get(), instance_id, accessor);
+    auto snapshot_manager = std::make_shared<selectdb::SnapshotManager>(txn_kv);
+
+    // Should return 1 indicating invalid index_id with suffix
     ASSERT_EQ(snapshot_manager->inverted_check_mvcc_meta_key(checker.get()), 1);
 }

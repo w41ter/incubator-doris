@@ -1003,11 +1003,13 @@ void MetaChecker::init_tablet_and_partition_info_from_fe_meta() {
 }
 
 bool MetaChecker::do_mvcc_check() {
+#ifdef BUILD_CHECK_META
     int ret = snapshot_manager_->check_meta(this);
     if (ret != 0) {
         LOG(INFO) << "do_mvcc_check failed";
         return false;
     }
+#endif
     return true;
 }
 
