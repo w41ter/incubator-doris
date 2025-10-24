@@ -12,7 +12,7 @@ if(BUILD_CHECK_META STREQUAL "OFF")
     list(REMOVE_ITEM ENTERPRISE_SNAPSHOT_SOURCES meta_check_snapshot.cpp)
 endif ()
 
-add_compile_definitions(-DFEATURE_ENTERPRISE_SNAPSHOT)
+add_compile_definitions(FEATURE_ENTERPRISE_SNAPSHOT)
 add_library(EnterpriseSnapshot STATIC ${ENTERPRISE_SNAPSHOT_SOURCES})
 
 # Export the library to parent scope
