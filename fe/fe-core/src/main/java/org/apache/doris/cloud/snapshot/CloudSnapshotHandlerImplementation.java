@@ -484,7 +484,7 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
     }
 
     private Pair<File, File> downloadImage(String snapshotId, Cloud.CloneInstanceResponse response) throws Exception {
-        LOG.info("start to download snapshot id: {}", snapshotId);
+        LOG.info("start to download snapshot id: {}, image url: {}", snapshotId, response.getImageUrl());
         // download zip file
         RemoteBase remote = RemoteBase.newInstance(new RemoteBase.ObjectInfo(response.getObjInfo()));
         try {
