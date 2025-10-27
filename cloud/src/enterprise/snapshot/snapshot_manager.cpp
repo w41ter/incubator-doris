@@ -21,6 +21,12 @@ namespace versioned = doris::cloud::versioned;
 
 namespace selectdb {
 
+static constexpr std::string_view SNAPSHOT_PREFIX = "snapshot";
+
+static inline std::string get_snapshot_url(std::string_view snapshot_id) {
+    return fmt::format("{}/{}/", SNAPSHOT_PREFIX, snapshot_id);
+}
+
 static bool decrypt_object_store_info_ak_sk(ObjectStoreInfoPB* obj_info) {
     if (!obj_info->has_encryption_info()) {
         return true;
@@ -194,8 +200,6 @@ void SnapshotManager::begin_snapshot(std::string_view instance_id,
 
     // get instance pb to check if it exists and get source snapshot info
     std::string key = instance_key({instance_id});
-    LOG(INFO) << "get instance_key=" << hex(key);
-
     std::string val;
     err = txn->get(key, &val);
     if (err != TxnErrorCode::TXN_OK) {
@@ -348,9 +352,16 @@ void SnapshotManager::begin_snapshot(std::string_view instance_id,
     }
 
     std::string snapshot_id = serialize_snapshot_id(versionstamp);
-    response->set_image_url("/snapshot/" + snapshot_id + "/");
+    std::string image_url = get_snapshot_url(snapshot_id);
+    response->set_image_url(image_url);
     response->set_snapshot_id(snapshot_id);
     response->mutable_obj_info()->Swap(&obj_info);
+
+    LOG_INFO("begin snapshot completed")
+            .tag("instance_id", instance_id)
+            .tag("snapshot_id", hex(snapshot_id))
+            .tag("image_url", image_url)
+            .tag("resource_id", snapshot_resource_id);
 }
 
 void SnapshotManager::update_snapshot(std::string_view instance_id,
