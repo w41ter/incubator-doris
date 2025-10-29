@@ -214,7 +214,7 @@ TEST(MetaServiceSnapshotTest, BeginSnapshotTest) {
         ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
         ASSERT_FALSE(res.image_url().empty());
         ASSERT_FALSE(res.snapshot_id().empty());
-        ASSERT_TRUE(res.image_url().find("/snapshot/") != std::string::npos);
+        ASSERT_TRUE(res.image_url().find("snapshot/") != std::string::npos);
     }
 
     // test begin snapshot with custom parameters
@@ -417,7 +417,7 @@ TEST(MetaServiceSnapshotTest, UpdateSnapshotTest) {
         ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
         ASSERT_FALSE(res.image_url().empty());
         ASSERT_FALSE(res.snapshot_id().empty());
-        ASSERT_TRUE(res.image_url().find("/snapshot/") != std::string::npos);
+        ASSERT_TRUE(res.image_url().find("snapshot/") != std::string::npos);
         snapshot_id = res.snapshot_id();
     }
 

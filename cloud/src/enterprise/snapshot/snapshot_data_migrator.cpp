@@ -1,5 +1,6 @@
 #include "recycler/snapshot_data_migrator.h"
 
+#include <gen_cpp/cloud.pb.h>
 #include <gen_cpp/olap_file.pb.h>
 
 #include <chrono>
@@ -1102,7 +1103,7 @@ int MigrateExecutor::get_tablet_stats(Transaction* txn, int64_t tablet_id,
         return -1;
     }
 
-    MetaServiceCode code;
+    MetaServiceCode code = MetaServiceCode::OK;
     std::string msg;
     tablet_idx.set_tablet_id(tablet_id);
     internal_get_tablet_stats(code, msg, txn, instance_id_, tablet_idx, *tablet_stats);
