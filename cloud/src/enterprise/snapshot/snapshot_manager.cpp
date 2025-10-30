@@ -1268,13 +1268,6 @@ InstanceInfoPB SnapshotManager::create_readonly_instance_info(
     new_instance.set_source_instance_id(from_instance_id);
     new_instance.set_source_snapshot_id(from_snapshot_id);
 
-    // Set original instance relationship (root of snapshot chain)
-    if (from_instance_info.has_original_instance_id()) {
-        new_instance.set_original_instance_id(from_instance_info.original_instance_id());
-    } else {
-        new_instance.set_original_instance_id(from_instance_id);
-    }
-
     // Inherit source instance storage configuration (READ_ONLY fully shared)
     for (const auto& obj_info : from_instance_info.obj_info()) {
         *new_instance.add_obj_info() = obj_info;
@@ -1324,13 +1317,6 @@ InstanceInfoPB SnapshotManager::create_writable_instance_info(
     // Derivation relationship information
     new_instance.set_source_instance_id(from_instance_id);
     new_instance.set_source_snapshot_id(from_snapshot_id);
-
-    // Set original instance relationship (root of snapshot chain)
-    if (from_instance_info.has_original_instance_id()) {
-        new_instance.set_original_instance_id(from_instance_info.original_instance_id());
-    } else {
-        new_instance.set_original_instance_id(from_instance_id);
-    }
 
     // Configure storage hierarchy (Copy-on-Write)
     // Storage vault configuration will be finalized in setup_writable_storage
@@ -1735,10 +1721,16 @@ MetaServiceCode SnapshotManager::handle_rollback_clone(
 
     // Update key fields for the new instance
     target_instance_info.set_instance_id(new_instance_id);
-    target_instance_info.set_original_instance_id(from_instance_info.instance_id());
     target_instance_info.set_source_snapshot_id(snapshot_versionstamp.to_string());
     target_instance_info.set_source_instance_id(from_instance_id);
     target_instance_info.set_ctime(std::time(nullptr));
+
+    // Set original instance relationship
+    if (from_instance_info.has_original_instance_id()) {
+        target_instance_info.set_original_instance_id(from_instance_info.original_instance_id());
+    } else {
+        target_instance_info.set_original_instance_id(from_instance_id);
+    }
 
     // Prepare target instance key
     InstanceKeyInfo target_key_info {new_instance_id};
@@ -1895,6 +1887,7 @@ void SnapshotManager::clone_instance(const CloneInstanceRequest& request,
     LOG_INFO("committing clone_instance transaction")
             .tag("clone_type", CloneInstanceRequest::CloneType_Name(request.clone_type()));
 
+    txn->atomic_add(system_meta_service_instance_update_key(), 1);
     err = txn->commit();
     if (err != TxnErrorCode::TXN_OK) {
         status->set_code(cast_as<ErrCategory::COMMIT>(err));
@@ -2095,6 +2088,7 @@ std::pair<MetaServiceCode, std::string> SnapshotManager::set_multi_version_statu
         return {MetaServiceCode::PROTOBUF_SERIALIZE_ERR, "failed to serialize instance info"};
     }
 
+    txn->atomic_add(system_meta_service_instance_update_key(), 1);
     txn->put(instance_key_str, updated_instance_val);
     err = txn->commit();
     if (err != TxnErrorCode::TXN_OK) {
