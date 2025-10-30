@@ -4,6 +4,7 @@
 
 #include <charconv>
 #include <chrono>
+#include <limits>
 #include <numeric>
 #include <string_view>
 
@@ -1923,11 +1924,56 @@ void SnapshotManager::clone_instance(const CloneInstanceRequest& request,
             .tag("transaction_committed", true);
 }
 
+static void clear_mv_key_space(Transaction* txn, const std::string& id) {
+    // The delete_bitmap_key is reserved since it is not depends on multi version status.
+    std::string begin_key = versioned::version_key_prefix(id);
+    std::string end_key = versioned::version_key_prefix(id + '\x00');
+    txn->remove(begin_key, end_key);
+    begin_key = versioned::index_key_prefix(id);
+    end_key = versioned::index_key_prefix(id + '\x00');
+    txn->remove(begin_key, end_key);
+    begin_key = versioned::stats_key_prefix(id);
+    end_key = versioned::stats_key_prefix(id + '\x00');
+    txn->remove(begin_key, end_key);
+    begin_key = versioned::meta_partition_key({id, 0});
+    end_key = versioned::meta_partition_key({id, std::numeric_limits<int64_t>::max()});
+    txn->remove(begin_key, end_key);
+    begin_key = versioned::meta_index_key({id, 0});
+    end_key = versioned::meta_index_key({id, std::numeric_limits<int64_t>::max()});
+    txn->remove(begin_key, end_key);
+    begin_key = versioned::meta_tablet_key({id, 0});
+    end_key = versioned::meta_tablet_key({id, std::numeric_limits<int64_t>::max()});
+    txn->remove(begin_key, end_key);
+    begin_key = versioned::meta_schema_key({id, 0, 0});
+    end_key = versioned::meta_schema_key(
+            {id, std::numeric_limits<int64_t>::max(), std::numeric_limits<int64_t>::max()});
+    txn->remove(begin_key, end_key);
+    begin_key = versioned::meta_rowset_load_key({id, 0, 0});
+    end_key = versioned::meta_rowset_load_key(
+            {id, std::numeric_limits<int64_t>::max(), std::numeric_limits<int64_t>::max()});
+    txn->remove(begin_key, end_key);
+    begin_key = versioned::meta_rowset_compact_key({id, 0, 0});
+    end_key = versioned::meta_rowset_compact_key(
+            {id, std::numeric_limits<int64_t>::max(), std::numeric_limits<int64_t>::max()});
+    txn->remove(begin_key, end_key);
+    begin_key = versioned::data_key_prefix(id);
+    end_key = versioned::data_key_prefix(id + '\x00');
+    txn->remove(begin_key, end_key);
+    begin_key = versioned::snapshot_key_prefix(id);
+    end_key = versioned::snapshot_key_prefix(id + '\x00');
+    txn->remove(begin_key, end_key);
+    begin_key = versioned::log_key_prefix(id);
+    end_key = versioned::log_key_prefix(id + '\x00');
+    txn->remove(begin_key, end_key);
+}
+
 std::pair<MetaServiceCode, std::string> SnapshotManager::set_multi_version_status(
-        std::string_view instance_id, MultiVersionStatus multi_version_status) {
+        std::string_view id, MultiVersionStatus multi_version_status) {
     LOG_INFO("set_multi_version_status")
-            .tag("instance_id", instance_id)
-            .tag("multi_version_status", multi_version_status);
+            .tag("instance_id", id)
+            .tag("multi_version_status", MultiVersionStatus_Name(multi_version_status));
+
+    std::string instance_id(id);
 
     std::unique_ptr<Transaction> txn;
     TxnErrorCode err = txn_kv_->create_txn(&txn);
@@ -1935,10 +1981,7 @@ std::pair<MetaServiceCode, std::string> SnapshotManager::set_multi_version_statu
         return {cast_as<ErrCategory::CREATE>(err), "failed to create txn"};
     }
 
-    InstanceKeyInfo key_info {std::string(instance_id)};
-    std::string instance_key_str;
-    instance_key(key_info, &instance_key_str);
-
+    std::string instance_key_str = instance_key(instance_id);
     std::string instance_val;
     err = txn->get(instance_key_str, &instance_val);
     if (err != TxnErrorCode::TXN_OK) {
@@ -1954,6 +1997,97 @@ std::pair<MetaServiceCode, std::string> SnapshotManager::set_multi_version_statu
         return {MetaServiceCode::PROTOBUF_PARSE_ERR, "failed to parse instance info"};
     }
 
+    using AllowMultiVersionStatus = std::unordered_set<MultiVersionStatus>;
+    std::unordered_map<MultiVersionStatus, AllowMultiVersionStatus> allowed_transitions = {
+            {
+                    MultiVersionStatus::MULTI_VERSION_DISABLED,
+                    {MultiVersionStatus::MULTI_VERSION_DISABLED,
+                     MultiVersionStatus::MULTI_VERSION_WRITE_ONLY},
+            },
+            {
+                    MultiVersionStatus::MULTI_VERSION_WRITE_ONLY,
+                    {MultiVersionStatus::MULTI_VERSION_DISABLED,
+                     MultiVersionStatus::MULTI_VERSION_READ_WRITE,
+                     MultiVersionStatus::MULTI_VERSION_WRITE_ONLY},
+            },
+            {
+                    MultiVersionStatus::MULTI_VERSION_READ_WRITE,
+                    {MultiVersionStatus::MULTI_VERSION_READ_WRITE,
+                     MultiVersionStatus::MULTI_VERSION_WRITE_ONLY,
+                     MultiVersionStatus::MULTI_VERSION_DISABLED},
+            },
+    };
+
+    MultiVersionStatus current_status = instance_info.has_multi_version_status()
+                                                ? instance_info.multi_version_status()
+                                                : MultiVersionStatus::MULTI_VERSION_DISABLED;
+    if (auto it = allowed_transitions.find(current_status);
+        it == allowed_transitions.end() || !it->second.contains(multi_version_status)) {
+        return {MetaServiceCode::INVALID_ARGUMENT,
+                fmt::format("directly convert from {} to {} is not allowed",
+                            MultiVersionStatus_Name(current_status),
+                            MultiVersionStatus_Name(multi_version_status))};
+    }
+
+    // Additional checks: Switch to READ_WRITE only if snapshot switch is not DISABLED
+    SnapshotSwitchStatus snapshot_switch_status =
+            instance_info.has_snapshot_switch_status()
+                    ? instance_info.snapshot_switch_status()
+                    : SnapshotSwitchStatus::SNAPSHOT_SWITCH_DISABLED;
+    if (current_status == MultiVersionStatus::MULTI_VERSION_WRITE_ONLY &&
+        multi_version_status == MultiVersionStatus::MULTI_VERSION_READ_WRITE &&
+        snapshot_switch_status == SnapshotSwitchStatus::SNAPSHOT_SWITCH_DISABLED) {
+        return {MetaServiceCode::INVALID_ARGUMENT,
+                fmt::format("cannot set multi_version_status from {} to {} when "
+                            "snapshot_switch_status is DISABLED. The snapshot data migration job "
+                            "is not finished yet.",
+                            MultiVersionStatus_Name(current_status),
+                            MultiVersionStatus_Name(multi_version_status))};
+    }
+
+    // Additional checks: Cloned instances cannot set multi_version_status to WRITE_ONLY or DISABLED
+    if (instance_info.has_source_instance_id() &&
+        (multi_version_status == MultiVersionStatus::MULTI_VERSION_WRITE_ONLY ||
+         multi_version_status == MultiVersionStatus::MULTI_VERSION_DISABLED)) {
+        return {MetaServiceCode::INVALID_ARGUMENT,
+                fmt::format("cannot set multi_version_status to {} for cloned instances",
+                            MultiVersionStatus_Name(multi_version_status))};
+    }
+
+    // Additional checks: Disable multi version only when there is no snapshot references
+    if ((current_status == MultiVersionStatus::MULTI_VERSION_READ_WRITE ||
+         current_status == MultiVersionStatus::MULTI_VERSION_WRITE_ONLY) &&
+        multi_version_status == MultiVersionStatus::MULTI_VERSION_DISABLED) {
+        // 1. The snapshot feature should be off.
+        if (snapshot_switch_status == SnapshotSwitchStatus::SNAPSHOT_SWITCH_ON) {
+            return {MetaServiceCode::INVALID_ARGUMENT,
+                    "you must turn off snapshot switch before disabling multi version. Consider "
+                    "execute sql: ADMIN SET CLUSTER SNAPSHOT FEATURE OFF"};
+        }
+
+        // 2. Snapshot and snapshot references must be cleaned.
+        MetaReader reader(instance_id);
+        bool has_snapshot = false;
+        err = reader.has_snapshot(txn.get(), &has_snapshot);
+        if (err != TxnErrorCode::TXN_OK) {
+            return {cast_as<ErrCategory::READ>(err), "failed to check whether there is snapshot"};
+        }
+        if (has_snapshot) {
+            return {MetaServiceCode::INVALID_ARGUMENT,
+                    "you must delete all snapshots before disabling multi version. Consider "
+                    "execute sql: ADMIN DROP CLUSTER SNAPSHOT WHERE snapshot_id = '$snapshot_id'"
+                    ". The dropped snapshot will be cleaned asynchronously in recycler, so you "
+                    " need to wait until all snapshots are cleaned before disabling multi "
+                    "version."};
+        }
+    }
+
+    // Clean the multi version key space before enable double writes.
+    if (current_status == MultiVersionStatus::MULTI_VERSION_DISABLED &&
+        multi_version_status == MultiVersionStatus::MULTI_VERSION_WRITE_ONLY) {
+        clear_mv_key_space(txn.get(), instance_id);
+    }
+
     instance_info.set_multi_version_status(multi_version_status);
 
     std::string updated_instance_val = instance_info.SerializeAsString();
@@ -1964,11 +2098,11 @@ std::pair<MetaServiceCode, std::string> SnapshotManager::set_multi_version_statu
     txn->put(instance_key_str, updated_instance_val);
     err = txn->commit();
     if (err != TxnErrorCode::TXN_OK) {
-        return {cast_as<ErrCategory::COMMIT>(err), "failed to commit txn"};
+        return {cast_as<ErrCategory::COMMIT>(err), fmt::format("failed to commit txn: {}", err)};
     }
 
     // Notify ResourceManager to refresh instance cache
-    notify_refresh_instance(txn_kv_, std::string(instance_id), nullptr, /*include_self=*/true);
+    notify_refresh_instance(txn_kv_, instance_id, nullptr, /*include_self=*/true);
 
     LOG_INFO("set_multi_version_status completed")
             .tag("instance_id", instance_id)

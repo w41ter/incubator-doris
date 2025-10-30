@@ -52,6 +52,7 @@
 #include "meta-store/txn_kv.h"
 #include "meta-store/txn_kv_error.h"
 #include "mock_resource_manager.h"
+#include "recycler/recycler.h"
 #include "resource-manager/resource_manager.h"
 
 namespace config = doris::cloud::config;
@@ -220,7 +221,8 @@ public:
             Response resp;
             auto s = google::protobuf::util::JsonStringToMessage(response_body, &resp);
             static_assert(std::is_base_of_v<::google::protobuf::Message, Response>);
-            EXPECT_TRUE(s.ok()) << __PRETTY_FUNCTION__ << " Parse JSON: " << s.ToString();
+            EXPECT_TRUE(s.ok()) << __PRETTY_FUNCTION__ << " Parse JSON: " << s.ToString()
+                                << ", body: " << response_body;
             return {status_code, std::move(resp)};
         } else if constexpr (std::is_same_v<std::string, Response>) {
             return {status_code, std::move(response_body)};
@@ -288,6 +290,17 @@ public:
         InstanceInfoPB instance;
         instance.ParseFromString(val);
         return instance;
+    }
+
+    TxnErrorCode update_instance_info(const InstanceInfoPB& instance) {
+        InstanceKeyInfo key_info {instance.instance_id()};
+        std::string key;
+        instance_key(key_info, &key);
+        std::string val = instance.SerializeAsString();
+        std::unique_ptr<Transaction> txn;
+        EXPECT_EQ(meta_service_->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+        txn->put(key, val);
+        return txn->commit();
     }
 
     MetaServiceProxy* meta_service() const { return meta_service_.get(); }
@@ -670,11 +683,15 @@ TEST(MetaServiceHttpTest, SetMultiVersionStatusTest) {
                   MultiVersionStatus::MULTI_VERSION_WRITE_ONLY);
     }
 
-    // Test 3: Set multi-version status to ENABLED using string enum
+    // Test 3: Set multi-version status to READ_WRITE using string enum
     {
+        InstanceInfoPB instance = ctx.get_instance_info(instance_id);
+        instance.set_snapshot_switch_status(SNAPSHOT_SWITCH_ON);
+        ASSERT_EQ(ctx.update_instance_info(instance), TxnErrorCode::TXN_OK);
+
         auto [http_code, response] = ctx.query<MetaServiceResponseStatus>(
                 "set_multi_version_status", fmt::format("instance_id={}&multi_version_"
-                                                        "status=MULTI_VERSION_ENABLED",
+                                                        "status=MULTI_VERSION_READ_WRITE",
                                                         instance_id));
         ASSERT_EQ(http_code, 200);
         ASSERT_EQ(response.code(), MetaServiceCode::OK);
@@ -689,7 +706,7 @@ TEST(MetaServiceHttpTest, SetMultiVersionStatusTest) {
         ASSERT_EQ(response.status.code(), MetaServiceCode::OK);
         ASSERT_TRUE(response.result.has_value());
         ASSERT_EQ(response.result->multi_version_status(),
-                  MultiVersionStatus::MULTI_VERSION_ENABLED);
+                  MultiVersionStatus::MULTI_VERSION_READ_WRITE);
     }
 
     // Test 5: Test with missing arguments
@@ -708,6 +725,325 @@ TEST(MetaServiceHttpTest, SetMultiVersionStatusTest) {
                                                         instance_id));
         ASSERT_EQ(http_code, 400);
         ASSERT_EQ(response.code(), MetaServiceCode::INVALID_ARGUMENT);
+    }
+}
+
+TEST(MetaServiceHttpTest, SetMultiVersionStatusInvalidTransitionsTest) {
+    HttpContext ctx;
+
+    // Create a test instance
+    std::string instance_id = "test_invalid_transitions_instance";
+    {
+        CreateInstanceRequest req;
+        req.set_instance_id(instance_id);
+        req.set_user_id("test_user");
+        req.set_name("test_instance");
+
+        auto [status_code, resp] = ctx.forward<MetaServiceResponseStatus>("create_instance", req);
+        ASSERT_EQ(status_code, 200);
+        ASSERT_EQ(resp.code(), MetaServiceCode::OK);
+    }
+
+    // Test 1: Try to jump from DISABLED to READ_WRITE (should fail)
+    {
+        auto [http_code, response] = ctx.query<MetaServiceResponseStatus>(
+                "set_multi_version_status",
+                fmt::format("instance_id={}&multi_version_status=MULTI_VERSION_READ_WRITE",
+                            instance_id));
+        ASSERT_EQ(http_code, 400);
+        ASSERT_EQ(response.code(), MetaServiceCode::INVALID_ARGUMENT);
+        EXPECT_TRUE(response.msg().find("directly convert from") != std::string::npos);
+    }
+
+    // Test 2: Set to WRITE_ONLY first (valid transition)
+    {
+        auto [http_code, response] = ctx.query<MetaServiceResponseStatus>(
+                "set_multi_version_status",
+                fmt::format("instance_id={}&multi_version_status=MULTI_VERSION_WRITE_ONLY",
+                            instance_id));
+        ASSERT_EQ(http_code, 200);
+        ASSERT_EQ(response.code(), MetaServiceCode::OK);
+    }
+
+    // Test 3: Verify we can stay at WRITE_ONLY (idempotent)
+    {
+        auto [http_code, response] = ctx.query<MetaServiceResponseStatus>(
+                "set_multi_version_status",
+                fmt::format("instance_id={}&multi_version_status=MULTI_VERSION_WRITE_ONLY",
+                            instance_id));
+        ASSERT_EQ(http_code, 200);
+        ASSERT_EQ(response.code(), MetaServiceCode::OK);
+    }
+}
+
+TEST(MetaServiceHttpTest, SetMultiVersionStatusSnapshotSwitchCheckTest) {
+    HttpContext ctx;
+
+    // Create a test instance
+    std::string instance_id = "test_snapshot_switch_check_instance";
+    {
+        CreateInstanceRequest req;
+        req.set_instance_id(instance_id);
+        req.set_user_id("test_user");
+        req.set_name("test_instance");
+
+        auto [status_code, resp] = ctx.forward<MetaServiceResponseStatus>("create_instance", req);
+        ASSERT_EQ(status_code, 200);
+        ASSERT_EQ(resp.code(), MetaServiceCode::OK);
+    }
+
+    // Test 1: Set to WRITE_ONLY first
+    {
+        auto [http_code, response] = ctx.query<MetaServiceResponseStatus>(
+                "set_multi_version_status",
+                fmt::format("instance_id={}&multi_version_status=MULTI_VERSION_WRITE_ONLY",
+                            instance_id));
+        ASSERT_EQ(http_code, 200);
+        ASSERT_EQ(response.code(), MetaServiceCode::OK);
+    }
+
+    // Test 2: Try to set to READ_WRITE when snapshot_switch_status is DISABLED (should fail)
+    {
+        auto [http_code, response] = ctx.query<MetaServiceResponseStatus>(
+                "set_multi_version_status",
+                fmt::format("instance_id={}&multi_version_status=MULTI_VERSION_READ_WRITE",
+                            instance_id));
+        ASSERT_EQ(http_code, 400);
+        ASSERT_EQ(response.code(), MetaServiceCode::INVALID_ARGUMENT);
+        EXPECT_TRUE(response.msg().find("snapshot data migration job") != std::string::npos);
+    }
+
+    // Test 3: Enable snapshot switch and try again (should succeed)
+    {
+        InstanceInfoPB instance = ctx.get_instance_info(instance_id);
+        instance.set_snapshot_switch_status(SNAPSHOT_SWITCH_ON);
+        ASSERT_EQ(ctx.update_instance_info(instance), TxnErrorCode::TXN_OK);
+
+        auto [http_code, response] = ctx.query<MetaServiceResponseStatus>(
+                "set_multi_version_status",
+                fmt::format("instance_id={}&multi_version_status=MULTI_VERSION_READ_WRITE",
+                            instance_id));
+        ASSERT_EQ(http_code, 200);
+        ASSERT_EQ(response.code(), MetaServiceCode::OK);
+    }
+
+    // Test 4: Verify status was set to READ_WRITE
+    {
+        auto [http_code, response] = ctx.query_with_result<InstanceInfoPB>(
+                "get_instance",
+                fmt::format("instance_id={}&cloud_unique_id=test_cloud_unique_id", instance_id));
+        ASSERT_EQ(http_code, 200);
+        ASSERT_EQ(response.status.code(), MetaServiceCode::OK);
+        ASSERT_TRUE(response.result.has_value());
+        ASSERT_EQ(response.result->multi_version_status(),
+                  MultiVersionStatus::MULTI_VERSION_READ_WRITE);
+    }
+}
+
+TEST(MetaServiceHttpTest, SetMultiVersionStatusClonedInstanceTest) {
+    HttpContext ctx;
+
+    // Create a source instance and snapshot
+    std::string source_instance_id = "test_cloned_instance_source";
+    create_test_instance_for_snapshot(ctx, source_instance_id);
+
+    // Initialize snapshot switch status to ON
+    {
+        InstanceInfoPB instance = ctx.get_instance_info(source_instance_id);
+        instance.set_snapshot_switch_status(SNAPSHOT_SWITCH_ON);
+        ASSERT_EQ(ctx.update_instance_info(instance), TxnErrorCode::TXN_OK);
+    }
+
+    // Create a snapshot
+    std::string snapshot_id;
+    {
+        BeginSnapshotRequest req;
+        req.set_cloud_unique_id(fmt::format("1:{}:1", source_instance_id));
+        req.set_snapshot_label("test_cloned_instance_snapshot");
+        req.set_timeout_seconds(3600);
+        req.set_ttl_seconds(7200);
+        req.set_auto_snapshot(false);
+
+        brpc::Controller ctrl;
+        BeginSnapshotResponse resp;
+        ctx.meta_service()->begin_snapshot(&ctrl, &req, &resp, nullptr);
+        ASSERT_EQ(resp.status().code(), MetaServiceCode::OK);
+        snapshot_id = resp.snapshot_id();
+    }
+
+    {
+        CommitSnapshotRequest req;
+        req.set_cloud_unique_id(fmt::format("1:{}:1", source_instance_id));
+        req.set_snapshot_id(snapshot_id);
+        req.set_image_url("snapshot/xxxx");
+        req.set_last_journal_id(0);
+        brpc::Controller ctrl;
+        CommitSnapshotResponse resp;
+        ctx.meta_service()->commit_snapshot(&ctrl, &req, &resp, nullptr);
+        ASSERT_EQ(resp.status().code(), MetaServiceCode::OK);
+    }
+
+    // Create a cloned instance (read-only)
+    std::string cloned_instance_id = "test_cloned_instance_readonly";
+    {
+        CloneInstanceRequest req;
+        req.set_clone_type(CloneInstanceRequest::READ_ONLY);
+        req.set_from_instance_id(source_instance_id);
+        req.set_from_snapshot_id(snapshot_id);
+        req.set_new_instance_id(cloned_instance_id);
+
+        brpc::Controller ctrl;
+        CloneInstanceResponse resp;
+        ctx.meta_service()->clone_instance(&ctrl, &req, &resp, nullptr);
+        ASSERT_EQ(resp.status().code(), MetaServiceCode::OK);
+    }
+
+    // Verify the cloned instance has source_instance_id
+    {
+        InstanceInfoPB instance = ctx.get_instance_info(cloned_instance_id);
+        ASSERT_TRUE(instance.has_source_instance_id());
+        ASSERT_EQ(instance.source_instance_id(), source_instance_id);
+        ASSERT_EQ(instance.multi_version_status(), MultiVersionStatus::MULTI_VERSION_READ_WRITE);
+    }
+
+    // Test 1: Try to set cloned instance to WRITE_ONLY (should fail)
+    {
+        auto [http_code, response] = ctx.query<MetaServiceResponseStatus>(
+                "set_multi_version_status",
+                fmt::format("instance_id={}&multi_version_status=MULTI_VERSION_WRITE_ONLY",
+                            cloned_instance_id));
+        ASSERT_EQ(http_code, 400);
+        ASSERT_EQ(response.code(), MetaServiceCode::INVALID_ARGUMENT);
+        EXPECT_TRUE(response.msg().find("cloned instances") != std::string::npos);
+    }
+
+    // Test 2: Try to set cloned instance to DISABLED (should fail)
+    {
+        auto [http_code, response] = ctx.query<MetaServiceResponseStatus>(
+                "set_multi_version_status",
+                fmt::format("instance_id={}&multi_version_status=MULTI_VERSION_DISABLED",
+                            cloned_instance_id));
+        ASSERT_EQ(http_code, 400);
+        ASSERT_EQ(response.code(), MetaServiceCode::INVALID_ARGUMENT);
+        EXPECT_TRUE(response.msg().find("cloned instances") != std::string::npos);
+    }
+
+    // Test 3: Cloned instance can stay at READ_WRITE (idempotent)
+    {
+        auto [http_code, response] = ctx.query<MetaServiceResponseStatus>(
+                "set_multi_version_status",
+                fmt::format("instance_id={}&multi_version_status=MULTI_VERSION_READ_WRITE",
+                            cloned_instance_id));
+        ASSERT_EQ(http_code, 200);
+        ASSERT_EQ(response.code(), MetaServiceCode::OK);
+    }
+}
+
+TEST(MetaServiceHttpTest, SetMultiVersionStatusDisableWithSnapshotsTest) {
+    HttpContext ctx;
+
+    // Create a test instance
+    std::string instance_id = "test_disable_with_snapshots_instance";
+    create_test_instance_for_snapshot(ctx, instance_id);
+
+    // Test 1: Set to WRITE_ONLY first
+    {
+        auto [http_code, response] = ctx.query<MetaServiceResponseStatus>(
+                "set_multi_version_status",
+                fmt::format("instance_id={}&multi_version_status=MULTI_VERSION_WRITE_ONLY",
+                            instance_id));
+        ASSERT_EQ(http_code, 200);
+        ASSERT_EQ(response.code(), MetaServiceCode::OK);
+    }
+
+    // Test 2: Try to disable when snapshot switch is OFF but no snapshots exist (should succeed)
+    {
+        InstanceInfoPB instance = ctx.get_instance_info(instance_id);
+        instance.set_snapshot_switch_status(SNAPSHOT_SWITCH_OFF);
+        ASSERT_EQ(ctx.update_instance_info(instance), TxnErrorCode::TXN_OK);
+
+        auto [http_code, response] = ctx.query<MetaServiceResponseStatus>(
+                "set_multi_version_status",
+                fmt::format("instance_id={}&multi_version_status=MULTI_VERSION_DISABLED",
+                            instance_id));
+        ASSERT_EQ(http_code, 200);
+        ASSERT_EQ(response.code(), MetaServiceCode::OK);
+    }
+
+    // Test 3: Set to READ_WRITE and enable snapshot switch
+    {
+        auto [http_code, response] = ctx.query<MetaServiceResponseStatus>(
+                "set_multi_version_status",
+                fmt::format("instance_id={}&multi_version_status=MULTI_VERSION_WRITE_ONLY",
+                            instance_id));
+        ASSERT_EQ(http_code, 200);
+        ASSERT_EQ(response.code(), MetaServiceCode::OK);
+
+        InstanceInfoPB instance = ctx.get_instance_info(instance_id);
+        instance.set_snapshot_switch_status(SNAPSHOT_SWITCH_ON);
+        ASSERT_EQ(ctx.update_instance_info(instance), TxnErrorCode::TXN_OK);
+
+        auto [http_code2, response2] = ctx.query<MetaServiceResponseStatus>(
+                "set_multi_version_status",
+                fmt::format("instance_id={}&multi_version_status=MULTI_VERSION_READ_WRITE",
+                            instance_id));
+        ASSERT_EQ(http_code2, 200);
+        ASSERT_EQ(response2.code(), MetaServiceCode::OK);
+    }
+
+    // Test 4: Try to disable when snapshot switch is ON (should fail)
+    {
+        auto [http_code, response] = ctx.query<MetaServiceResponseStatus>(
+                "set_multi_version_status",
+                fmt::format("instance_id={}&multi_version_status=MULTI_VERSION_DISABLED",
+                            instance_id));
+        ASSERT_EQ(http_code, 400);
+        ASSERT_EQ(response.code(), MetaServiceCode::INVALID_ARGUMENT);
+        EXPECT_TRUE(response.msg().find("turn off snapshot switch") != std::string::npos);
+    }
+
+    // Test 5: Create a snapshot
+    std::string snapshot_id;
+    {
+        BeginSnapshotRequest req;
+        req.set_cloud_unique_id(fmt::format("1:{}:1", instance_id));
+        req.set_snapshot_label("test_disable_snapshot");
+        req.set_timeout_seconds(3600);
+        req.set_ttl_seconds(7200);
+        req.set_auto_snapshot(false);
+
+        brpc::Controller ctrl;
+        BeginSnapshotResponse resp;
+        ctx.meta_service()->begin_snapshot(&ctrl, &req, &resp, nullptr);
+        ASSERT_EQ(resp.status().code(), MetaServiceCode::OK);
+        snapshot_id = resp.snapshot_id();
+    }
+
+    {
+        CommitSnapshotRequest req;
+        req.set_cloud_unique_id(fmt::format("1:{}:1", instance_id));
+        req.set_snapshot_id(snapshot_id);
+        req.set_image_url("snapshot/xxxx");
+        req.set_last_journal_id(0);
+        brpc::Controller ctrl;
+        CommitSnapshotResponse resp;
+        ctx.meta_service()->commit_snapshot(&ctrl, &req, &resp, nullptr);
+        ASSERT_EQ(resp.status().code(), MetaServiceCode::OK);
+    }
+
+    // Test 6: Turn off snapshot switch but try to disable with existing snapshots (should fail)
+    {
+        InstanceInfoPB instance = ctx.get_instance_info(instance_id);
+        instance.set_snapshot_switch_status(SNAPSHOT_SWITCH_OFF);
+        ASSERT_EQ(ctx.update_instance_info(instance), TxnErrorCode::TXN_OK);
+
+        auto [http_code, response] = ctx.query<MetaServiceResponseStatus>(
+                "set_multi_version_status",
+                fmt::format("instance_id={}&multi_version_status=MULTI_VERSION_DISABLED",
+                            instance_id));
+        ASSERT_EQ(http_code, 400);
+        ASSERT_EQ(response.code(), MetaServiceCode::INVALID_ARGUMENT);
+        EXPECT_TRUE(response.msg().find("delete all snapshots") != std::string::npos);
     }
 }
 
