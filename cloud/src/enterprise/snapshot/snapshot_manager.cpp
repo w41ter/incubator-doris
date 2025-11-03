@@ -2047,18 +2047,21 @@ std::pair<MetaServiceCode, std::string> SnapshotManager::set_multi_version_statu
                             MultiVersionStatus_Name(multi_version_status))};
     }
 
+    if (snapshot_switch_status == SnapshotSwitchStatus::SNAPSHOT_SWITCH_ON &&
+        multi_version_status != MultiVersionStatus::MULTI_VERSION_ENABLED &&
+        multi_version_status != MultiVersionStatus::MULTI_VERSION_READ_WRITE) {
+        return {MetaServiceCode::INVALID_ARGUMENT,
+                fmt::format("cannot set multi_version_status to {} when snapshot switch is ON. "
+                            "Consider turn off snapshot switch by executing sql: "
+                            "ADMIN SET CLUSTER SNAPSHOT FEATURE OFF",
+                            MultiVersionStatus_Name(multi_version_status))};
+    }
+
     // Additional checks: Disable multi version only when there is no snapshot references
     if ((current_status == MultiVersionStatus::MULTI_VERSION_READ_WRITE ||
          current_status == MultiVersionStatus::MULTI_VERSION_WRITE_ONLY) &&
         multi_version_status == MultiVersionStatus::MULTI_VERSION_DISABLED) {
-        // 1. The snapshot feature should be off.
-        if (snapshot_switch_status == SnapshotSwitchStatus::SNAPSHOT_SWITCH_ON) {
-            return {MetaServiceCode::INVALID_ARGUMENT,
-                    "you must turn off snapshot switch before disabling multi version. Consider "
-                    "execute sql: ADMIN SET CLUSTER SNAPSHOT FEATURE OFF"};
-        }
-
-        // 2. Snapshot and snapshot references must be cleaned.
+        // Snapshot and snapshot references must be cleaned.
         MetaReader reader(instance_id);
         bool has_snapshot = false;
         err = reader.has_snapshot(txn.get(), &has_snapshot);
@@ -2083,8 +2086,7 @@ std::pair<MetaServiceCode, std::string> SnapshotManager::set_multi_version_statu
     }
 
     // Disable snapshot switch when multi version is disabled.
-    if (current_status != MultiVersionStatus::MULTI_VERSION_DISABLED &&
-        multi_version_status == MultiVersionStatus::MULTI_VERSION_DISABLED) {
+    if (multi_version_status == MultiVersionStatus::MULTI_VERSION_DISABLED) {
         instance_info.set_snapshot_switch_status(SnapshotSwitchStatus::SNAPSHOT_SWITCH_DISABLED);
     }
 
