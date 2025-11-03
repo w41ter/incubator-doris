@@ -229,6 +229,8 @@ int MigrateExecutor::migrate_table_version_key(int64_t db_id, int64_t table_id) 
     err = txn->get(old_key, &old_value);
     if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
         // Key was deleted, skip
+        VLOG_DEBUG << "table version key already deleted for db " << db_id << ", table "
+                   << table_id;
         return 1; // skipped
     } else if (err != TxnErrorCode::TXN_OK) {
         LOG_WARNING("failed to read old key for migrating table version key").tag("error", err);
@@ -239,6 +241,7 @@ int MigrateExecutor::migrate_table_version_key(int64_t db_id, int64_t table_id) 
 
     err = txn->commit();
     if (err == TxnErrorCode::TXN_OK) {
+        VLOG_DEBUG << "migrate table version key for db " << db_id << ", table " << table_id;
         return 0; // success
     } else if (err == TxnErrorCode::TXN_CONFLICT) {
         LOG_WARNING("migrate table version key failed due to transaction conflict");
@@ -330,6 +333,8 @@ int MigrateExecutor::migrate_tablet_schema_key(int64_t index_id, int64_t schema_
     err = txn->get(versioned_key, &value);
     if (err == TxnErrorCode::TXN_OK) {
         // Already migrated, skip
+        VLOG_DEBUG << "tablet schema key already migrated for index " << index_id
+                   << ", schema version " << schema_version;
         return 1;
     } else if (err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
         LOG_WARNING("failed to get versioned key for migrating tablet schema key")
@@ -343,6 +348,8 @@ int MigrateExecutor::migrate_tablet_schema_key(int64_t index_id, int64_t schema_
     err = blob_get(txn.get(), old_key, &value_buf);
     if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
         // Key was deleted, skip
+        VLOG_DEBUG << "tablet schema key already deleted for index " << index_id
+                   << ", schema version " << schema_version;
         return 1;
     } else if (err != TxnErrorCode::TXN_OK) {
         LOG_WARNING("failed to read old key for migrating tablet schema key").tag("error", err);
@@ -361,6 +368,8 @@ int MigrateExecutor::migrate_tablet_schema_key(int64_t index_id, int64_t schema_
 
     err = txn->commit();
     if (err == TxnErrorCode::TXN_OK) {
+        VLOG_DEBUG << "migrate tablet schema key for index " << index_id << ", schema version "
+                   << schema_version;
         return 0; // success
     } else if (err == TxnErrorCode::TXN_CONFLICT) {
         LOG_WARNING("migrate tablet schema key failed due to transaction conflict");
@@ -471,6 +480,8 @@ int MigrateExecutor::migrate_partition_version_key(int64_t db_id, int64_t table_
     err = versioned_get(txn.get(), versioned_key, &version, &existing_value);
     if (err == TxnErrorCode::TXN_OK) {
         // Already migrated, skip
+        VLOG_DEBUG << "partition version key already migrated for partition " << partition_id
+                   << ", db " << db_id << ", table " << table_id;
         return 1;
     } else if (err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
         LOG_WARNING("failed to get versioned key for migrating partition version key")
@@ -483,6 +494,8 @@ int MigrateExecutor::migrate_partition_version_key(int64_t db_id, int64_t table_
     err = txn->get(old_key, &old_value);
     if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
         // Key was deleted, skip
+        VLOG_DEBUG << "partition version key already deleted for partition " << partition_id
+                   << ", db " << db_id << ", table " << table_id;
         return 1;
     } else if (err != TxnErrorCode::TXN_OK) {
         LOG_WARNING("failed to read old key for migrating partition version key").tag("error", err);
@@ -515,6 +528,8 @@ int MigrateExecutor::migrate_partition_version_key(int64_t db_id, int64_t table_
             txn->put(partition_inverted_index_key, "");
             versioned_put(txn.get(), partition_meta_key, "");
             migrate_partition_meta_keys = true;
+            VLOG_DEBUG << "migrate partition meta keys for partition " << partition_id << ", db "
+                       << db_id << ", table " << table_id;
         }
     }
 
@@ -524,6 +539,8 @@ int MigrateExecutor::migrate_partition_version_key(int64_t db_id, int64_t table_
             std::unique_lock lock(migrate_context_.mutex);
             migrate_context_.migrated_partitions.insert(partition_id);
         }
+        VLOG_DEBUG << "migrate partition version key for partition " << partition_id << ", db "
+                   << db_id << ", table " << table_id;
         return 0; // success
     } else if (err == TxnErrorCode::TXN_CONFLICT) {
         LOG_WARNING("migrate partition version key failed due to transaction conflict");
@@ -604,6 +621,8 @@ int MigrateExecutor::migrate_index_meta_keys(Transaction* txn, int64_t db_id, in
     TxnErrorCode err = txn->get(index_index_key, &value);
     if (err == TxnErrorCode::TXN_OK) {
         // Already migrated, skip
+        VLOG_DEBUG << "index meta keys already migrated for index " << index_id << ", db " << db_id
+                   << ", table " << table_id;
         return 1;
     } else if (err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
         LOG_WARNING("failed to read index meta for index")
@@ -620,6 +639,8 @@ int MigrateExecutor::migrate_index_meta_keys(Transaction* txn, int64_t db_id, in
         txn->put(index_index_key, index_index_pb.SerializeAsString());
         txn->put(index_inverted_index_key, "");
         versioned_put(txn, index_meta_key, "");
+        VLOG_DEBUG << "migrate index meta keys for index " << index_id << ", db " << db_id
+                   << ", table " << table_id;
         return 0;
     }
 }
@@ -631,6 +652,8 @@ int MigrateExecutor::migrate_partition_meta_keys(Transaction* txn, int64_t db_id
     TxnErrorCode err = txn->get(partition_index_key, &value);
     if (err == TxnErrorCode::TXN_OK) {
         // Already migrated, skip
+        VLOG_DEBUG << "partition meta keys already migrated for partition " << partition_id
+                   << ", db " << db_id << ", table " << table_id;
         return 1;
     } else if (err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
         LOG_WARNING("failed to read partition meta for partition")
@@ -648,6 +671,8 @@ int MigrateExecutor::migrate_partition_meta_keys(Transaction* txn, int64_t db_id
         txn->put(partition_index_key, partition_index_pb.SerializeAsString());
         txn->put(partition_inverted_index_key, "");
         versioned_put(txn, partition_meta_key, "");
+        VLOG_DEBUG << "migrate partition meta keys for partition " << partition_id << ", db "
+                   << db_id << ", table " << table_id;
         return 0;
     }
 }
@@ -669,6 +694,7 @@ int MigrateExecutor::migrate_meta_tablet_idx_key(int64_t tablet_id) {
     err = txn->get(versioned_key, &existing_value);
     if (err == TxnErrorCode::TXN_OK) {
         // This tablet index is migrated, try migrate the partition/index meta keys if needed.
+        VLOG_DEBUG << "tablet index key already migrated for tablet " << tablet_id;
         is_tablet_idx_migrated = true;
     } else if (err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
         // Error occurred
@@ -741,6 +767,11 @@ int MigrateExecutor::migrate_meta_tablet_idx_key(int64_t tablet_id) {
             if (is_partition_meta_keys_migrated) {
                 migrate_context_.migrated_partitions.insert(partition_id);
             }
+        }
+        if (any_key_migrated) {
+            VLOG_DEBUG << "migrate tablet index key for tablet " << tablet_id << ", db " << db_id
+                       << ", table " << table_id << ", index " << index_id << ", partition "
+                       << partition_id;
         }
         return any_key_migrated ? 0 : 1; // success or skipped
     } else if (err == TxnErrorCode::TXN_CONFLICT) {
@@ -826,6 +857,7 @@ int MigrateExecutor::migrate_meta_tablet_key(int64_t table_id, int64_t index_id,
     err = versioned_get(txn.get(), versioned_key, &version, &existing_value);
     if (err == TxnErrorCode::TXN_OK) {
         // Already migrated, skip
+        VLOG_DEBUG << "meta tablet key already migrated for tablet " << tablet_id;
         return 1;
     } else if (err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
         LOG_WARNING("failed to get versioned key for migrating meta tablet key").tag("error", err);
@@ -838,6 +870,7 @@ int MigrateExecutor::migrate_meta_tablet_key(int64_t table_id, int64_t index_id,
     err = txn->get(old_key, &old_value);
     if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
         // Key was deleted, skip
+        VLOG_DEBUG << "meta tablet key already deleted for tablet " << tablet_id;
         return 1;
     } else if (err != TxnErrorCode::TXN_OK) {
         LOG_WARNING("failed to read old key for migrating meta tablet key").tag("error", err);
@@ -848,6 +881,7 @@ int MigrateExecutor::migrate_meta_tablet_key(int64_t table_id, int64_t index_id,
 
     err = txn->commit();
     if (err == TxnErrorCode::TXN_OK) {
+        VLOG_DEBUG << "migrate meta tablet key for tablet " << tablet_id;
         return 0; // success
     } else if (err == TxnErrorCode::TXN_CONFLICT) {
         LOG_WARNING("migrate meta tablet key failed due to transaction conflict");
@@ -953,6 +987,9 @@ int MigrateExecutor::migrate_rowset_meta(int64_t tablet_id,
         return -1;
     } else if (old_rowset_meta.rowset_id_v2() != rowset_meta.rowset_id_v2()) {
         // Already modified during migration, skip
+        VLOG_DEBUG << "rowset meta already modified for tablet " << tablet_id << ", version "
+                   << end_version << " by another, new rowset_id "
+                   << old_rowset_meta.rowset_id_v2();
         return 1;
     }
 
@@ -978,6 +1015,8 @@ int MigrateExecutor::migrate_rowset_meta(int64_t tablet_id,
 
     err = txn->commit();
     if (err == TxnErrorCode::TXN_OK) {
+        VLOG_DEBUG << "migrate rowset meta for tablet " << tablet_id << ", version " << end_version
+                   << ", rowset_id " << rowset_meta.rowset_id_v2();
         return 0; // success
     } else if (err == TxnErrorCode::TXN_CONFLICT) {
         LOG_WARNING("migrate rowset meta failed due to transaction conflict");
@@ -1091,6 +1130,7 @@ int MigrateExecutor::get_tablet_stats(Transaction* txn, int64_t tablet_id,
     TxnErrorCode err = txn->get(tablet_idx_key, &value);
     if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
         // Tablet was deleted, skip
+        VLOG_DEBUG << "tablet index not found when getting tablet stats, tablet " << tablet_id;
         return 1;
     } else if (err != TxnErrorCode::TXN_OK) {
         LOG_WARNING("failed to get tablet index when getting tablet stats")
@@ -1109,6 +1149,7 @@ int MigrateExecutor::get_tablet_stats(Transaction* txn, int64_t tablet_id,
     internal_get_tablet_stats(code, msg, txn, instance_id_, tablet_idx, *tablet_stats);
     if (code == MetaServiceCode::TABLET_NOT_FOUND) {
         // Tablet was deleted, skip
+        VLOG_DEBUG << "tablet stats not found, tablet " << tablet_id;
         return 1;
     } else if (code != MetaServiceCode::OK) {
         LOG_WARNING("failed to get tablet stats")
@@ -1203,6 +1244,7 @@ int MigrateExecutor::migrate_tablet_stats_key(int64_t tablet_id) {
         LOG_WARNING("failed to commit txn to migrate tablet stats keys").tag("error", err);
         return -1;
     } else {
+        VLOG_DEBUG << "migrate tablet stats keys for tablet " << tablet_id;
         return 0;
     }
 }
