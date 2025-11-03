@@ -2079,6 +2079,13 @@ std::pair<MetaServiceCode, std::string> SnapshotManager::set_multi_version_statu
     if (current_status == MultiVersionStatus::MULTI_VERSION_DISABLED &&
         multi_version_status == MultiVersionStatus::MULTI_VERSION_WRITE_ONLY) {
         clear_mv_key_space(txn.get(), instance_id);
+        instance_info.clear_migrated_key_sets();
+    }
+
+    // Disable snapshot switch when multi version is disabled.
+    if (current_status != MultiVersionStatus::MULTI_VERSION_DISABLED &&
+        multi_version_status == MultiVersionStatus::MULTI_VERSION_DISABLED) {
+        instance_info.set_snapshot_switch_status(SnapshotSwitchStatus::SNAPSHOT_SWITCH_DISABLED);
     }
 
     instance_info.set_multi_version_status(multi_version_status);
@@ -2098,9 +2105,16 @@ std::pair<MetaServiceCode, std::string> SnapshotManager::set_multi_version_statu
     // Notify ResourceManager to refresh instance cache
     notify_refresh_instance(txn_kv_, instance_id, nullptr, /*include_self=*/true);
 
+    SnapshotSwitchStatus new_switch_status =
+            instance_info.has_snapshot_switch_status()
+                    ? instance_info.snapshot_switch_status()
+                    : SnapshotSwitchStatus::SNAPSHOT_SWITCH_DISABLED;
     LOG_INFO("set_multi_version_status completed")
             .tag("instance_id", instance_id)
-            .tag("multi_version_status", multi_version_status);
+            .tag("old_switch_status", SnapshotSwitchStatus_Name(snapshot_switch_status))
+            .tag("old_mv_status", MultiVersionStatus_Name(current_status))
+            .tag("multi_version_status", MultiVersionStatus_Name(multi_version_status))
+            .tag("snapshot_switch_status", SnapshotSwitchStatus_Name(new_switch_status));
 
     return {MetaServiceCode::OK, "success"};
 }
