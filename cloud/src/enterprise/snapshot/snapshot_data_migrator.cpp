@@ -30,6 +30,15 @@ namespace selectdb {
 static constexpr int MAX_RETRY_TIMES = 5;
 static constexpr int RETRY_INTERVAL_MS = 100;
 
+struct SnapshotDataMigrateContext {
+    std::mutex mutex;
+
+    // The indexes that have been migrated.
+    std::unordered_set<int64_t> migrated_indexes;
+    // The partitions that have been migrated.
+    std::unordered_set<int64_t> migrated_partitions;
+};
+
 static inline bool is_partition_migrated(SnapshotDataMigrateContext& migrate_context,
                                          int64_t partition_id) {
     std::unique_lock lock(migrate_context.mutex);
@@ -44,11 +53,8 @@ static inline bool is_index_migrated(SnapshotDataMigrateContext& migrate_context
 
 class MigrateExecutor {
 public:
-    MigrateExecutor(const std::string& instance_id, std::shared_ptr<TxnKv> txn_kv,
-                    SnapshotDataMigrateContext& migrate_context)
-            : instance_id_(instance_id),
-              txn_kv_(std::move(txn_kv)),
-              migrate_context_(migrate_context) {}
+    MigrateExecutor(const std::string& instance_id, std::shared_ptr<TxnKv> txn_kv)
+            : instance_id_(instance_id), txn_kv_(std::move(txn_kv)) {}
     ~MigrateExecutor() = default;
 
     // Migrate table version keys to versioned keys
@@ -195,7 +201,7 @@ private:
 
     const std::string instance_id_;
     std::shared_ptr<TxnKv> txn_kv_;
-    SnapshotDataMigrateContext& migrate_context_;
+    SnapshotDataMigrateContext migrate_context_;
 };
 
 int MigrateExecutor::migrate_table_version_key(int64_t db_id, int64_t table_id) {
@@ -1424,7 +1430,7 @@ int SnapshotManager::migrate_to_versioned_keys(InstanceDataMigrator* migrator) {
     std::string instance_id(migrator->instance_id());
     const InstanceInfoPB& instance = migrator->instance_info();
     AnnotateTag instance_tag("instance", instance_id);
-    MigrateExecutor executor(instance_id, txn_kv_, migrator->get_migrate_context());
+    MigrateExecutor executor(instance_id, txn_kv_);
 
     // ATTN: Order matters, some key sets depend on others being migrated first.
     //
