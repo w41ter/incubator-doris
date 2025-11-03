@@ -119,33 +119,25 @@ public class CloneSnapshotState {
         checkNotNull("from_snapshot_id", fromSnapshotId);
         checkNotNull("instance_id", instanceId);
         checkNotNull("name", name);
-        if (isSucceed == null && isReadOnly == null) {
-            throw new IllegalArgumentException("either set is_succeed or is_read_only");
+        if (isReadOnly()) {
+            throw new IllegalArgumentException("read only clone is not supported yet");
         }
-        if (isSucceed != null && isReadOnly != null && isSucceed.booleanValue()) {
-            throw new IllegalArgumentException("either set is_succeed or is_read_only");
-        }
-        if (isSucceed != null && isSucceed.booleanValue() && objInfo != null) {
+        if (isSucceed() && objInfo != null) {
             throw new IllegalArgumentException("obj_info must be null when is_succeed is true");
         }
-        if (isReadOnly != null) {
-            if (isReadOnly.booleanValue()) {
-                if (objInfo != null) {
-                    throw new IllegalArgumentException("obj_info must be null when is_read_only is true");
-                }
-            } else {
-                if (objInfo == null) {
-                    throw new IllegalArgumentException("obj_info is null");
-                }
-                checkNotNull("obj_info.ak", objInfo.ak);
-                checkNotNull("obj_info.sk", objInfo.sk);
-                checkNotNull("obj_info.bucket", objInfo.bucket);
-                // prefix can be empty
-                checkNotNull("obj_info.endpoint", objInfo.endpoint);
-                checkNotNull("obj_info.external_endpoint", objInfo.externalEndpoint);
-                checkNotNull("obj_info.region", objInfo.region);
-                checkNotNull("obj_info.provider", objInfo.provider);
+        if (!isSucceed()) {
+            // Since read only clone is not supported yet, so objInfo must not be null
+            if (objInfo == null) {
+                throw new IllegalArgumentException("obj_info is null, it is required for writeable clone");
             }
+            checkNotNull("obj_info.ak", objInfo.ak);
+            checkNotNull("obj_info.sk", objInfo.sk);
+            checkNotNull("obj_info.bucket", objInfo.bucket);
+            // prefix can be empty
+            checkNotNull("obj_info.endpoint", objInfo.endpoint);
+            checkNotNull("obj_info.external_endpoint", objInfo.externalEndpoint);
+            checkNotNull("obj_info.region", objInfo.region);
+            checkNotNull("obj_info.provider", objInfo.provider);
         }
     }
 }
