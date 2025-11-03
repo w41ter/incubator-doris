@@ -966,8 +966,7 @@ TEST(MigrateSnapshotKeysTest, Basic) {
     {
         InstanceInfoPB instance_info;
         get_instance(meta_service.get(), cloud_unique_id, instance_info);
-        SnapshotDataMigrateContext context;
-        InstanceDataMigrator migrator(txn_kv, instance_info, context);
+        InstanceDataMigrator migrator(txn_kv, instance_info);
         ASSERT_EQ(migrator.do_migrate(), 0);
         enable_instance_multi_version_read_write(meta_service.get(), instance_id);
 
@@ -1059,8 +1058,7 @@ TEST(MigrateSnapshotKeysTest, Insert) {
     {
         InstanceInfoPB instance_info;
         get_instance(meta_service.get(), cloud_unique_id, instance_info);
-        SnapshotDataMigrateContext context;
-        InstanceDataMigrator migrator(txn_kv, instance_info, context);
+        InstanceDataMigrator migrator(txn_kv, instance_info);
         ASSERT_EQ(migrator.do_migrate(), 0);
         enable_instance_multi_version_read_write(meta_service.get(), instance_id);
 
@@ -1167,8 +1165,7 @@ TEST(MigrateSnapshotKeysTest, Compaction) {
     {
         InstanceInfoPB instance_info;
         get_instance(meta_service.get(), cloud_unique_id, instance_info);
-        SnapshotDataMigrateContext context;
-        InstanceDataMigrator migrator(txn_kv, instance_info, context);
+        InstanceDataMigrator migrator(txn_kv, instance_info);
         ASSERT_EQ(migrator.do_migrate(), 0);
         enable_instance_multi_version_read_write(meta_service.get(), instance_id);
 
@@ -1367,8 +1364,7 @@ TEST(MigrateSnapshotKeysTest, SchemaChange) {
     {
         InstanceInfoPB instance_info;
         get_instance(meta_service.get(), cloud_unique_id, instance_info);
-        SnapshotDataMigrateContext context;
-        InstanceDataMigrator migrator(txn_kv, instance_info, context);
+        InstanceDataMigrator migrator(txn_kv, instance_info);
         ASSERT_EQ(migrator.do_migrate(), 0);
         enable_instance_multi_version_read_write(meta_service.get(), instance_id);
 
