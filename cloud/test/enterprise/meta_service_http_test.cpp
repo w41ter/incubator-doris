@@ -353,6 +353,7 @@ TEST(MetaServiceHttpTest, SetSnapshotPropertyHttpTest) {
         InstanceInfoPB instance;
         instance.ParseFromString(val);
         instance.set_snapshot_switch_status(SNAPSHOT_SWITCH_OFF);
+        instance.set_multi_version_status(MULTI_VERSION_READ_WRITE);
         val = instance.SerializeAsString();
         txn->put(key, val);
         ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
@@ -447,6 +448,7 @@ TEST(MetaServiceHttpTest, GetSnapshotPropertyHttpTest) {
         InstanceInfoPB instance;
         instance.ParseFromString(val);
         instance.set_snapshot_switch_status(SNAPSHOT_SWITCH_OFF);
+        instance.set_multi_version_status(MULTI_VERSION_READ_WRITE);
         val = instance.SerializeAsString();
         txn->put(key, val);
         ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);

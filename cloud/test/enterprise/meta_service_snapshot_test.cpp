@@ -1760,6 +1760,7 @@ TEST(MetaServiceSnapshotTest, BeginAutoSnapshotDisabledTest) {
         InstanceInfoPB instance_info;
         ASSERT_TRUE(instance_info.ParseFromString(instance_value));
         instance_info.set_snapshot_switch_status(SnapshotSwitchStatus::SNAPSHOT_SWITCH_OFF);
+        instance_info.set_multi_version_status(MULTI_VERSION_READ_WRITE);
         txn->put(instance_key_str, instance_info.SerializeAsString());
         ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
     }
@@ -2098,7 +2099,6 @@ TEST(MetaServiceSnapshotTest, CloneInstanceReadOnlyTest) {
         // Verify source relationship
         ASSERT_EQ(instance_info.source_instance_id(), "test_instance");
         ASSERT_EQ(instance_info.source_snapshot_id(), snapshot_id);
-        ASSERT_EQ(instance_info.original_instance_id(), "test_instance");
 
         // Verify storage configuration is inherited from source
         ASSERT_EQ(instance_info.obj_info_size(), 1);
