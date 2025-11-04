@@ -73,6 +73,7 @@ void SnapshotDataMigrator::stop() {
 }
 
 void SnapshotDataMigrator::migration_loop() {
+    pthread_setname_np(pthread_self(), "SNAP_MIGRATOR");
     while (!stopped()) {
         // fetch instance to check
         InstanceInfoPB instance;
@@ -348,6 +349,12 @@ int InstanceDataMigrator::enable_instance_snapshot_switch() {
         LOG_WARNING("failed to parse instance info in data migration")
                 .tag("instance_id", instance_id_);
         return -1;
+    }
+
+    if (instance_info.multi_version_status() == MultiVersionStatus::MULTI_VERSION_DISABLED) {
+        LOG_WARNING("instance multi version status is disabled, no need to enable snapshot switch")
+                .tag("instance_id", instance_id_);
+        return 0;
     }
 
     instance_info.set_snapshot_switch_status(SnapshotSwitchStatus::SNAPSHOT_SWITCH_OFF);
