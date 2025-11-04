@@ -39,6 +39,7 @@ import org.apache.doris.persist.meta.MetaReader;
 import org.apache.doris.rpc.RpcException;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.common.base.Preconditions;
 import com.google.common.collect.Queues;
 import org.apache.commons.codec.digest.DigestUtils;
 import org.apache.logging.log4j.LogManager;
@@ -542,50 +543,55 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
     }
 
     private void loadSnapshotImage(File imageFile, File editLogFile) throws IOException, DdlException {
-        CloudSnapshotEnv cloudSnapshotEnv = new CloudSnapshotEnv(true);
-        // load image
-        long imageJournalId = 0;
-        if (imageFile != null) {
-            imageJournalId = Long.parseLong(parseFileName(imageFile, 3, 1));
-            MetaReader.read(imageFile, cloudSnapshotEnv);
-            LOG.info("finished load image from cluster snapshot: {}, imageJournalId: {}",
-                    imageFile.getAbsolutePath(), imageJournalId);
-        }
-
-        // replay edit log
-        long replayedJournalId = imageJournalId;
-        if (editLogFile != null) {
-            DataInputStream currentStream = new DataInputStream(
-                    new BufferedInputStream(new EditLogFileInputStream(editLogFile)));
-            try {
-                while (true) {
-                    JournalEntity entity = new JournalEntity();
-                    entity.readFields(currentStream);
-                    if (entity.getOpCode() == OperationType.OP_LOCAL_EOF) {
-                        break;
-                    }
-                    replayedJournalId++;
-                    EditLog.loadJournal(cloudSnapshotEnv, replayedJournalId, entity);
-                }
-            } catch (IOException e) {
-                try {
-                    currentStream.close();
-                } catch (IOException e1) {
-                    LOG.error("failed to close cluster snapshot edit log", e1);
-                }
-                if (!(e instanceof EOFException)) {
-                    LOG.error("failed to replay cluster snapshot edit log", e);
-                    System.exit(-1);
-                }
+        try {
+            CloudSnapshotEnv cloudSnapshotEnv = CloudSnapshotEnv.createAndGetInstance();
+            // load image
+            long imageJournalId = 0;
+            if (imageFile != null) {
+                imageJournalId = Long.parseLong(parseFileName(imageFile, 3, 1));
+                MetaReader.read(imageFile, cloudSnapshotEnv);
+                LOG.info("finished load image from cluster snapshot: {}, imageJournalId: {}",
+                        imageFile.getAbsolutePath(), imageJournalId);
             }
-            LOG.info("finished replay edit logs from cluster snapshot: {}, replayedJournalId: {}",
-                    editLogFile.getAbsolutePath(), replayedJournalId);
-        }
 
-        // generate new image
-        cloudSnapshotEnv.setReplayedJournalId(replayedJournalId);
-        String latestImageFilePath = cloudSnapshotEnv.saveImage();
-        LOG.info("save image to {}, replayedJournalId: {}", latestImageFilePath, replayedJournalId);
+            // replay edit log
+            long replayedJournalId = imageJournalId;
+            if (editLogFile != null) {
+                DataInputStream currentStream = new DataInputStream(
+                        new BufferedInputStream(new EditLogFileInputStream(editLogFile)));
+                try {
+                    while (true) {
+                        JournalEntity entity = new JournalEntity();
+                        entity.readFields(currentStream);
+                        if (entity.getOpCode() == OperationType.OP_LOCAL_EOF) {
+                            break;
+                        }
+                        replayedJournalId++;
+                        EditLog.loadJournal(cloudSnapshotEnv, replayedJournalId, entity);
+                    }
+                } catch (IOException e) {
+                    try {
+                        currentStream.close();
+                    } catch (IOException e1) {
+                        LOG.error("failed to close cluster snapshot edit log", e1);
+                    }
+                    if (!(e instanceof EOFException)) {
+                        LOG.error("failed to replay cluster snapshot edit log", e);
+                        System.exit(-1);
+                    }
+                }
+                LOG.info("finished replay edit logs from cluster snapshot: {}, replayedJournalId: {}",
+                        editLogFile.getAbsolutePath(), replayedJournalId);
+            }
+
+            // generate new image
+            cloudSnapshotEnv.setReplayedJournalId(replayedJournalId);
+            String latestImageFilePath = cloudSnapshotEnv.saveImage();
+            LOG.info("save image to {}, replayedJournalId: {}", latestImageFilePath, replayedJournalId);
+        } finally {
+            CloudSnapshotEnv.resetInstance();
+            Preconditions.checkState(CloudSnapshotEnv.getInstance() == null);
+        }
     }
 
     private void createDir(String dir) {

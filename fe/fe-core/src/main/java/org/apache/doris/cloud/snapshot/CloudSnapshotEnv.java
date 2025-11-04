@@ -29,9 +29,32 @@ import java.util.concurrent.atomic.AtomicLong;
 public class CloudSnapshotEnv extends CloudEnv {
 
     private static final Logger LOG = LogManager.getLogger(CloudSnapshotEnv.class);
+    private static CloudSnapshotEnv instance = null;
 
     public CloudSnapshotEnv(boolean isCheckpointCatalog) {
         super(isCheckpointCatalog);
+    }
+
+    public static CloudSnapshotEnv createAndGetInstance() {
+        if (instance != null) {
+            return instance;
+        }
+        synchronized (CloudSnapshotEnv.class) {
+            if (instance == null) {
+                instance = new CloudSnapshotEnv(false);
+            }
+            return instance;
+        }
+    }
+
+    public static void resetInstance() {
+        synchronized (CloudSnapshotEnv.class) {
+            instance = null;
+        }
+    }
+
+    public static CloudSnapshotEnv getInstance() {
+        return instance;
     }
 
     @Override
