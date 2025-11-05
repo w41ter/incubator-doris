@@ -2414,7 +2414,7 @@ TEST(MetaServiceSnapshotTest, CloneInstanceRollbackTest) {
         req.set_clone_type(CloneInstanceRequest::ROLLBACK);
         req.set_from_instance_id("test_instance");
         req.set_from_snapshot_id(snapshot_id);
-        req.set_new_instance_id("test_instance"); // Same as source for rollback
+        req.set_new_instance_id("test_instance_rollback"); // Different from source for rollback
 
         CloneInstanceResponse res;
         meta_service->clone_instance(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
@@ -2424,17 +2424,18 @@ TEST(MetaServiceSnapshotTest, CloneInstanceRollbackTest) {
         ASSERT_TRUE(res.has_obj_info());
     }
 
-    // Verify rollback updated instance correctly
+    // Verify rollback created new instance correctly
     {
         std::unique_ptr<Transaction> txn;
         ASSERT_EQ(meta_service->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
-        std::string instance_key_str = instance_key("test_instance");
+        std::string instance_key_str = instance_key("test_instance_rollback");
         std::string instance_value;
         ASSERT_EQ(txn->get(instance_key_str, &instance_value), TxnErrorCode::TXN_OK);
 
         InstanceInfoPB instance_info;
         ASSERT_TRUE(instance_info.ParseFromString(instance_value));
         ASSERT_EQ(instance_info.source_snapshot_id(), snapshot_id);
+        ASSERT_EQ(instance_info.source_instance_id(), "test_instance");
         ASSERT_EQ(instance_info.original_instance_id(), "test_instance");
     }
 }
@@ -2549,6 +2550,24 @@ TEST(MetaServiceSnapshotTest, CloneInstanceParameterValidationTest) {
         ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
         ASSERT_TRUE(res.status().msg().find("WRITABLE clone requires obj_info") !=
                     std::string::npos);
+    }
+
+    // Test clone with same from_instance_id and new_instance_id
+    {
+        brpc::Controller cntl;
+        CloneInstanceRequest req;
+        req.set_clone_type(CloneInstanceRequest::READ_ONLY);
+        req.set_from_instance_id("same_instance");
+        req.set_from_snapshot_id("1234567890abcdef1234");
+        req.set_new_instance_id("same_instance"); // Same as source - should fail
+
+        CloneInstanceResponse res;
+        meta_service->clone_instance(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                     &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+        ASSERT_TRUE(
+                res.status().msg().find("from_instance_id and new_instance_id must be different") !=
+                std::string::npos);
     }
 }
 

@@ -1076,6 +1076,12 @@ MetaServiceCode SnapshotManager::validate_clone_request(const CloneInstanceReque
         return MetaServiceCode::INVALID_ARGUMENT;
     }
 
+    // For all clone types, from_instance_id and new_instance_id must be different
+    if (request.from_instance_id() == request.new_instance_id()) {
+        *error_msg = "from_instance_id and new_instance_id must be different";
+        return MetaServiceCode::INVALID_ARGUMENT;
+    }
+
     if (clone_type == CloneInstanceRequest::WRITABLE) {
         return validate_writable_clone_request(request, error_msg);
     }
