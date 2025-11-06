@@ -843,6 +843,22 @@ void enable_instance_multi_version_read_write(MetaServiceProxy* meta_service,
     ASSERT_TRUE(meta_service->resource_mgr()->is_version_read_enabled(instance_id));
 }
 
+void enable_instance_multi_version_disabled(MetaServiceProxy* meta_service,
+                                            const std::string& instance_id) {
+    std::string path = "set_multi_version_status";
+    std::unordered_map<std::string, std::string> params = {
+            {"token", config::http_token},
+            {"instance_id", instance_id},
+            {"multi_version_status", "MULTI_VERSION_DISABLED"},
+    };
+
+    rapidjson::Document document;
+    issue_http_request(meta_service, brpc::HTTP_METHOD_POST, path, params, &document);
+    meta_service->resource_mgr()->refresh_instance(instance_id);
+    ASSERT_FALSE(meta_service->resource_mgr()->is_version_read_enabled(instance_id));
+    ASSERT_FALSE(meta_service->resource_mgr()->is_version_write_enabled(instance_id));
+}
+
 struct SnapshotProperty {
     SnapshotSwitchStatus status;
     int64_t max_reserved_snapshots;
@@ -940,6 +956,19 @@ std::string dump_range(TxnKv* txn_kv, std::string_view begin = "", std::string_v
     return buffer;
 }
 
+void tablet_stats_must_equals(const TabletStatsPB& old_stats, const TabletStatsPB& new_stats) {
+    ASSERT_EQ(new_stats.base_compaction_cnt(), old_stats.base_compaction_cnt());
+    ASSERT_EQ(new_stats.cumulative_compaction_cnt(), old_stats.cumulative_compaction_cnt());
+    ASSERT_EQ(new_stats.full_compaction_cnt(), old_stats.full_compaction_cnt());
+    ASSERT_EQ(new_stats.cumulative_point(), old_stats.cumulative_point());
+    ASSERT_EQ(new_stats.num_rows(), old_stats.num_rows());
+    ASSERT_EQ(new_stats.num_segments(), old_stats.num_segments());
+    ASSERT_EQ(new_stats.num_rowsets(), old_stats.num_rowsets());
+    ASSERT_EQ(new_stats.data_size(), old_stats.data_size());
+    ASSERT_EQ(new_stats.index_size(), old_stats.index_size());
+    ASSERT_EQ(new_stats.segment_size(), old_stats.segment_size());
+}
+
 TEST(MigrateSnapshotKeysTest, Basic) {
     auto meta_service = get_meta_service();
     auto txn_kv = meta_service->txn_kv();
@@ -997,15 +1026,12 @@ TEST(MigrateSnapshotKeysTest, Basic) {
 
     TabletStatsPB new_tablet_stats;
     get_tablet_stats(meta_service.get(), cloud_unique_id, tablet_id, new_tablet_stats);
-    ASSERT_EQ(new_tablet_stats.base_compaction_cnt(), old_tablet_stats.base_compaction_cnt());
-    ASSERT_EQ(new_tablet_stats.cumulative_compaction_cnt(),
-              old_tablet_stats.cumulative_compaction_cnt());
-    ASSERT_EQ(new_tablet_stats.full_compaction_cnt(), old_tablet_stats.full_compaction_cnt());
-    ASSERT_EQ(new_tablet_stats.cumulative_point(), old_tablet_stats.cumulative_point());
-    ASSERT_EQ(new_tablet_stats.num_rows(), old_tablet_stats.num_rows());
-    ASSERT_EQ(new_tablet_stats.num_segments(), old_tablet_stats.num_segments());
-    ASSERT_EQ(new_tablet_stats.data_size(), old_tablet_stats.data_size());
-    ASSERT_EQ(new_tablet_stats.index_size(), old_tablet_stats.index_size());
+    tablet_stats_must_equals(new_tablet_stats, old_tablet_stats);
+
+    // Switch back to multi-version disabled, test the tablet stats is compatible.
+    enable_instance_multi_version_disabled(meta_service.get(), instance_id);
+    get_tablet_stats(meta_service.get(), cloud_unique_id, tablet_id, old_tablet_stats);
+    tablet_stats_must_equals(new_tablet_stats, old_tablet_stats);
 }
 
 TEST(MigrateSnapshotKeysTest, Insert) {
@@ -1086,15 +1112,12 @@ TEST(MigrateSnapshotKeysTest, Insert) {
 
     TabletStatsPB new_tablet_stats;
     get_tablet_stats(meta_service.get(), cloud_unique_id, tablet_id, new_tablet_stats);
-    ASSERT_EQ(new_tablet_stats.base_compaction_cnt(), old_tablet_stats.base_compaction_cnt());
-    ASSERT_EQ(new_tablet_stats.cumulative_compaction_cnt(),
-              old_tablet_stats.cumulative_compaction_cnt());
-    ASSERT_EQ(new_tablet_stats.full_compaction_cnt(), old_tablet_stats.full_compaction_cnt());
-    ASSERT_EQ(new_tablet_stats.cumulative_point(), old_tablet_stats.cumulative_point());
-    ASSERT_EQ(new_tablet_stats.num_rows(), old_tablet_stats.num_rows());
-    ASSERT_EQ(new_tablet_stats.num_segments(), old_tablet_stats.num_segments());
-    ASSERT_EQ(new_tablet_stats.data_size(), old_tablet_stats.data_size());
-    ASSERT_EQ(new_tablet_stats.index_size(), old_tablet_stats.index_size());
+    tablet_stats_must_equals(new_tablet_stats, old_tablet_stats);
+
+    // Switch back to multi-version disabled, test the tablet stats is compatible.
+    enable_instance_multi_version_disabled(meta_service.get(), instance_id);
+    get_tablet_stats(meta_service.get(), cloud_unique_id, tablet_id, old_tablet_stats);
+    tablet_stats_must_equals(new_tablet_stats, old_tablet_stats);
 }
 
 TEST(MigrateSnapshotKeysTest, Compaction) {
@@ -1177,15 +1200,7 @@ TEST(MigrateSnapshotKeysTest, Compaction) {
 
     TabletStatsPB new_tablet_stats;
     get_tablet_stats(meta_service.get(), cloud_unique_id, tablet_id, new_tablet_stats);
-    ASSERT_EQ(new_tablet_stats.base_compaction_cnt(), old_tablet_stats.base_compaction_cnt());
-    ASSERT_EQ(new_tablet_stats.cumulative_compaction_cnt(),
-              old_tablet_stats.cumulative_compaction_cnt());
-    ASSERT_EQ(new_tablet_stats.full_compaction_cnt(), old_tablet_stats.full_compaction_cnt());
-    ASSERT_EQ(new_tablet_stats.cumulative_point(), old_tablet_stats.cumulative_point());
-    ASSERT_EQ(new_tablet_stats.num_rows(), old_tablet_stats.num_rows());
-    ASSERT_EQ(new_tablet_stats.num_segments(), old_tablet_stats.num_segments());
-    ASSERT_EQ(new_tablet_stats.data_size(), old_tablet_stats.data_size());
-    ASSERT_EQ(new_tablet_stats.index_size(), old_tablet_stats.index_size());
+    tablet_stats_must_equals(new_tablet_stats, old_tablet_stats);
 
     // Phase 4: Multi-version mode - insert 2 more rowsets (version 10-11)
     for (int i = 8; i < 10; i++) {
@@ -1236,6 +1251,150 @@ TEST(MigrateSnapshotKeysTest, Compaction) {
     TabletMetaCloudPB tablet_meta;
     get_tablet_meta(meta_service.get(), cloud_unique_id, tablet_id, &tablet_meta);
     ASSERT_EQ(tablet_meta.tablet_id(), tablet_id);
+
+    // Switch back to multi-version disabled, test the tablet stats is compatible.
+    get_tablet_stats(meta_service.get(), cloud_unique_id, tablet_id, new_tablet_stats);
+    enable_instance_multi_version_disabled(meta_service.get(), instance_id);
+    get_tablet_stats(meta_service.get(), cloud_unique_id, tablet_id, old_tablet_stats);
+    tablet_stats_must_equals(new_tablet_stats, old_tablet_stats);
+}
+
+TEST(MigrateSnapshotKeysTest, CompactionAfterMigrated) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "migrate_snapshot_keys_compaction_after_migrated_test_instance";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+
+    for (int i = 0; i < 5; i++) {
+        insert_rowset(meta_service.get(), cloud_unique_id, db_id, fmt::format("label_{}", i),
+                      table_id, partition_id, tablet_id);
+    }
+
+    TabletStatsPB old_tablet_stats;
+    get_tablet_stats(meta_service.get(), cloud_unique_id, tablet_id, old_tablet_stats);
+
+    enable_instance_multi_version_write_only(meta_service.get(), instance_id);
+
+    // Migrate old keys and switch to multi-version read write
+    {
+        InstanceInfoPB instance_info;
+        get_instance(meta_service.get(), cloud_unique_id, instance_info);
+        InstanceDataMigrator migrator(txn_kv, instance_info);
+        ASSERT_EQ(migrator.do_migrate(), 0);
+        enable_instance_multi_version_read_write(meta_service.get(), instance_id);
+
+        // Check the snapshot properties
+        SnapshotProperty property;
+        get_instance_snapshot_properties(meta_service.get(), instance_id, &property);
+        ASSERT_EQ(property.status, SnapshotSwitchStatus::SNAPSHOT_SWITCH_OFF);
+    }
+
+    // Check tablet stats after migration
+    TabletStatsPB new_tablet_stats;
+    get_tablet_stats(meta_service.get(), cloud_unique_id, tablet_id, new_tablet_stats);
+    tablet_stats_must_equals(new_tablet_stats, old_tablet_stats);
+
+    // Phase 1: Single version mode - compact version 2-4
+    {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, 6, rowsets);
+        ASSERT_EQ(rowsets.size(), 6);
+
+        compact_rowsets_cumulative(meta_service.get(), cloud_unique_id, db_id, "compaction_label_1",
+                                   table_id, partition_id, tablet_id, 2, 4, 300);
+
+        // Verify: should have 4 rowsets: [0-1], [2-4], [5-5], [6-6]
+        rowsets.clear();
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, 6, rowsets);
+        ASSERT_EQ(rowsets.size(), 4);
+    }
+
+    // Phase 2: Dual write mode - insert 3 more rowsets (version 7-9)
+    for (int i = 5; i < 8; i++) {
+        insert_rowset(meta_service.get(), cloud_unique_id, db_id, fmt::format("label_{}", i),
+                      table_id, partition_id, tablet_id);
+    }
+
+    // Phase 2: Dual write mode - compact version 5-7 (cross migration boundary)
+    {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, 9, rowsets);
+        // [0-1], [2-4], [5-5], [6-6], [7-7], [8-8], [9-9] - 3 + 3 = 7, but [5-7] will be compacted
+        ASSERT_EQ(rowsets.size(), 7);
+
+        compact_rowsets_cumulative(meta_service.get(), cloud_unique_id, db_id, "compaction_label_2",
+                                   table_id, partition_id, tablet_id, 5, 7, 300);
+
+        // Verify rowsets
+        rowsets.clear();
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, 9, rowsets);
+        ASSERT_EQ(rowsets.size(), 5); // [0-1], [2-4], [5-7], [8-8], [9-9]
+    }
+
+    // Phase 4: Multi-version mode - insert 2 more rowsets (version 10-11)
+    for (int i = 8; i < 10; i++) {
+        insert_rowset(meta_service.get(), cloud_unique_id, db_id, fmt::format("label_{}", i),
+                      table_id, partition_id, tablet_id);
+    }
+
+    // Phase 4: Multi-version mode - compact version 8-10
+    {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, 11, rowsets);
+        ASSERT_EQ(rowsets.size(), 7); // [0-1], [2-4], [5-7], [8-8], [9-9], [10-10], [11-11]
+
+        compact_rowsets_cumulative(meta_service.get(), cloud_unique_id, db_id, "compaction_label_3",
+                                   table_id, partition_id, tablet_id, 8, 10, 300);
+
+        // Verify rowsets
+        rowsets.clear();
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, 11, rowsets);
+        ASSERT_EQ(rowsets.size(), 5); // [0-1], [2-4], [5-7], [8-10], [11-11]
+    }
+
+    // Final check: Get all rowsets and verify versions
+    {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, 11, rowsets);
+        ASSERT_EQ(rowsets.size(), 5); // [0-1], [2-4], [5-7], [8-10], [11-11]
+
+        // Verify version continuity
+        ASSERT_EQ(rowsets[0].start_version(), 0);
+        ASSERT_EQ(rowsets[0].end_version(), 1);
+        ASSERT_EQ(rowsets[1].start_version(), 2);
+        ASSERT_EQ(rowsets[1].end_version(), 4);
+        ASSERT_EQ(rowsets[2].start_version(), 5);
+        ASSERT_EQ(rowsets[2].end_version(), 7);
+        ASSERT_EQ(rowsets[3].start_version(), 8);
+        ASSERT_EQ(rowsets[3].end_version(), 10);
+        ASSERT_EQ(rowsets[4].start_version(), 11);
+        ASSERT_EQ(rowsets[4].end_version(), 11);
+    }
+
+    int64_t partition_version = -1, table_version = -1;
+    get_partition_version(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                          &partition_version);
+    get_table_version(meta_service.get(), cloud_unique_id, db_id, table_id, &table_version);
+    ASSERT_EQ(partition_version, 11);
+    ASSERT_GE(table_version, 11);
+    TabletMetaCloudPB tablet_meta;
+    get_tablet_meta(meta_service.get(), cloud_unique_id, tablet_id, &tablet_meta);
+    ASSERT_EQ(tablet_meta.tablet_id(), tablet_id);
+
+    // Switch back to multi-version disabled, test the tablet stats is compatible.
+    get_tablet_stats(meta_service.get(), cloud_unique_id, tablet_id, new_tablet_stats);
+    enable_instance_multi_version_disabled(meta_service.get(), instance_id);
+    get_tablet_stats(meta_service.get(), cloud_unique_id, tablet_id, old_tablet_stats);
+    tablet_stats_must_equals(new_tablet_stats, old_tablet_stats);
 }
 
 TEST(MigrateSnapshotKeysTest, SchemaChange) {
@@ -1376,15 +1535,7 @@ TEST(MigrateSnapshotKeysTest, SchemaChange) {
 
     TabletStatsPB new_tablet_stats;
     get_tablet_stats(meta_service.get(), cloud_unique_id, new_tablet_id_2, new_tablet_stats);
-    ASSERT_EQ(new_tablet_stats.base_compaction_cnt(), old_tablet_stats.base_compaction_cnt());
-    ASSERT_EQ(new_tablet_stats.cumulative_compaction_cnt(),
-              old_tablet_stats.cumulative_compaction_cnt());
-    ASSERT_EQ(new_tablet_stats.full_compaction_cnt(), old_tablet_stats.full_compaction_cnt());
-    ASSERT_EQ(new_tablet_stats.cumulative_point(), old_tablet_stats.cumulative_point());
-    ASSERT_EQ(new_tablet_stats.num_rows(), old_tablet_stats.num_rows());
-    ASSERT_EQ(new_tablet_stats.num_segments(), old_tablet_stats.num_segments());
-    ASSERT_EQ(new_tablet_stats.data_size(), old_tablet_stats.data_size());
-    ASSERT_EQ(new_tablet_stats.index_size(), old_tablet_stats.index_size());
+    tablet_stats_must_equals(new_tablet_stats, old_tablet_stats);
 
     // Phase 4: Multi-version mode - insert 2 more rowsets to new_tablet_2 (version 10-11)
     for (int i = 8; i < 10; i++) {
@@ -1416,4 +1567,322 @@ TEST(MigrateSnapshotKeysTest, SchemaChange) {
     TabletMetaCloudPB tablet_meta;
     get_tablet_meta(meta_service.get(), cloud_unique_id, new_tablet_id_2, &tablet_meta);
     ASSERT_EQ(tablet_meta.tablet_id(), new_tablet_id_2);
+
+    // Switch back to multi-version disabled, test the tablet stats is compatible.
+    get_tablet_stats(meta_service.get(), cloud_unique_id, new_tablet_id_2, new_tablet_stats);
+    enable_instance_multi_version_disabled(meta_service.get(), instance_id);
+    get_tablet_stats(meta_service.get(), cloud_unique_id, new_tablet_id_2, old_tablet_stats);
+    tablet_stats_must_equals(new_tablet_stats, old_tablet_stats);
+}
+
+TEST(MigrateSnapshotKeysTest, SchemaChangeAfterMigrated) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "migrate_snapshot_keys_schema_change_after_migrated_test_instance";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4;
+    int64_t old_tablet_id = 5, new_tablet_id_1 = 6, new_tablet_id_2 = 7;
+
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  old_tablet_id);
+
+    // Phase 1: Single version mode - insert 5 rowsets to old_tablet (version 2-6)
+    for (int i = 0; i < 5; i++) {
+        insert_rowset(meta_service.get(), cloud_unique_id, db_id, fmt::format("label_{}", i),
+                      table_id, partition_id, old_tablet_id);
+    }
+
+    TabletStatsPB old_tablet_stats;
+    get_tablet_stats(meta_service.get(), cloud_unique_id, old_tablet_id, old_tablet_stats);
+
+    enable_instance_multi_version_write_only(meta_service.get(), instance_id);
+
+    {
+        InstanceInfoPB instance_info;
+        get_instance(meta_service.get(), cloud_unique_id, instance_info);
+        InstanceDataMigrator migrator(txn_kv, instance_info);
+        ASSERT_EQ(migrator.do_migrate(), 0);
+        enable_instance_multi_version_read_write(meta_service.get(), instance_id);
+
+        // Check the snapshot properties
+        SnapshotProperty property;
+        get_instance_snapshot_properties(meta_service.get(), instance_id, &property);
+        ASSERT_EQ(property.status, SnapshotSwitchStatus::SNAPSHOT_SWITCH_OFF);
+    }
+
+    TabletStatsPB new_tablet_stats;
+    get_tablet_stats(meta_service.get(), cloud_unique_id, old_tablet_id, new_tablet_stats);
+    tablet_stats_must_equals(new_tablet_stats, old_tablet_stats);
+
+    // Phase 1: Single version mode - schema change from old_tablet to new_tablet_1
+    {
+        std::vector<doris::RowsetMetaCloudPB> output_rowsets;
+        std::string job_id = fmt::format("schema_change_{}_{}", old_tablet_id, new_tablet_id_1);
+        int64_t alter_version = 6;
+
+        // Create new tablet
+        create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                      new_tablet_id_1, TabletStatePB::PB_NOTREADY);
+
+        // Start schema change job
+        start_schema_change_job(meta_service.get(), cloud_unique_id, table_id, index_id,
+                                partition_id, old_tablet_id, new_tablet_id_1, job_id, "test_case",
+                                alter_version);
+
+        // Create output rowsets for new_tablet_1 (version 0-1, 2-6)
+        // First create the initial rowset [0-1]
+        {
+            int64_t txn_id = 100000;
+            auto output_rowset = create_rowset(txn_id, new_tablet_id_1, partition_id, 0, 100);
+            output_rowset.set_end_version(1);
+            output_rowsets.push_back(output_rowset);
+            prepare_rowset(meta_service.get(), cloud_unique_id, output_rowset);
+            commit_rowset(meta_service.get(), cloud_unique_id, output_rowset);
+        }
+        // Then create rowsets for version 2-6
+        for (int version = 2; version <= 6; version++) {
+            int64_t txn_id = 100000 + version;
+            auto output_rowset = create_rowset(txn_id, new_tablet_id_1, partition_id, version, 100);
+            output_rowsets.push_back(output_rowset);
+            prepare_rowset(meta_service.get(), cloud_unique_id, output_rowset);
+            commit_rowset(meta_service.get(), cloud_unique_id, output_rowset);
+        }
+
+        // Finish schema change
+        finish_schema_change_job(meta_service.get(), cloud_unique_id, old_tablet_id,
+                                 new_tablet_id_1, job_id, "test_case", output_rowsets);
+
+        // Verify new_tablet_1 has all rowsets
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id, new_tablet_id_1, 0, 6, rowsets);
+        ASSERT_EQ(rowsets.size(), 6); // [0-1], [2-2], [3-3], [4-4], [5-5], [6-6]
+    }
+
+    // Phase 2: Dual write mode - insert 3 more rowsets to new_tablet_1 (version 7-9)
+    for (int i = 5; i < 8; i++) {
+        insert_rowset(meta_service.get(), cloud_unique_id, db_id, fmt::format("label_{}", i),
+                      table_id, partition_id, new_tablet_id_1);
+    }
+
+    // Phase 2: Dual write mode - schema change from new_tablet_1 to new_tablet_2
+    {
+        std::vector<doris::RowsetMetaCloudPB> output_rowsets;
+        std::string job_id = fmt::format("schema_change_{}_{}", new_tablet_id_1, new_tablet_id_2);
+        int64_t alter_version = 9;
+
+        // Create new tablet
+        create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                      new_tablet_id_2, TabletStatePB::PB_NOTREADY);
+
+        // Start schema change job
+        start_schema_change_job(meta_service.get(), cloud_unique_id, table_id, index_id,
+                                partition_id, new_tablet_id_1, new_tablet_id_2, job_id, "test_case",
+                                alter_version);
+
+        // Create output rowsets for new_tablet_2 (version 0-1, 2-9)
+        // First create the initial rowset [0-1]
+        {
+            int64_t txn_id = 200000;
+            auto output_rowset = create_rowset(txn_id, new_tablet_id_2, partition_id, 0, 100);
+            output_rowset.set_end_version(1);
+            output_rowsets.push_back(output_rowset);
+            prepare_rowset(meta_service.get(), cloud_unique_id, output_rowset);
+            commit_rowset(meta_service.get(), cloud_unique_id, output_rowset);
+        }
+        // Then create rowsets for version 2-9
+        for (int version = 2; version <= 9; version++) {
+            int64_t txn_id = 200000 + version;
+            auto output_rowset = create_rowset(txn_id, new_tablet_id_2, partition_id, version, 100);
+            output_rowsets.push_back(output_rowset);
+            prepare_rowset(meta_service.get(), cloud_unique_id, output_rowset);
+            commit_rowset(meta_service.get(), cloud_unique_id, output_rowset);
+        }
+
+        // Finish schema change
+        finish_schema_change_job(meta_service.get(), cloud_unique_id, new_tablet_id_1,
+                                 new_tablet_id_2, job_id, "test_case", output_rowsets);
+
+        // Verify new_tablet_2 has all rowsets
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id, new_tablet_id_2, 0, 9, rowsets);
+        ASSERT_EQ(rowsets.size(), 9); // [0-1], [2-2], ..., [9-9]
+    }
+
+    // Phase 3: Multi-version mode - insert 2 more rowsets to new_tablet_2 (version 10-11)
+    for (int i = 8; i < 10; i++) {
+        insert_rowset(meta_service.get(), cloud_unique_id, db_id, fmt::format("label_{}", i),
+                      table_id, partition_id, new_tablet_id_2);
+    }
+
+    // Final check: Get all rowsets and verify versions on new_tablet_2
+    {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id, new_tablet_id_2, 0, 11, rowsets);
+        ASSERT_EQ(rowsets.size(), 11); // [0-1], [2-2], [3-3], ..., [11-11]
+
+        // Verify version continuity
+        ASSERT_EQ(rowsets[0].start_version(), 0);
+        ASSERT_EQ(rowsets[0].end_version(), 1);
+        for (int i = 1; i < 11; i++) {
+            ASSERT_EQ(rowsets[i].start_version(), i + 1);
+            ASSERT_EQ(rowsets[i].end_version(), i + 1);
+        }
+    }
+
+    int64_t partition_version = -1, table_version = -1;
+    get_partition_version(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                          &partition_version);
+    get_table_version(meta_service.get(), cloud_unique_id, db_id, table_id, &table_version);
+    ASSERT_EQ(partition_version, 11);
+    ASSERT_GE(table_version, 11);
+    TabletMetaCloudPB tablet_meta;
+    get_tablet_meta(meta_service.get(), cloud_unique_id, new_tablet_id_2, &tablet_meta);
+    ASSERT_EQ(tablet_meta.tablet_id(), new_tablet_id_2);
+
+    // Switch back to multi-version disabled, test the tablet stats is compatible.
+    get_tablet_stats(meta_service.get(), cloud_unique_id, new_tablet_id_2, new_tablet_stats);
+    enable_instance_multi_version_disabled(meta_service.get(), instance_id);
+    get_tablet_stats(meta_service.get(), cloud_unique_id, new_tablet_id_2, old_tablet_stats);
+    tablet_stats_must_equals(new_tablet_stats, old_tablet_stats);
+}
+
+// Like the previous test SchemaChangeAfterMigrated, but do some compaction before schema change
+TEST(MigrateSnapshotKeysTest, SchemaChangeAfterMigrated2) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "migrate_snapshot_keys_schema_change_after_migrated_2_test_instance";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4;
+    int64_t old_tablet_id = 5, new_tablet_id_1 = 6;
+
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  old_tablet_id);
+
+    // Phase 1: Single version mode - insert 5 rowsets to old_tablet (version 2-6)
+    for (int i = 0; i < 5; i++) {
+        insert_rowset(meta_service.get(), cloud_unique_id, db_id, fmt::format("label_{}", i),
+                      table_id, partition_id, old_tablet_id);
+    }
+
+    // Compact the rowsets, to update the tablet stats key, so that we can verify the tablet stats
+    // consistency after migration/schema change.
+    {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id, old_tablet_id, 0, 6, rowsets);
+        ASSERT_EQ(rowsets.size(), 6);
+        compact_rowsets_cumulative(meta_service.get(), cloud_unique_id, db_id,
+                                   "compaction_label_before_migration", table_id, partition_id,
+                                   old_tablet_id, 2, 6, 300);
+        // Verify: should have 2 rowsets: [0-1], [2-6]
+        rowsets.clear();
+        get_rowsets(meta_service.get(), cloud_unique_id, old_tablet_id, 0, 6, rowsets);
+        ASSERT_EQ(rowsets.size(), 2);
+    }
+
+    TabletStatsPB old_tablet_stats;
+    get_tablet_stats(meta_service.get(), cloud_unique_id, old_tablet_id, old_tablet_stats);
+
+    enable_instance_multi_version_write_only(meta_service.get(), instance_id);
+
+    {
+        InstanceInfoPB instance_info;
+        get_instance(meta_service.get(), cloud_unique_id, instance_info);
+        InstanceDataMigrator migrator(txn_kv, instance_info);
+        ASSERT_EQ(migrator.do_migrate(), 0);
+        enable_instance_multi_version_read_write(meta_service.get(), instance_id);
+
+        // Check the snapshot properties
+        SnapshotProperty property;
+        get_instance_snapshot_properties(meta_service.get(), instance_id, &property);
+        ASSERT_EQ(property.status, SnapshotSwitchStatus::SNAPSHOT_SWITCH_OFF);
+    }
+
+    TabletStatsPB new_tablet_stats;
+    get_tablet_stats(meta_service.get(), cloud_unique_id, old_tablet_id, new_tablet_stats);
+    tablet_stats_must_equals(new_tablet_stats, old_tablet_stats);
+
+    // Phase 1: Single version mode - schema change from old_tablet to new_tablet_1
+    {
+        std::vector<doris::RowsetMetaCloudPB> output_rowsets;
+        std::string job_id = fmt::format("schema_change_{}_{}", old_tablet_id, new_tablet_id_1);
+        int64_t alter_version = 6;
+
+        // Create new tablet
+        create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                      new_tablet_id_1, TabletStatePB::PB_NOTREADY);
+
+        // Start schema change job
+        start_schema_change_job(meta_service.get(), cloud_unique_id, table_id, index_id,
+                                partition_id, old_tablet_id, new_tablet_id_1, job_id, "test_case",
+                                alter_version);
+
+        // Create output rowsets for new_tablet_1 (version 0-1, 2-6)
+        // First create the initial rowset [0-1]
+        {
+            int64_t txn_id = 100000;
+            auto output_rowset = create_rowset(txn_id, new_tablet_id_1, partition_id, 0, 100);
+            output_rowset.set_end_version(1);
+            output_rowsets.push_back(output_rowset);
+            prepare_rowset(meta_service.get(), cloud_unique_id, output_rowset);
+            commit_rowset(meta_service.get(), cloud_unique_id, output_rowset);
+        }
+        // Then create rowsets for version 2-6
+        {
+            int64_t version = 6;
+            int64_t txn_id = 100000 + version;
+            auto output_rowset = create_rowset(txn_id, new_tablet_id_1, partition_id, version, 100);
+            output_rowset.set_start_version(2);
+            output_rowsets.push_back(output_rowset);
+            prepare_rowset(meta_service.get(), cloud_unique_id, output_rowset);
+            commit_rowset(meta_service.get(), cloud_unique_id, output_rowset);
+        }
+
+        // Finish schema change
+        finish_schema_change_job(meta_service.get(), cloud_unique_id, old_tablet_id,
+                                 new_tablet_id_1, job_id, "test_case", output_rowsets);
+
+        // Verify new_tablet_1 has all rowsets
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id, new_tablet_id_1, 0, 6, rowsets);
+        ASSERT_EQ(rowsets.size(), 2); // [0-1], [2-6]
+    }
+
+    // Final check: Get all rowsets and verify versions on new_tablet_1
+    {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id, new_tablet_id_1, 0, 11, rowsets);
+        ASSERT_EQ(rowsets.size(), 2); // [0-1], [2-6]
+
+        // Verify version continuity
+        ASSERT_EQ(rowsets[0].start_version(), 0);
+        ASSERT_EQ(rowsets[0].end_version(), 1);
+        ASSERT_EQ(rowsets[1].start_version(), 2);
+        ASSERT_EQ(rowsets[1].end_version(), 6);
+    }
+
+    int64_t partition_version = -1, table_version = -1;
+    get_partition_version(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                          &partition_version);
+    get_table_version(meta_service.get(), cloud_unique_id, db_id, table_id, &table_version);
+    ASSERT_EQ(partition_version, 6);
+    ASSERT_GE(table_version, 6);
+    TabletMetaCloudPB tablet_meta;
+    get_tablet_meta(meta_service.get(), cloud_unique_id, new_tablet_id_1, &tablet_meta);
+    ASSERT_EQ(tablet_meta.tablet_id(), new_tablet_id_1);
+
+    // Switch back to multi-version disabled, test the tablet stats is compatible.
+    get_tablet_stats(meta_service.get(), cloud_unique_id, new_tablet_id_1, new_tablet_stats);
+    enable_instance_multi_version_disabled(meta_service.get(), instance_id);
+    get_tablet_stats(meta_service.get(), cloud_unique_id, new_tablet_id_1, old_tablet_stats);
+    tablet_stats_must_equals(new_tablet_stats, old_tablet_stats);
 }

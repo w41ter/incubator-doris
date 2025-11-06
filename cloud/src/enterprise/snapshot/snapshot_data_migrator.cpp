@@ -168,7 +168,8 @@ private:
     //   0: successfully got
     //   1: skipped (tablet not found)
     //  -1: error occurred
-    int get_tablet_stats(Transaction* txn, int64_t tablet_id, TabletStatsPB* tablet_stats);
+    int get_tablet_stats(Transaction* txn, int64_t tablet_id, TabletStatsPB* tablet_stats,
+                         TabletStats* detached_stats);
 
     // Migrate rowset meta for a tablet and version (single attempt)
     // Returns:
@@ -1129,7 +1130,7 @@ int MigrateExecutor::migrate_meta_rowset_keys() {
 }
 
 int MigrateExecutor::get_tablet_stats(Transaction* txn, int64_t tablet_id,
-                                      TabletStatsPB* tablet_stats) {
+                                      TabletStatsPB* tablet_stats, TabletStats* detached_stats) {
     std::string tablet_idx_key = meta_tablet_idx_key({instance_id_, tablet_id});
     std::string value;
     TabletIndexPB tablet_idx;
@@ -1152,7 +1153,8 @@ int MigrateExecutor::get_tablet_stats(Transaction* txn, int64_t tablet_id,
     MetaServiceCode code = MetaServiceCode::OK;
     std::string msg;
     tablet_idx.set_tablet_id(tablet_id);
-    internal_get_tablet_stats(code, msg, txn, instance_id_, tablet_idx, *tablet_stats);
+    internal_get_tablet_stats(code, msg, txn, instance_id_, tablet_idx, *tablet_stats,
+                              *detached_stats);
     if (code == MetaServiceCode::TABLET_NOT_FOUND) {
         // Tablet was deleted, skip
         VLOG_DEBUG << "tablet stats not found, tablet " << tablet_id;
@@ -1178,7 +1180,8 @@ int MigrateExecutor::migrate_tablet_stats_key(int64_t tablet_id) {
     }
 
     TabletStatsPB tablet_stats;
-    int res = get_tablet_stats(txn.get(), tablet_id, &tablet_stats);
+    TabletStats detached_stats;
+    int res = get_tablet_stats(txn.get(), tablet_id, &tablet_stats, &detached_stats);
     if (res == 1) {
         LOG_WARNING("tablet is not found when migrating stats keys, skip")
                 .tag("tablet_id", tablet_id);
@@ -1212,34 +1215,17 @@ int MigrateExecutor::migrate_tablet_stats_key(int64_t tablet_id) {
     if (is_load_migrated && is_compact_migrated) {
         // Already migrated, skip
         return 1;
-    } else if (!is_load_migrated && is_compact_migrated) {
-        // Only compact stats migrated, need to migrate load stats
-        // Subtract compact stats from tablet stats to get load stats
-        load_stats = tablet_stats;
-        load_stats.set_num_rows(tablet_stats.num_rows() - compact_stats.num_rows());
-        load_stats.set_data_size(tablet_stats.data_size() - compact_stats.data_size());
-        load_stats.set_num_rowsets(tablet_stats.num_rowsets() - compact_stats.num_rowsets());
-        load_stats.set_num_segments(tablet_stats.num_segments() - compact_stats.num_segments());
-        load_stats.set_index_size(tablet_stats.index_size() - compact_stats.index_size());
-        load_stats.set_segment_size(tablet_stats.segment_size() - compact_stats.segment_size());
+    }
+
+    if (!is_load_migrated) {
+        // Need to migrate load stats (detached stats)
+        merge_tablet_stats(load_stats, detached_stats);
         versioned_put(txn.get(), load_stats_key, load_stats.SerializeAsString());
-    } else if (is_load_migrated && !is_compact_migrated) {
-        // Only load stats migrated, need to migrate compact stats
-        // Initialize compact stats with cumulative counters only
-        compact_stats = tablet_stats;
-        compact_stats.set_num_rows(0);
-        compact_stats.set_data_size(0);
-        compact_stats.set_num_rowsets(0);
-        compact_stats.set_num_segments(0);
-        compact_stats.set_index_size(0);
-        compact_stats.set_segment_size(0);
-        versioned_put(txn.get(), compact_stats_key, compact_stats.SerializeAsString());
-    } else {
-        // Split tablet stats into load and compact stats
-        std::tie(load_stats, compact_stats) =
-                split_tablet_stats_into_load_and_compact_parts(tablet_stats);
-        versioned_put(txn.get(), load_stats_key, load_stats.SerializeAsString());
-        versioned_put(txn.get(), compact_stats_key, compact_stats.SerializeAsString());
+    }
+
+    if (!is_compact_migrated) {
+        // Need to migrate compact stats (non-detached stats)
+        versioned_put(txn.get(), compact_stats_key, tablet_stats.SerializeAsString());
     }
 
     err = txn->commit();
