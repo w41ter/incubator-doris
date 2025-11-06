@@ -54,8 +54,8 @@ inline static bool is_snapshot_expired(const SnapshotPB& snapshot_pb) {
         return true;
     }
 
-    int64_t created_at = snapshot_pb.create_at();
-    int64_t deadline = created_at + snapshot_pb.ttl_seconds();
+    int64_t finished_at = snapshot_pb.finish_at();
+    int64_t deadline = finished_at + snapshot_pb.ttl_seconds();
     return system_clock_now_seconds() >= deadline;
 }
 
