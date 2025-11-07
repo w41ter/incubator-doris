@@ -754,13 +754,21 @@ int inverted_check_mvcc_meta_rowset_key(InstanceChecker* checker, TxnKv* txn_kv)
         return -1;
     }
 
-    err = reader.get_all_tablet_ids(&tablet_ids, false);
-
-    if (err != TxnErrorCode::TXN_OK) {
-        LOG_WARNING("failed to get all tablet ids by versioned tablet index key")
-                .tag("instance_id", instance_id)
-                .tag("error_code", err);
-        return -1;
+    for (const auto& [snapshot_pb, snapshot_versionstamp] : snapshots) {
+        if (!is_snapshot_normal(snapshot_pb)) {
+            continue;
+        }
+        MetaReader snapshot_reader(instance_id, txn_kv, snapshot_versionstamp);
+        std::vector<int64_t> tablet_ids_t;
+        err = snapshot_reader.get_all_tablet_ids(&tablet_ids_t, false);
+        if (err != TxnErrorCode::TXN_OK) {
+            LOG_WARNING("failed to get all tablet ids by snapshot versionstamp")
+                    .tag("instance_id", instance_id)
+                    .tag("versionstamp", serialize_snapshot_versionstamp(snapshot_versionstamp))
+                    .tag("error_code", err);
+            return -1;
+        }
+        tablet_ids.insert(tablet_ids.end(), tablet_ids_t.begin(), tablet_ids_t.end());
     }
 
     for (auto& accessor : accessors) {

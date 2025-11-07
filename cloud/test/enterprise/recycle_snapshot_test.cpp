@@ -1938,7 +1938,16 @@ TEST(RecycleSnapshotTest, CheckInvertedIndexFileV1Normal) {
     ASSERT_NO_FATAL_FAILURE(
             commit_txn(meta_service.get(), cloud_unique_id, db_id, txn_id, "label_1"));
 
+    // create a normal snapshot
+    SnapshotContext ctx;
+    begin_snapshot(meta_service.get(), cloud_unique_id, "check-multiple-test", &ctx);
+    commit_snapshot(meta_service.get(), cloud_unique_id, ctx.snapshot_id, ctx.image_url, 100);
+
     std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    // prepare snapshot files in accessor
+    std::string image_path = "snapshot/" + ctx.snapshot_id + "/image.img";
+    accessor->put_file(image_path, "snapshot_content");
 
     // prepare legitimate segment and V1 index files
     std::string segment_file = fmt::format("data/{}/{}_0.dat", tablet_id, rowset_id);
@@ -1991,7 +2000,17 @@ TEST(RecycleSnapshotTest, CheckInvertedIndexFileV1MissingRowsetMeta) {
     ASSERT_NO_FATAL_FAILURE(commit_rowset(meta_service.get(), cloud_unique_id, rowset));
     ASSERT_NO_FATAL_FAILURE(
             commit_txn(meta_service.get(), cloud_unique_id, db_id, txn_id, "label_1"));
+
+    // create a normal snapshot
+    SnapshotContext ctx;
+    begin_snapshot(meta_service.get(), cloud_unique_id, "check-multiple-test", &ctx);
+    commit_snapshot(meta_service.get(), cloud_unique_id, ctx.snapshot_id, ctx.image_url, 100);
+
     std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    // prepare snapshot files in accessor
+    std::string image_path = "snapshot/" + ctx.snapshot_id + "/image.img";
+    accessor->put_file(image_path, "snapshot_content");
 
     // add orphaned V1 index file without corresponding rowset metadata
     std::string orphaned_index_v1 =
@@ -2030,7 +2049,16 @@ TEST(RecycleSnapshotTest, CheckInvertedIndexFileV1MissingTabletSchema) {
     insert_rowset(meta_service.get(), cloud_unique_id, db_id, "label_1", table_id, partition_id,
                   tablet_id, &rowset_id);
 
+    // create a normal snapshot
+    SnapshotContext ctx;
+    begin_snapshot(meta_service.get(), cloud_unique_id, "check-multiple-test", &ctx);
+    commit_snapshot(meta_service.get(), cloud_unique_id, ctx.snapshot_id, ctx.image_url, 100);
+
     std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    // prepare snapshot files in accessor
+    std::string image_path = "snapshot/" + ctx.snapshot_id + "/image.img";
+    accessor->put_file(image_path, "snapshot_content");
 
     // prepare segment file and V1 index file
     std::string segment_file = fmt::format("data/{}/{}_0.dat", tablet_id, rowset_id);
@@ -2085,7 +2113,16 @@ TEST(RecycleSnapshotTest, CheckInvertedIndexFileV2Normal) {
     ASSERT_NO_FATAL_FAILURE(
             commit_txn(meta_service.get(), cloud_unique_id, db_id, txn_id, "label_1"));
 
+    // create a normal snapshot
+    SnapshotContext ctx;
+    begin_snapshot(meta_service.get(), cloud_unique_id, "check-multiple-test", &ctx);
+    commit_snapshot(meta_service.get(), cloud_unique_id, ctx.snapshot_id, ctx.image_url, 100);
+
     std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    // prepare snapshot files in accessor
+    std::string image_path = "snapshot/" + ctx.snapshot_id + "/image.img";
+    accessor->put_file(image_path, "snapshot_content");
 
     // prepare legitimate segment and V2 index files
     std::string segment_file = fmt::format("data/{}/{}_0.dat", tablet_id, rowset_id);
@@ -2133,7 +2170,16 @@ TEST(RecycleSnapshotTest, CheckInvertedIndexFileV2MissingRowsetMeta) {
     ASSERT_TRUE(document_put(txn.get(), schema_key, std::move(tablet_schema)));
     ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
 
+    // create a normal snapshot
+    SnapshotContext ctx;
+    begin_snapshot(meta_service.get(), cloud_unique_id, "check-multiple-test", &ctx);
+    commit_snapshot(meta_service.get(), cloud_unique_id, ctx.snapshot_id, ctx.image_url, 100);
+
     std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    // prepare snapshot files in accessor
+    std::string image_path = "snapshot/" + ctx.snapshot_id + "/image.img";
+    accessor->put_file(image_path, "snapshot_content");
 
     // add orphaned V2 index file without corresponding rowset metadata
     std::string orphaned_index_v2 = fmt::format("data/{}/orphaned_rowset_0.idx", tablet_id);
@@ -2185,7 +2231,16 @@ TEST(RecycleSnapshotTest, CheckInvertedIndexFileV1InvalidSegment) {
     ASSERT_NO_FATAL_FAILURE(
             commit_txn(meta_service.get(), cloud_unique_id, db_id, txn_id, "label_1"));
 
+    // create a normal snapshot
+    SnapshotContext ctx;
+    begin_snapshot(meta_service.get(), cloud_unique_id, "check-multiple-test", &ctx);
+    commit_snapshot(meta_service.get(), cloud_unique_id, ctx.snapshot_id, ctx.image_url, 100);
+
     std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    // prepare snapshot files in accessor
+    std::string image_path = "snapshot/" + ctx.snapshot_id + "/image.img";
+    accessor->put_file(image_path, "snapshot_content");
 
     // prepare legitimate segment file
     std::string segment_file = fmt::format("data/{}/{}_0.dat", tablet_id, rowset_id);
@@ -2242,7 +2297,16 @@ TEST(RecycleSnapshotTest, CheckInvertedIndexFileV2InvalidSegment) {
     ASSERT_NO_FATAL_FAILURE(
             commit_txn(meta_service.get(), cloud_unique_id, db_id, txn_id, "label_1"));
 
+    // create a normal snapshot
+    SnapshotContext ctx;
+    begin_snapshot(meta_service.get(), cloud_unique_id, "check-multiple-test", &ctx);
+    commit_snapshot(meta_service.get(), cloud_unique_id, ctx.snapshot_id, ctx.image_url, 100);
+
     std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    // prepare snapshot files in accessor
+    std::string image_path = "snapshot/" + ctx.snapshot_id + "/image.img";
+    accessor->put_file(image_path, "snapshot_content");
 
     // prepare legitimate segment file
     std::string segment_file = fmt::format("data/{}/{}_0.dat", tablet_id, rowset_id);
@@ -2298,7 +2362,16 @@ TEST(RecycleSnapshotTest, CheckInvertedIndexFileV1InvalidIndexId) {
     ASSERT_NO_FATAL_FAILURE(
             commit_txn(meta_service.get(), cloud_unique_id, db_id, txn_id, "label_1"));
 
+    // create a normal snapshot
+    SnapshotContext ctx;
+    begin_snapshot(meta_service.get(), cloud_unique_id, "check-multiple-test", &ctx);
+    commit_snapshot(meta_service.get(), cloud_unique_id, ctx.snapshot_id, ctx.image_url, 100);
+
     std::shared_ptr<StorageVaultAccessor> accessor = std::make_shared<MockAccessor>();
+
+    // prepare snapshot files in accessor
+    std::string image_path = "snapshot/" + ctx.snapshot_id + "/image.img";
+    accessor->put_file(image_path, "snapshot_content");
 
     // prepare legitimate segment file
     std::string segment_file = fmt::format("data/{}/{}_0.dat", tablet_id, rowset_id);
