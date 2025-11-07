@@ -50,7 +50,7 @@ suite("test_checker") {
     logger.info("tabletIdSet:${tabletIdSet}")
 
     // Randomly delete segment file under tablet dir
-    getObjStoreInfoApiResult = getObjStoreInfo(token, cloudUniqueId)
+    def getObjStoreInfoApiResult = getObjStoreInfo(token, cloudUniqueId)
     if (getObjStoreInfoApiResult.result.toString().contains("obj_info")) {
         String ak, sk, endpoint, region, prefix, bucket
         if(!getObjStoreInfoApiResult.result.toString().contains("storage_vault=[")){

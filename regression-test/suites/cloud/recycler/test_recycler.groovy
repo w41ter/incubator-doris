@@ -40,7 +40,7 @@ suite("test_recycler") {
         Thread.sleep(10000)
         getRecycleJobInfo()
         logger.info("caseStartTime=${caseStartTime}, recyclerLastSuccessTime=${recyclerLastSuccessTime}")
-        if (recyclerLastFinishTime > caseStartTime) {
+        if (recyclerLastSuccessTime > caseStartTime) {
             break
         }
     } while (true)
