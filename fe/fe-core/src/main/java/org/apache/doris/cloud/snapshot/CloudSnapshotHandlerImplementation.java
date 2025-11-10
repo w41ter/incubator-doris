@@ -465,7 +465,7 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
                     .setFromSnapshotId(cloneSnapshotState.getFromSnapshotId())
                     .setFromInstanceId(cloneSnapshotState.getFromInstanceId())
                     .setNewInstanceId(cloneSnapshotState.getInstanceId());
-            if (cloneSnapshotState.isSucceed()) {
+            if (cloneSnapshotState.isSuccessor()) {
                 requestBuilder.setCloneType(Cloud.CloneInstanceRequest.CloneType.ROLLBACK);
             } else if (cloneSnapshotState.isReadOnly()) {
                 requestBuilder.setCloneType(Cloud.CloneInstanceRequest.CloneType.READ_ONLY);

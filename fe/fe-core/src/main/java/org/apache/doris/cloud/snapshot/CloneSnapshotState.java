@@ -96,8 +96,8 @@ public class CloneSnapshotState {
         return isReadOnly != null && isReadOnly.booleanValue();
     }
 
-    public boolean isSucceed() {
-        return isSucceed != null && isSucceed.booleanValue();
+    public boolean isSuccessor() {
+        return isSuccessor != null && isSuccessor.booleanValue();
     }
 
     public RemoteBase.ObjectInfo getObjInfo() {
