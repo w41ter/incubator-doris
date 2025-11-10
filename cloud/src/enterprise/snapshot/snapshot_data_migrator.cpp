@@ -181,6 +181,14 @@ private:
     int migrate_rowset_meta(int64_t tablet_id, const doris::RowsetMetaCloudPB& rowset_meta,
                             Versionstamp migrate_versionstamp);
 
+    // Migrate delete bitmap for a tablet and rowset (single attempt)
+    // Returns:
+    //   0: successfully migrated
+    //   1: skipped (already migrated)
+    //  -1: error occurred
+    //  -2: transaction conflict (for retry)
+    int migrate_delete_bitmap(int64_t tablet_id, const std::string& rowset_id);
+
     // Retry wrapper for migration functions. Retries up to MAX_RETRY_TIMES on TXN_CONFLICT.
     // migrate_func must return: 0 (success), 1 (skipped), -1 (error), -2 (TXN_CONFLICT to retry)
     template <typename Fn, typename... Args>
@@ -1164,6 +1172,107 @@ int MigrateExecutor::migrate_rowset_meta(int64_t tablet_id,
     }
 }
 
+int MigrateExecutor::migrate_delete_bitmap(int64_t tablet_id, const std::string& rowset_id) {
+    AnnotateTag tablet_id_tag("tablet_id", tablet_id);
+    AnnotateTag rowset_id_tag("rowset_id", rowset_id);
+
+    std::unique_ptr<Transaction> txn;
+    TxnErrorCode err = txn_kv_->create_txn(&txn);
+    if (err != TxnErrorCode::TXN_OK) {
+        LOG_WARNING("failed to create txn to migrate delete bitmap").tag("error", err);
+        return -1;
+    }
+
+    std::string key = versioned::meta_delete_bitmap_key({instance_id_, tablet_id, rowset_id});
+    ValueBuf val_buf;
+    err = doris::cloud::blob_get(txn.get(), key, &val_buf);
+    if (err == TxnErrorCode::TXN_OK) {
+        // Already migrated, skip
+        VLOG_DEBUG << "delete bitmap key already migrated for tablet=" << tablet_id
+                   << ", rowset_id=" << rowset_id;
+        return 1;
+    } else if (err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        LOG_WARNING("failed to get versioned delete bitmap key for migrating delete bitmap")
+                .tag("error", err);
+        return -1;
+    }
+
+    doris::DeleteBitmapPB delete_bitmap_pb;
+    std::string start_key = meta_delete_bitmap_key({instance_id_, tablet_id, rowset_id, 0, 0});
+    std::string end_key =
+            meta_delete_bitmap_key({instance_id_, tablet_id, rowset_id, INT64_MAX, INT64_MAX});
+    std::unique_ptr<RangeGetIterator> it;
+    int64_t last_ver = -1;
+    int64_t last_seg_id = -1;
+    do {
+        TxnErrorCode err = txn->get(start_key, end_key, &it);
+        int64_t retry = 0;
+        while (err == TxnErrorCode::TXN_TOO_OLD && retry < 3) {
+            txn = nullptr;
+            err = txn_kv_->create_txn(&txn);
+            if (err != TxnErrorCode::TXN_OK) {
+                LOG_WARNING("failed to create txn to migrate delete bitmap")
+                        .tag("retry", retry)
+                        .tag("error", err);
+                return -1;
+            }
+            err = txn->get(start_key, end_key, &it);
+            retry++;
+        }
+        if (err != TxnErrorCode::TXN_OK) {
+            LOG_WARNING("failed to create txn to migrate delete bitmap").tag("error", err);
+            return -1;
+        }
+
+        while (it->has_next()) {
+            auto [k, v] = it->next();
+            auto k1 = k;
+            k1.remove_prefix(1);
+            std::vector<std::tuple<std::variant<int64_t, std::string>, int, int>> out;
+            decode_key(&k1, &out);
+            // 0x01 "meta" ${instance_id}  "delete_bitmap" ${tablet_id} ${rowset_id0} ${version1} ${segment_id0} -> delete_bitmap_bytes
+            auto ver = std::get<int64_t>(std::get<0>(out[5]));
+            auto seg_id = std::get<int64_t>(std::get<0>(out[6]));
+
+            if (ver != last_ver || seg_id != last_seg_id) {
+                delete_bitmap_pb.add_rowset_ids(rowset_id);
+                delete_bitmap_pb.add_segment_ids(seg_id);
+                delete_bitmap_pb.add_versions(ver);
+                delete_bitmap_pb.add_segment_delete_bitmaps(std::string(v));
+                last_ver = ver;
+                last_seg_id = seg_id;
+            } else {
+                // merge splitted large values (>90*1000)
+                delete_bitmap_pb.mutable_segment_delete_bitmaps()->rbegin()->append(v);
+            }
+        }
+        start_key = it->next_begin_key(); // Update to next smallest key for iteration
+    } while (it->more());
+
+    DeleteBitmapStoragePB delete_bitmap_storage_pb;
+    delete_bitmap_storage_pb.set_store_in_fdb(true);
+    *(delete_bitmap_storage_pb.mutable_delete_bitmap()) = std::move(delete_bitmap_pb);
+    std::string val;
+    if (!delete_bitmap_storage_pb.SerializeToString(&val)) {
+        LOG_WARNING("failed to serialize delete bitmap storage");
+        return -1;
+    }
+    doris::cloud::blob_put(txn.get(), key, val, 0);
+
+    err = txn->commit();
+    if (err == TxnErrorCode::TXN_OK) {
+        VLOG_DEBUG << "migrate delete bitmap for tablet=" << tablet_id
+                   << ", rowset_id=" << rowset_id;
+        return 0; // success
+    } else if (err == TxnErrorCode::TXN_CONFLICT) {
+        LOG_WARNING("migrate delete bitmap failed due to transaction conflict");
+        return -2; // TXN_CONFLICT
+    } else {
+        LOG_WARNING("failed to commit txn for migrating delete bitmap").tag("error", err);
+        return -1;
+    }
+}
+
 int MigrateExecutor::migrate_meta_rowset_keys() {
     LOG_INFO("begin to migrate meta rowset keys");
 
@@ -1177,6 +1286,9 @@ int MigrateExecutor::migrate_meta_rowset_keys() {
     int total_keys = 0;
     int migrated_keys = 0;
     int skipped_keys = 0;
+    int total_delete_bitmap_keys = 0;
+    int migrated_delete_bitmap_keys = 0;
+    int skipped_delete_bitmap_keys = 0;
     StopWatch stop_watch;
 
     DORIS_CLOUD_DEFER {
@@ -1184,6 +1296,9 @@ int MigrateExecutor::migrate_meta_rowset_keys() {
                 .tag("total", total_keys)
                 .tag("migrated", migrated_keys)
                 .tag("skipped", skipped_keys)
+                .tag("total_delete_bitmap", total_delete_bitmap_keys)
+                .tag("migrated_delete_bitmap", migrated_delete_bitmap_keys)
+                .tag("skipped_delete_bitmap", skipped_delete_bitmap_keys)
                 .tag("cost(s)", stop_watch.elapsed_seconds());
     };
 
@@ -1228,6 +1343,17 @@ int MigrateExecutor::migrate_meta_rowset_keys() {
             return -1;
         }
 
+        doris::TabletMetaCloudPB tablet_meta;
+        err = meta_reader.get_tablet_meta(tablet_id, &tablet_meta, nullptr);
+        if (err != TxnErrorCode::TXN_OK) {
+            LOG_WARNING("failed to get tablet meta for migrate meta rowset keys")
+                    .tag("tablet_id", tablet_id)
+                    .tag("error", err);
+            return -1;
+        }
+        bool is_mow = tablet_meta.has_enable_unique_key_merge_on_write() &&
+                      tablet_meta.enable_unique_key_merge_on_write();
+
         // The migrate versionstamp is used to determine the versionstamp of the migrated rowset meta.
         // It should ensure that the migrated rowset meta has a versionstamp smaller than the read version of
         // the current transaction, so that the migrated rowset meta is visible to the current transaction,
@@ -1256,6 +1382,22 @@ int MigrateExecutor::migrate_meta_rowset_keys() {
                         .tag("version", rowset_meta.end_version())
                         .tag("rowset_id", rowset_meta.rowset_id_v2());
                 return -1;
+            }
+
+            if (is_mow) {
+                total_delete_bitmap_keys++;
+                result = retry_if_txn_conflict(&MigrateExecutor::migrate_delete_bitmap, tablet_id,
+                                               rowset_meta.rowset_id_v2());
+                if (result == 0) {
+                    migrated_delete_bitmap_keys++;
+                } else if (result == 1) {
+                    skipped_delete_bitmap_keys++;
+                } else {
+                    LOG_WARNING("failed to migrate delete bitmap")
+                            .tag("tablet_id", tablet_id)
+                            .tag("rowset_id", rowset_meta.rowset_id_v2());
+                    return -1;
+                }
             }
         }
     }
