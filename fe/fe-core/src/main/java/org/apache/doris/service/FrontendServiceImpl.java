@@ -28,6 +28,8 @@ import org.apache.doris.analysis.SetType;
 import org.apache.doris.analysis.TableName;
 import org.apache.doris.analysis.TableRef;
 import org.apache.doris.analysis.UserIdentity;
+import org.apache.doris.backup.BackupJobInfo;
+import org.apache.doris.backup.BackupMeta;
 import org.apache.doris.backup.Snapshot;
 import org.apache.doris.binlog.BinlogLagInfo;
 import org.apache.doris.catalog.AutoIncrementGenerator;
@@ -61,7 +63,6 @@ import org.apache.doris.common.CaseSensibility;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.DuplicatedRequestException;
-import org.apache.doris.common.GZIPUtils;
 import org.apache.doris.common.InternalErrorCode;
 import org.apache.doris.common.LabelAlreadyUsedException;
 import org.apache.doris.common.LoadException;
@@ -2212,8 +2213,8 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             LOG.warn("exec sql error", e);
             throw e;
         } catch (Throwable e) {
-            LOG.warn("exec sql error catch unknown result.", e);
-            throw new UserException("exec sql error catch unknown result." + e);
+            LOG.warn("exec sql: {} catch unknown result. ", originStmt, e);
+            throw new UserException("exec sql error catch unknown result. " + e.getMessage());
         }
         return httpStreamParams;
     }
@@ -2785,13 +2786,19 @@ public class FrontendServiceImpl implements FrontendService.Iface {
                 }
                 List<Backend> backends;
                 if (Config.isCloudMode()) {
-                    if (request.isSetWarmUpJobId()) {
-                        CloudReplica cloudReplica = (CloudReplica) replica;
-                        Backend primaryBackend = cloudReplica.getPrimaryBackend(clusterId);
-                        backends = Lists.newArrayList(primaryBackend);
-                    } else {
-                        CloudReplica cloudReplica = (CloudReplica) replica;
+                    CloudReplica cloudReplica = (CloudReplica) replica;
+                    if (!request.isSetWarmUpJobId()) {
                         backends = cloudReplica.getAllPrimaryBes();
+                    } else {
+                        // On the cloud, the PrimaryBackend of a tablet
+                        // indicates the BE where the tablet is stably located,
+                        // while the SecondBackend refers to a BE selected by a new hash when the PrimaryBackend
+                        // is temporarily unavailable. Once the PrimaryBackend recovers,
+                        // the system will switch back to using it. During the preheating phase,
+                        // data needs to be synchronized downstream, which requires a stable BE,
+                        // so the PrimaryBackend is used in this case.
+                        Backend backend = cloudReplica.getPrimaryBackend(clusterId, true);
+                        backends = Lists.newArrayList(backend);
                     }
                 } else {
                     Backend backend = Env.getCurrentSystemInfo().getBackend(replica.getBackendIdWithoutException());
@@ -3056,24 +3063,38 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             result.getStatus().setStatusCode(TStatusCode.SNAPSHOT_EXPIRED);
             result.getStatus().addToErrorMsgs(String.format("snapshot %s is expired", label));
         } else {
-            byte[] meta = snapshot.getMeta();
-            byte[] jobInfo = snapshot.getJobInfo();
+            long metaSize = snapshot.getMetaSize();
+            long jobInfoSize = snapshot.getJobInfoSize();
+            long snapshotSize = snapshot.getMetaSize() + snapshot.getJobInfoSize();
+            if (metaSize + jobInfoSize >= Integer.MAX_VALUE && !request.isEnableCompress()) {
+                String msg = String.format(
+                        "Snapshot %s is too large (%d bytes > 2GB). Please enable compression to continue.",
+                        label, snapshotSize);
+                LOG.warn("get snapshot failed: {}", msg);
+                result.getStatus().setStatusCode(TStatusCode.INTERNAL_ERROR);
+                result.getStatus().addToErrorMsgs(msg);
+                return result;
+            }
+
             long expiredAt = snapshot.getExpiredAt();
             long commitSeq = snapshot.getCommitSeq();
 
             LOG.info("get snapshot info, snapshot: {}, meta size: {}, job info size: {}, "
-                    + "expired at: {}, commit seq: {}", label, meta.length, jobInfo.length, expiredAt, commitSeq);
+                    + "expired at: {}, commit seq: {}", label, metaSize, jobInfoSize, expiredAt, commitSeq);
             if (request.isEnableCompress()) {
-                meta = GZIPUtils.compress(meta);
-                jobInfo = GZIPUtils.compress(jobInfo);
+                byte[] meta = snapshot.getCompressedMeta();
+                byte[] jobInfo = snapshot.getCompressedJobInfo();
+                result.setMeta(meta);
+                result.setJobInfo(jobInfo);
                 result.setCompressed(true);
                 if (LOG.isDebugEnabled()) {
                     LOG.debug("get snapshot info with compress, snapshot: {}, compressed meta "
                             + "size {}, compressed job info size {}", label, meta.length, jobInfo.length);
                 }
+            } else {
+                result.setMeta(snapshot.getMeta());
+                result.setJobInfo(snapshot.getJobInfo());
             }
-            result.setMeta(meta);
-            result.setJobInfo(jobInfo);
             result.setExpiredAt(expiredAt);
             result.setCommitSeq(commitSeq);
         }
@@ -3186,6 +3207,8 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             }
         }
 
+        BackupMeta backupMeta;
+        BackupJobInfo backupJobInfo;
         byte[] meta = request.getMeta();
         byte[] jobInfo = request.getJobInfo();
         if (Config.enable_restore_snapshot_rpc_compression && request.isCompressed()) {
@@ -3194,18 +3217,29 @@ public class FrontendServiceImpl implements FrontendService.Iface {
                         meta.length, jobInfo.length);
             }
             try {
-                meta = GZIPUtils.decompress(meta);
-                jobInfo = GZIPUtils.decompress(jobInfo);
+                Pair<BackupMeta, BackupJobInfo> pair = Snapshot.readFromCompressedBytes(meta, jobInfo);
+                backupMeta = pair.first;
+                backupJobInfo = pair.second;
             } catch (Exception e) {
                 LOG.warn("decompress meta and job info failed", e);
                 throw new UserException("decompress meta and job info failed", e);
             }
-        } else if (GZIPUtils.isGZIPCompressed(jobInfo) || GZIPUtils.isGZIPCompressed(meta)) {
+        } else if (Snapshot.isCompressed(meta, jobInfo)) {
             throw new UserException("The request is compressed, but the config "
                     + "`enable_restore_snapshot_rpc_compressed` is not enabled.");
+        } else {
+            try {
+                Pair<BackupMeta, BackupJobInfo> pair = Snapshot.readFromBytes(meta, jobInfo);
+                backupMeta = pair.first;
+                backupJobInfo = pair.second;
+            } catch (Exception e) {
+                LOG.warn("deserialize meta and job info failed", e);
+                throw new UserException("deserialize meta and job info failed", e);
+            }
         }
 
-        RestoreStmt restoreStmt = new RestoreStmt(label, repoName, restoreTableRefClause, properties, meta, jobInfo);
+        RestoreStmt restoreStmt = new RestoreStmt(
+                label, repoName, restoreTableRefClause, properties, backupMeta, backupJobInfo);
         restoreStmt.setIsBeingSynced();
         LOG.debug("restore snapshot info, restoreStmt: {}", restoreStmt);
         try {

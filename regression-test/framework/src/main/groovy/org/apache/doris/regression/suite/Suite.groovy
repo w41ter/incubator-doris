@@ -1662,7 +1662,7 @@ class Suite implements GroovyInterceptable {
 
     void waitingMVTaskFinishedByMvName(String dbName, String tableName, String indexName) {
         Thread.sleep(2000)
-        String showTasks = "SHOW ALTER TABLE MATERIALIZED VIEW from ${dbName} where TableName='${tableName}' ORDER BY CreateTime DESC"
+        String showTasks = "SHOW ALTER TABLE MATERIALIZED VIEW from ${dbName} where TableName='${tableName}' ORDER BY CreateTime DESC LIMIT 1"
         String status = "NULL"
         List<List<Object>> result
         long startTime = System.currentTimeMillis()
@@ -1671,12 +1671,7 @@ class Suite implements GroovyInterceptable {
         while (timeoutTimestamp > System.currentTimeMillis() && (status != 'FINISHED')) {
             result = sql(showTasks)
             logger.info("crrent db is " + dbName + ", showTasks result: " + result.toString())
-            // just consider current db
-            for (List<String> taskRow : result) {
-                if (taskRow.get(5).equals(indexName)) {
-                    toCheckTaskRow = taskRow;
-                }
-            }
+            toCheckTaskRow = result.last()
             if (toCheckTaskRow.isEmpty()) {
                 logger.info("waitingMVTaskFinishedByMvName toCheckTaskRow is empty")
                 Thread.sleep(1000);
@@ -1831,33 +1826,17 @@ class Suite implements GroovyInterceptable {
     }
 
     boolean enableStoragevault() {
-        if (Strings.isNullOrEmpty(context.config.metaServiceHttpAddress)
-                || Strings.isNullOrEmpty(context.config.instanceId)
-                || Strings.isNullOrEmpty(context.config.metaServiceToken)) {
+        if (!isCloudMode()) {
             return false;
         }
-
-        boolean ret = false;
-        def getInstanceInfo = { check_func ->
-            httpTest {
-                endpoint context.config.metaServiceHttpAddress
-                uri "/MetaService/http/get_instance?token=${context.config.metaServiceToken}&instance_id=${context.config.instanceId}"
-                op "get"
-                check check_func
-            }
+        try {
+            sql "show storage vault"
+        } catch (Exception e) {
+            logger.info("show storage vault failed: {}", e.getMessage())
+            Assert.assertTrue(e.getMessage().contains("Your cloud instance doesn't support storage vault"))
+            return false;
         }
-        getInstanceInfo.call() {
-            respCode, body ->
-                String respCodeValue = "${respCode}".toString();
-                if (!respCodeValue.equals("200")) {
-                    return;
-                }
-                def json = parseJson(body)
-                if (json.result.containsKey("enable_storage_vault") && json.result.enable_storage_vault) {
-                    ret = true;
-                }
-        }
-        return ret;
+        return true;
     }
 
     boolean isGroupCommitMode() {

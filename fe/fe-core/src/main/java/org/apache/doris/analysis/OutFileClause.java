@@ -73,6 +73,9 @@ public class OutFileClause {
     public static final Map<String, TParquetDataType> PARQUET_DATA_TYPE_MAP = Maps.newHashMap();
     public static final Map<String, TParquetCompressionType> PARQUET_COMPRESSION_TYPE_MAP = Maps.newHashMap();
     public static final Map<String, TFileCompressType> ORC_COMPRESSION_TYPE_MAP = Maps.newHashMap();
+    // supported compression types for csv writer
+    public static final Map<String, TFileCompressType> CSV_COMPRESSION_TYPE_MAP = Maps.newHashMap();
+
     public static final Map<String, TParquetVersion> PARQUET_VERSION_MAP = Maps.newHashMap();
     public static final Set<String> ORC_DATA_TYPE = Sets.newHashSet();
     public static final String FILE_NUMBER = "FileNumber";
@@ -130,6 +133,13 @@ public class OutFileClause {
         ORC_DATA_TYPE.add("smallint");
         ORC_DATA_TYPE.add("string");
         ORC_DATA_TYPE.add("tinyint");
+
+        CSV_COMPRESSION_TYPE_MAP.put("plain", TFileCompressType.PLAIN);
+        CSV_COMPRESSION_TYPE_MAP.put("gz", TFileCompressType.GZ);
+        CSV_COMPRESSION_TYPE_MAP.put("bz2", TFileCompressType.BZ2);
+        CSV_COMPRESSION_TYPE_MAP.put("snappyblock", TFileCompressType.SNAPPYBLOCK);
+        CSV_COMPRESSION_TYPE_MAP.put("lz4block", TFileCompressType.LZ4BLOCK);
+        CSV_COMPRESSION_TYPE_MAP.put("zstd", TFileCompressType.ZSTD);
     }
 
     public static final String LOCAL_FILE_PREFIX = "file:///";
@@ -182,6 +192,7 @@ public class OutFileClause {
 
     private TParquetCompressionType parquetCompressionType = TParquetCompressionType.SNAPPY;
     private TFileCompressType orcCompressionType = TFileCompressType.ZLIB;
+    private TFileCompressType csvCompressionType = TFileCompressType.PLAIN;
     private static final String PARQUET_DISABLE_DICTIONARY = "disable_dictionary";
     private boolean parquetDisableDictionary = false;
     private static final String PARQUET_VERSION = "version";
@@ -617,6 +628,10 @@ public class OutFileClause {
             getOrcProperties(processedPropKeys);
         }
 
+        if (Util.isCsvFormat(fileFormatType)) {
+            getCsvProperties(processedPropKeys);
+        }
+
         if (processedPropKeys.size() != properties.size()) {
             if (LOG.isDebugEnabled()) {
                 LOG.debug("{} vs {}", processedPropKeys, properties);
@@ -816,6 +831,21 @@ public class OutFileClause {
         processedPropKeys.add(SCHEMA);
     }
 
+    private void getCsvProperties(Set<String> processedPropKeys) throws AnalysisException {
+        // get compression type
+        // save compress type
+        if (properties.containsKey(COMPRESS_TYPE)) {
+            if (CSV_COMPRESSION_TYPE_MAP.containsKey(properties.get(COMPRESS_TYPE).toLowerCase())) {
+                this.csvCompressionType = CSV_COMPRESSION_TYPE_MAP.get(properties.get(COMPRESS_TYPE).toLowerCase());
+                processedPropKeys.add(COMPRESS_TYPE);
+            } else {
+                throw new AnalysisException("csv compression type [" + properties.get(COMPRESS_TYPE) + "] is invalid,"
+                        + " please choose one among "
+                        + "\"plain\", \"gz\", \"bz2\", \"snappyblock\", \"lz4block\", \"zstd\"");
+            }
+        }
+    }
+
     private boolean isParquetFormat() {
         return fileFormatType == TFileFormatType.FORMAT_PARQUET;
     }
@@ -886,6 +916,9 @@ public class OutFileClause {
             sinkOptions.setOrcSchema(serializeOrcSchema());
             sinkOptions.setOrcCompressionType(orcCompressionType);
             sinkOptions.setOrcWriterVersion(1);
+        }
+        if (Util.isCsvFormat(fileFormatType)) {
+            sinkOptions.setCompressionType(csvCompressionType);
         }
         return sinkOptions;
     }

@@ -45,7 +45,7 @@ static inline bool is_cloud_mode() {
 // In this mode, The config meta_service_connection_pooled is still useful, but the other two configs will be ignored.
 DECLARE_mString(meta_service_endpoint);
 // Whether check config::meta_service_endpoint is identical to the ms endpoint from FE master heartbeat
-// This may help in some cases that we intend to change the config only FE side or BE side
+// This may help in some cases that we intend to change the config only on FE side or BE side
 DECLARE_mBool(enable_meta_service_endpoint_consistency_check);
 // Set the underlying connection type to pooled.
 DECLARE_Bool(meta_service_connection_pooled);

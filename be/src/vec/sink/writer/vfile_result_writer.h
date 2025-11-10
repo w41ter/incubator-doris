@@ -99,7 +99,9 @@ private:
     Status _fill_result_block();
     // delete the dir of file_path
     Status _delete_dir();
+    std::string _compression_type_to_name();
 
+private:
     RuntimeState* _state; // not owned, set when init
     const pipeline::ResultFileOptions* _file_opts = nullptr;
     TStorageBackendType::type _storage_type;
