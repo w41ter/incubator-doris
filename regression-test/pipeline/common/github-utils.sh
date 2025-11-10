@@ -59,7 +59,7 @@ function create_an_issue_comment_tpch() {
 
 \`\`\`
 machine: '${machine}'
-scripts: https://github.com/selectdb/selectdb-core/tree/selectdb-cloud-4.0/tools/tpch-tools
+scripts: https://github.com/selectdb/selectdb-core/tree/master/tools/tpch-tools
 ${COMMENT_BODY_DETAIL}
 \`\`\`
 </details>
@@ -78,7 +78,7 @@ function create_an_issue_comment_tpcds() {
 
 \`\`\`
 machine: '${machine}'
-scripts: https://github.com/apache/selectdb-core/tree/selectdb-cloud-4.0/tools/tpcds-tools
+scripts: https://github.com/selectdb/selectdb-core/tree/master/tools/tpcds-tools
 ${COMMENT_BODY_DETAIL}
 \`\`\`
 </details>
@@ -97,7 +97,7 @@ function create_an_issue_comment_clickbench() {
 
 \`\`\`
 machine: '${machine}'
-scripts: https://github.com/selectdb/selectdb-core/tree/selectdb-cloud-4.0/tools/clickbench-tools
+scripts: https://github.com/selectdb/selectdb-core/tree/master/tools/clickbench-tools
 ${COMMENT_BODY_DETAIL}
 \`\`\`
 </details>
@@ -132,7 +132,6 @@ _get_pr_changed_files_count() {
         set -x
         if ret=$(
             curl -s -H "Accept: application/vnd.github+json" \
-                -H "Authorization: Bearer ${GITHUB_TOKEN:-}" \
                 https://api.github.com/repos/"${OWNER}"/"${REPO}"/pulls/"${PULL_NUMBER}" | jq -e '.changed_files'
         ); then
             set +x
@@ -170,7 +169,6 @@ _get_pr_changed_files() {
             set -x
             if curl -s \
                 -H "Accept: application/vnd.github+json" \
-                -H "Authorization: Bearer ${GITHUB_TOKEN:-}" \
                 https://api.github.com/repos/"${OWNER}"/"${REPO}"/pulls/"${PULL_NUMBER}"/files?page="${page}"\&per_page="${per_page}" \
                 >>"${file_name}"; then
                 set +x

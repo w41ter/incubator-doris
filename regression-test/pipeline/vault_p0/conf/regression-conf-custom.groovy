@@ -22,6 +22,7 @@ jdbcUrl = "jdbc:mysql://127.0.0.1:9030/?useLocalSessionState=true&allowLoadLocal
 targetJdbcUrl = "jdbc:mysql://127.0.0.1:9030/?useLocalSessionState=true&allowLoadLocalInfile=true&zeroDateTimeBehavior=round"
 
 // for vault case, consistent with the configuration in the create_warehouse_vault method in the doris-utils.sh file.
+metaServiceToken = "greedisgood9999"
 instanceId="cloud_instance_0"
 multiClusterInstanceId="cloud_instance_0"
 

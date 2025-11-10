@@ -44,7 +44,7 @@ exit_flag=0
 (
     echo "#### 1. download doris binary"
     cd "${teamcity_build_checkoutDir}"
-    export OSS_DIR="${OSS_DIR:-"oss://opensource-pipeline/compile_result"}"
+    export OSS_DIR="${OSS_DIR:-"oss://opensource-pipeline/selectdb_compile_result"}"
     if download_oss_file "${pr_num_from_trigger}_${commit_id_from_trigger}.tar.gz"; then
         rm -rf "${teamcity_build_checkoutDir}"/output
         tar -I pigz -xf "${pr_num_from_trigger}_${commit_id_from_trigger}.tar.gz"
@@ -59,6 +59,12 @@ exit_flag=0
     cp -rf "${DORIS_HOME}"/ms/ "${DORIS_HOME}"/recycler/
     cp -f "${teamcity_build_checkoutDir}"/regression-test/pipeline/vault_p0/conf/fe_custom.conf "${DORIS_HOME}"/fe/conf/
     cp -f "${teamcity_build_checkoutDir}"/regression-test/pipeline/vault_p0/conf/be_custom.conf "${DORIS_HOME}"/be/conf/
+    if [[ -f "${DORIS_HOME}"/ms/conf/doris_cloud.conf && ! -f "${DORIS_HOME}"/ms/conf/selectdb_cloud.conf ]]; then
+        ln -s "${DORIS_HOME}"/ms/conf/doris_cloud.conf "${DORIS_HOME}"/ms/conf/selectdb_cloud.conf
+    fi
+    if [[ -f "${DORIS_HOME}"/ms/conf/selectdb_cloud.conf && ! -f "${DORIS_HOME}"/ms/conf/doris_cloud.conf ]]; then
+        ln -s "${DORIS_HOME}"/ms/conf/selectdb_cloud.conf "${DORIS_HOME}"/ms/conf/doris_cloud.conf
+    fi
     fdb_cluster="$(cat /etc/foundationdb/fdb.cluster)"
     sed -i "s/^fdb_cluster = .*/fdb_cluster = ${fdb_cluster}/" "${DORIS_HOME}"/ms/conf/doris_cloud.conf
     sed -i "s/^fdb_cluster = .*/fdb_cluster = ${fdb_cluster}/" "${DORIS_HOME}"/recycler/conf/doris_cloud.conf
