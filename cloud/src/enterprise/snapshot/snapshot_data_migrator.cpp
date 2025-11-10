@@ -276,10 +276,6 @@ int MigrateExecutor::migrate_table_version_keys() {
     opts.snapshot = true;
     opts.prefetch = true;
     auto iter = scan_txn->full_range_get(begin_key, end_key, opts);
-    if (err != TxnErrorCode::TXN_OK) {
-        LOG_WARNING("failed to scan table version keys").tag("error", err);
-        return -1;
-    }
 
     int total_keys = 0;
     int migrated_keys = 0;
@@ -318,6 +314,11 @@ int MigrateExecutor::migrate_table_version_keys() {
                     .tag("table_id", table_id);
             return -1;
         }
+    }
+
+    if (!iter->is_valid()) {
+        LOG_WARNING("failed to iterate table version keys").tag("error", iter->error_code());
+        return -1;
     }
 
     return 0;
@@ -405,10 +406,6 @@ int MigrateExecutor::migrate_tablet_schema_keys() {
     opts.snapshot = true;
     opts.prefetch = true;
     auto iter = scan_txn->full_range_get(begin_key, end_key, opts);
-    if (err != TxnErrorCode::TXN_OK) {
-        LOG_WARNING("failed to scan tablet schema keys").tag("error", err);
-        return -1;
-    }
 
     int total_keys = 0;
     int migrated_keys = 0;
@@ -464,6 +461,11 @@ int MigrateExecutor::migrate_tablet_schema_keys() {
                     .tag("schema_version", schema_version);
             return -1;
         }
+    }
+
+    if (!iter->is_valid()) {
+        LOG_WARNING("failed to iterate tablet schema keys").tag("error", iter->error_code());
+        return -1;
     }
 
     return 0;
@@ -616,6 +618,11 @@ int MigrateExecutor::migrate_partition_version_keys() {
                     .tag("partition_id", partition_id);
             return -1;
         }
+    }
+
+    if (!iter->is_valid()) {
+        LOG_WARNING("failed to iterate partition version keys").tag("error", iter->error_code());
+        return -1;
     }
 
     return 0;
@@ -843,6 +850,12 @@ int MigrateExecutor::migrate_tablet_index_keys() {
             return -1;
         }
     }
+
+    if (!iter->is_valid()) {
+        LOG_WARNING("failed to iterate tablet index keys").tag("error", iter->error_code());
+        return -1;
+    }
+
     return 0;
 }
 
@@ -959,6 +972,11 @@ int MigrateExecutor::migrate_meta_tablet_keys() {
                     .tag("tablet_id", tablet_id);
             return -1;
         }
+    }
+
+    if (!iter->is_valid()) {
+        LOG_WARNING("failed to iterate meta tablet keys").tag("error", iter->error_code());
+        return -1;
     }
 
     return 0;
@@ -1312,6 +1330,11 @@ int MigrateExecutor::get_all_tablets(std::vector<int64_t>* tablet_ids) {
         tablet_ids->push_back(tablet_id);
     }
 
+    if (!iter->is_valid()) {
+        LOG_WARNING("failed to iterate tablet index keys").tag("error", iter->error_code());
+        return -1;
+    }
+
     return 0;
 }
 
@@ -1345,6 +1368,14 @@ int MigrateExecutor::get_tablet_version_graph(
         int64_t version = rowset_meta.end_version();
         (*version_graph)[version] = rowset_meta;
     }
+
+    if (!iter->is_valid()) {
+        LOG_WARNING("failed to iterate meta rowset keys")
+                .tag("tablet_id", tablet_id)
+                .tag("error", iter->error_code());
+        return -1;
+    }
+
     return 0;
 }
 
