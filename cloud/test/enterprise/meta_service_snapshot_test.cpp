@@ -2807,8 +2807,8 @@ TEST(MetaServiceSnapshotTest, GetInstanceWithPredecessorSuccessorTest) {
         instance.set_instance_id("test_instance");
         instance.set_name("test_instance");
         instance.set_user_id("test_user");
-        instance.set_source_instance_id("parent_instance");     // predecessor
-        instance.set_succeed_instance_id("successor_instance"); // successor
+        instance.set_source_instance_id("parent_instance");       // predecessor
+        instance.set_successor_instance_id("successor_instance"); // successor
 
         // Add basic obj_info
         auto* obj = instance.add_obj_info();
@@ -2844,8 +2844,8 @@ TEST(MetaServiceSnapshotTest, GetInstanceWithPredecessorSuccessorTest) {
         ASSERT_TRUE(res.instance().has_source_instance_id());
         EXPECT_EQ(res.instance().source_instance_id(), "parent_instance");
 
-        ASSERT_TRUE(res.instance().has_succeed_instance_id());
-        EXPECT_EQ(res.instance().succeed_instance_id(), "successor_instance");
+        ASSERT_TRUE(res.instance().has_successor_instance_id());
+        EXPECT_EQ(res.instance().successor_instance_id(), "successor_instance");
     }
 }
 

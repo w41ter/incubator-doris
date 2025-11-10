@@ -91,7 +91,7 @@ suite("test_rollback_basic", "snapshot,docker") {
             "from_instance_id": "old_instance_id",
             "instance_id": "new_instance_id",
             "name": "new_instance",
-            "is_succeed": true
+            "is_successor": true
         }
         """
         logger.info("Rollback the cluster with snapshot: " + cluster_snapshot_content)

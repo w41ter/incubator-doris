@@ -36,8 +36,8 @@ public class CloneSnapshotState {
     private Boolean isReadOnly;
     @JsonProperty("obj_info")
     private ObjInfo objInfo;
-    @JsonProperty("is_succeed")
-    private Boolean isSucceed;
+    @JsonProperty("is_successor")
+    private Boolean isSuccessor;
 
     public static class ObjInfo {
         @JsonProperty("ak")
@@ -122,10 +122,10 @@ public class CloneSnapshotState {
         if (isReadOnly()) {
             throw new IllegalArgumentException("read only clone is not supported yet");
         }
-        if (isSucceed() && objInfo != null) {
-            throw new IllegalArgumentException("obj_info must be null when is_succeed is true");
+        if (isSuccessor() && objInfo != null) {
+            throw new IllegalArgumentException("obj_info must be null when is_successor is true");
         }
-        if (!isSucceed()) {
+        if (!isSuccessor()) {
             // Since read only clone is not supported yet, so objInfo must not be null
             if (objInfo == null) {
                 throw new IllegalArgumentException("obj_info is null, it is required for writeable clone");

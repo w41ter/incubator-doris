@@ -1194,13 +1194,12 @@ TxnErrorCode SnapshotManager::validate_source_instance(Transaction* txn,
     // Type-specific validation
     if (clone_type == CloneInstanceRequest::ROLLBACK) {
         // Validate source instance does not already have a successor instance
-        if (from_instance_info->has_succeed_instance_id() &&
-            !from_instance_info->succeed_instance_id().empty()) {
+        if (from_instance_info->has_successor_instance_id() &&
+            !from_instance_info->successor_instance_id().empty()) {
             *error_msg = fmt::format(
                     "source instance already has a successor instance: {}, ROLLBACK only one "
-                    "successor is "
-                    "allowed",
-                    from_instance_info->succeed_instance_id());
+                    "successor is allowed",
+                    from_instance_info->successor_instance_id());
             return TxnErrorCode::TXN_KEY_NOT_FOUND;
         }
     }
@@ -1538,7 +1537,7 @@ MetaServiceCode SnapshotManager::update_source_instance_successor(
         Transaction* txn, const std::string& from_instance_key, InstanceInfoPB* from_instance_info,
         const std::string& new_instance_id, std::string* error_msg) {
     // Update source instance to record the successor instance
-    from_instance_info->set_succeed_instance_id(new_instance_id);
+    from_instance_info->set_successor_instance_id(new_instance_id);
     std::string updated_source_instance_val;
     if (!from_instance_info->SerializeToString(&updated_source_instance_val)) {
         *error_msg = "failed to serialize updated source InstanceInfoPB";
