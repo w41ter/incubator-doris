@@ -63,6 +63,8 @@ public:
 
     int migrate_to_versioned_keys(doris::cloud::InstanceDataMigrator* migrator) override;
 
+    int compact_snapshot_chains(doris::cloud::InstanceChainCompactor* compactor) override;
+
 private:
     // Validation functions
     doris::cloud::MetaServiceCode validate_clone_request(

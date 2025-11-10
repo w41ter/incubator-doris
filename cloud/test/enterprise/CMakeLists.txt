@@ -18,5 +18,8 @@ target_link_libraries(enterprise_meta_service_http_test ${TEST_LINK_LIBS})
 add_executable(enterprise_migrate_snapshot_keys_test migrate_snapshot_keys_test.cpp)
 target_link_libraries(enterprise_migrate_snapshot_keys_test ${TEST_LINK_LIBS})
 
+add_executable(enterprise_snapshot_chain_compactor_test snapshot_chain_compactor_test.cpp)
+target_link_libraries(enterprise_snapshot_chain_compactor_test ${TEST_LINK_LIBS})
+
 add_executable(enterprise_recycle_snapshot_test recycle_snapshot_test.cpp)
 target_link_libraries(enterprise_recycle_snapshot_test ${TEST_LINK_LIBS})

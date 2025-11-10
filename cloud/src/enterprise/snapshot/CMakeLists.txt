@@ -5,6 +5,7 @@ set(ENTERPRISE_SNAPSHOT_SOURCES
     recycle_snapshot.cpp
     check_snapshot.cpp
     snapshot_data_migrator.cpp
+    snapshot_chain_compactor.cpp
     snapshot_manager.cpp
     meta_check_snapshot.cpp)
 

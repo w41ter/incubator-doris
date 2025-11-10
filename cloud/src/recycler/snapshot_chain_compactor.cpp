@@ -28,6 +28,10 @@
 #include "recycler/s3_accessor.h"
 #include "recycler/util.h"
 
+#ifdef FEATURE_ENTERPRISE_SNAPSHOT
+#include "enterprise/snapshot/snapshot_manager.h"
+#endif
+
 namespace doris::cloud {
 
 SnapshotChainCompactor::SnapshotChainCompactor(std::shared_ptr<TxnKv> txn_kv)
@@ -384,7 +388,11 @@ int InstanceChainCompactor::do_compact() {
                 .tag("cost(sec)", stop_watch.elapsed_seconds());
     };
 
+#ifdef FEATURE_ENTERPRISE_SNAPSHOT
+    selectdb::SnapshotManager snapshot_mgr(txn_kv_);
+#else
     SnapshotManager snapshot_mgr(txn_kv_);
+#endif
     int res = snapshot_mgr.compact_snapshot_chains(this);
     if (res != 0) {
         LOG_WARNING("failed to compact snapshot chains").tag("instance_id", instance_id_);
