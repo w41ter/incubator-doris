@@ -1001,7 +1001,12 @@ int MigrateExecutor::migrate_rowset_meta(int64_t tablet_id,
     std::string rowset_meta_key = meta_rowset_key({instance_id_, tablet_id, end_version});
     std::string value;
     err = txn->get(rowset_meta_key, &value);
-    if (err != TxnErrorCode::TXN_OK) {
+    if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        // Already deleted, skip
+        VLOG_DEBUG << "rowset meta not found for tablet " << tablet_id << ", version "
+                   << end_version;
+        return 1;
+    } else if (err != TxnErrorCode::TXN_OK) {
         LOG_WARNING("failed to read RowsetMetaCloudPB to migrate rowset meta").tag("error", err);
         return -1;
     }
@@ -1018,25 +1023,38 @@ int MigrateExecutor::migrate_rowset_meta(int64_t tablet_id,
         return 1;
     }
 
-    bool serialization_success = false;
-    doris::RowsetMetaCloudPB rowset_meta_copy = rowset_meta;
+    // Check whether the versioned key already exists.
+    std::string versioned_key;
     if (start_version == end_version || end_version == 1) {
-        std::string versioned_key =
-                versioned::meta_rowset_load_key({instance_id_, tablet_id, end_version});
-        serialization_success =
-                versioned::document_put(txn.get(), versioned_key, std::move(rowset_meta_copy));
+        versioned_key = versioned::meta_rowset_load_key({instance_id_, tablet_id, end_version});
     } else {
-        std::string versioned_key =
-                versioned::meta_rowset_compact_key({instance_id_, tablet_id, end_version});
-        serialization_success =
-                versioned::document_put(txn.get(), versioned_key, std::move(rowset_meta_copy));
+        versioned_key = versioned::meta_rowset_compact_key({instance_id_, tablet_id, end_version});
     }
-    if (!serialization_success) {
+
+    doris::RowsetMetaCloudPB exists_value;
+    Versionstamp exists_versionstamp;
+    err = versioned::document_get(txn.get(), versioned_key, &exists_value, &exists_versionstamp);
+    if (err == TxnErrorCode::TXN_OK) {
+        // Already migrated, skip
+        VLOG_DEBUG << "rowset meta already migrated for tablet " << tablet_id << ", version "
+                   << end_version;
+        return 1;
+    } else if (err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        LOG_WARNING("failed to get versioned key to migrate rowset meta").tag("error", err);
+        return -1;
+    }
+
+    std::string rowset_id = rowset_meta.rowset_id_v2();
+    doris::RowsetMetaCloudPB rowset_meta_copy = rowset_meta;
+    if (!versioned::document_put(txn.get(), versioned_key, migrate_versionstamp,
+                                 std::move(rowset_meta_copy))) {
         LOG_WARNING("failed to serialize RowsetMetaCloudPB to migrate rowset meta keys");
         return -1;
     }
 
-    // TODO(walter): add data reference counting here
+    std::string data_ref_count_key = versioned::data_rowset_ref_count_key(
+            {instance_id_, tablet_id, rowset_meta.rowset_id_v2()});
+    txn->atomic_add(data_ref_count_key, 1);
 
     err = txn->commit();
     if (err == TxnErrorCode::TXN_OK) {
@@ -1116,6 +1134,10 @@ int MigrateExecutor::migrate_meta_rowset_keys() {
             return -1;
         }
 
+        // The migrate versionstamp is used to determine the versionstamp of the migrated rowset meta.
+        // It should ensure that the migrated rowset meta has a versionstamp smaller than the read version of
+        // the current transaction, so that the migrated rowset meta is visible to the current transaction,
+        // but does not affect the visibility of other data written after current transaction.
         Versionstamp migrate_versionstamp(read_version - 1, 0);
         for (auto&& [_, rowset_meta] : rowset_meta_map) {
             total_keys++;
