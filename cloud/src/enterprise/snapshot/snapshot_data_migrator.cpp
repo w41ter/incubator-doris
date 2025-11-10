@@ -8,6 +8,7 @@
 #include <string_view>
 #include <thread>
 
+#include "common/config.h"
 #include "common/defer.h"
 #include "common/logging.h"
 #include "common/stopwatch.h"
@@ -203,6 +204,99 @@ private:
     const std::string instance_id_;
     std::shared_ptr<TxnKv> txn_kv_;
     SnapshotDataMigrateContext migrate_context_;
+};
+
+class MigrateValidator {
+public:
+    struct ValidationResult {
+        int total_entities = 0;
+        int validated_entities = 0;
+        int inconsistent_entities = 0;
+        int error_entities = 0;
+
+        void apply_validation_result(int res) {
+            if (res == 0) {
+                validated_entities++;
+            } else if (res == 1) {
+                inconsistent_entities++;
+            } else {
+                error_entities++;
+            }
+        }
+    };
+
+    struct CollectedEntities {
+        // table_id -> (db_id, table_id)
+        std::unordered_map<int64_t, std::pair<int64_t, int64_t>> tables;
+        // partition_id -> (db_id, table_id, partition_id)
+        std::unordered_map<int64_t, std::tuple<int64_t, int64_t, int64_t>> partitions;
+        // tablet_id -> (table_id, index_id, partition_id, tablet_id)
+        std::unordered_map<int64_t, std::tuple<int64_t, int64_t, int64_t, int64_t>> tablets;
+        // index_id -> (db_id, table_id, index_id)
+        std::unordered_map<int64_t, std::tuple<int64_t, int64_t, int64_t>> indexes;
+        // (index_id, schema_version)
+        std::vector<std::pair<int64_t, int64_t>> schemas;
+    };
+
+    MigrateValidator(const std::string& instance_id, std::shared_ptr<TxnKv> txn_kv)
+            : instance_id_(instance_id), txn_kv_(std::move(txn_kv)) {}
+
+    int validate_all_migrated_keys();
+
+private:
+    int collect_all_entities(CollectedEntities* entities);
+
+    // Validate table version keys
+    int validate_table_version_keys(const CollectedEntities& entities, ValidationResult* result);
+
+    // Validate partition related keys
+    // 1. partition version key
+    // 2. partition meta key
+    // 3. partition index & inverted index keys
+    int validate_partition_keys(const CollectedEntities& entities, ValidationResult* result);
+
+    // Validate tablet related keys
+    // 1. tablet meta key
+    // 2. tablet index & inverted index keys
+    // 3. tablet stats keys
+    int validate_tablet_keys(const CollectedEntities& entities, ValidationResult* result);
+
+    // Validate tablet index schema keys
+    // 1. index schema keys
+    // 2. index index & inverted index keys.
+    int validate_tablet_schema_keys(const CollectedEntities& entities, ValidationResult* result);
+
+    int validate_rowset_meta_keys(const CollectedEntities& entities, ValidationResult* result);
+
+    // Helper functions for validating single entities
+    // Returns: 0=consistent, 1=inconsistent, -1=error
+    int validate_table_version(Transaction* txn, MetaReader& meta_reader, int64_t db_id,
+                               int64_t table_id);
+    int validate_partition_version(Transaction* txn, MetaReader& meta_reader, int64_t db_id,
+                                   int64_t table_id, int64_t partition_id, bool* exists);
+    int validate_index_schema(Transaction* txn, MetaReader& meta_reader, int64_t index_id,
+                              int64_t schema_version, bool* exists);
+    int validate_tablet_index(Transaction* txn, MetaReader& meta_reader, int64_t tablet_id);
+    int validate_tablet_meta(Transaction* txn, MetaReader& meta_reader, int64_t table_id,
+                             int64_t index_id, int64_t partition_id, int64_t tablet_id);
+    int validate_rowset_metas(Transaction* txn, MetaReader& meta_reader, int64_t tablet_id);
+    int validate_tablet_stats(Transaction* txn, MetaReader& meta_reader, int64_t tablet_id);
+
+    // Validate versioned-only keys (partition/index/tablet index and inverted_index)
+    int validate_partition_index_keys(Transaction* txn, int64_t partition_id, int64_t db_id,
+                                      int64_t table_id);
+    int validate_partition_meta_key(Transaction* txn, int64_t partition_id, int64_t db_id,
+                                    int64_t table_id);
+    int validate_index_index_keys(Transaction* txn, int64_t index_id, int64_t db_id,
+                                  int64_t table_id);
+    int validate_index_meta_key(Transaction* txn, int64_t index_id, int64_t db_id,
+                                int64_t table_id);
+    int validate_tablet_inverted_index_keys(Transaction* txn, int64_t tablet_id, int64_t db_id,
+                                            int64_t table_id, int64_t index_id,
+                                            int64_t partition_id);
+
+    const std::string instance_id_;
+    std::shared_ptr<TxnKv> txn_kv_;
 };
 
 int MigrateExecutor::migrate_table_version_key(int64_t db_id, int64_t table_id) {
@@ -1535,6 +1629,962 @@ int SnapshotManager::migrate_to_versioned_keys(InstanceDataMigrator* migrator) {
                     .tag("key_set", KeySetType_Name(key_set));
             return ret;
         }
+    }
+
+    if (config::enable_snapshot_data_migrator_validation) {
+        MigrateValidator validator(instance_id, txn_kv_);
+        int validation_ret = validator.validate_all_migrated_keys();
+        if (validation_ret != 0) {
+            LOG_WARNING("validation failed after migration").tag("error_code", validation_ret);
+            if (!config::allow_snapshot_data_validation_failure) {
+                return -1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+// ==================== MigrateValidator Implementation ====================
+
+int MigrateValidator::collect_all_entities(CollectedEntities* entities) {
+    std::unique_ptr<Transaction> txn;
+    TxnErrorCode err = txn_kv_->create_txn(&txn);
+    if (err != TxnErrorCode::TXN_OK) {
+        LOG_WARNING("failed to create txn for collecting entities").tag("error", err);
+        return -1;
+    }
+
+    // Collect table version keys
+    {
+        std::string begin_key = table_version_key({instance_id_, 0, 0});
+        std::string end_key = table_version_key({instance_id_, INT64_MAX, INT64_MAX});
+        FullRangeGetOptions opts;
+        opts.snapshot = true;
+        opts.prefetch = true;
+        auto iter = txn->full_range_get(begin_key, end_key, opts);
+        for (auto kvp = iter->next(); kvp.has_value(); kvp = iter->next()) {
+            auto&& [key, value] = *kvp;
+            int64_t db_id = -1, table_id = -1;
+            std::string_view key_view(key);
+            if (!decode_table_version_key(&key_view, &db_id, &table_id)) {
+                LOG_WARNING("failed to decode table version key").tag("key", hex(key));
+                return -1;
+            }
+            entities->tables[table_id] = {db_id, table_id};
+        }
+
+        if (!iter->is_valid()) {
+            LOG_WARNING("failed to iterate table version keys").tag("error", iter->error_code());
+            return -1;
+        }
+    }
+
+    // Collect partition version keys
+    {
+        std::string begin_key = partition_version_key({instance_id_, 0, 0, 0});
+        std::string end_key =
+                partition_version_key({instance_id_, INT64_MAX, INT64_MAX, INT64_MAX});
+        FullRangeGetOptions opts;
+        opts.snapshot = true;
+        opts.prefetch = true;
+        auto iter = txn->full_range_get(begin_key, end_key, opts);
+        for (auto kvp = iter->next(); kvp.has_value(); kvp = iter->next()) {
+            auto&& [key, value] = *kvp;
+            int64_t db_id = -1, table_id = -1, partition_id = -1;
+            std::string_view key_view(key);
+            if (!decode_partition_version_key(&key_view, &db_id, &table_id, &partition_id)) {
+                LOG_WARNING("failed to decode partition version key").tag("key", hex(key));
+                return -1;
+            }
+            entities->partitions[partition_id] = {db_id, table_id, partition_id};
+        }
+        if (!iter->is_valid()) {
+            LOG_WARNING("failed to iterate partition version keys")
+                    .tag("error", iter->error_code());
+            return -1;
+        }
+    }
+
+    // Collect tablet index keys
+    {
+        std::string begin_key = meta_tablet_idx_key({instance_id_, 0});
+        std::string end_key = meta_tablet_idx_key({instance_id_, INT64_MAX});
+        FullRangeGetOptions opts;
+        opts.snapshot = true;
+        opts.prefetch = true;
+        auto iter = txn->full_range_get(begin_key, end_key, opts);
+        for (auto kvp = iter->next(); kvp.has_value(); kvp = iter->next()) {
+            auto&& [key, value] = *kvp;
+            int64_t tablet_id = -1;
+            std::string_view key_view(key);
+            if (!decode_meta_tablet_idx_key(&key_view, &tablet_id)) {
+                LOG_WARNING("failed to decode meta tablet idx key").tag("key", hex(key));
+                return -1;
+            }
+
+            TabletIndexPB tablet_index;
+            if (!tablet_index.ParseFromArray(value.data(), value.size())) {
+                LOG_WARNING("failed to parse TabletIndexPB").tag("tablet_id", tablet_id);
+                return -1;
+            }
+
+            int64_t db_id = tablet_index.db_id();
+            int64_t table_id = tablet_index.table_id();
+            int64_t index_id = tablet_index.index_id();
+            int64_t partition_id = tablet_index.partition_id();
+
+            entities->tablets[tablet_id] = {table_id, index_id, partition_id, tablet_id};
+            entities->indexes[index_id] = {db_id, table_id, index_id};
+        }
+        if (!iter->is_valid()) {
+            LOG_WARNING("failed to iterate tablet index keys").tag("error", iter->error_code());
+            return -1;
+        }
+    }
+
+    // Collect tablet schema keys
+    {
+        std::string begin_key = meta_schema_key({instance_id_, 0, 0});
+        std::string end_key = meta_schema_key({instance_id_, INT64_MAX, INT64_MAX});
+        FullRangeGetOptions opts;
+        opts.snapshot = true;
+        opts.prefetch = true;
+        auto iter = txn->full_range_get(begin_key, end_key, opts);
+
+        std::string last_key = "";
+        for (auto kvp = iter->next(); kvp.has_value(); kvp = iter->next()) {
+            auto&& [key, value] = *kvp;
+            std::string_view key_view(key);
+            if (key_view.size() != begin_key.size()) {
+                // compatible with old version (blob message), see blob_message.h
+                if (key_view.size() < 9) {
+                    LOG_WARNING("failed to decode tablet schema key").tag("key", hex(key));
+                    return -1;
+                }
+                key_view.remove_suffix(9);
+            }
+
+            if (!last_key.empty() && key.starts_with(last_key)) {
+                // Skip blobs for the same schema key
+                continue;
+            }
+            last_key = std::string(key_view);
+
+            int64_t index_id = -1, schema_version = -1;
+            if (!decode_tablet_schema_key(&key_view, &index_id, &schema_version)) {
+                LOG_WARNING("failed to decode tablet schema key").tag("key", hex(key));
+                return -1;
+            }
+            entities->schemas.push_back({index_id, schema_version});
+        }
+        if (!iter->is_valid()) {
+            LOG_WARNING("failed to iterate tablet schema keys").tag("error", iter->error_code());
+            return -1;
+        }
+    }
+
+    LOG_INFO("collected entities for validation")
+            .tag("tables", entities->tables.size())
+            .tag("partitions", entities->partitions.size())
+            .tag("tablets", entities->tablets.size())
+            .tag("indexes", entities->indexes.size())
+            .tag("schemas", entities->schemas.size());
+
+    return 0;
+}
+
+int MigrateValidator::validate_all_migrated_keys() {
+    LOG_INFO("begin to validate migrated keys");
+
+    CollectedEntities entities;
+    if (collect_all_entities(&entities) != 0) {
+        LOG_WARNING("failed to collect entities for validation");
+        return -1;
+    }
+
+    ValidationResult result;
+    StopWatch stop_watch;
+
+    DORIS_CLOUD_DEFER {
+        LOG_INFO("validate migrated keys finished")
+                .tag("total", result.total_entities)
+                .tag("validated", result.validated_entities)
+                .tag("inconsistent", result.inconsistent_entities)
+                .tag("error", result.error_entities)
+                .tag("cost(s)", stop_watch.elapsed_seconds());
+    };
+
+    // Validate each key type
+    if (validate_table_version_keys(entities, &result) != 0) {
+        return -1;
+    }
+
+    if (validate_partition_keys(entities, &result) != 0) {
+        return -1;
+    }
+
+    if (validate_tablet_schema_keys(entities, &result) != 0) {
+        return -1;
+    }
+
+    if (validate_tablet_keys(entities, &result) != 0) {
+        return -1;
+    }
+
+    if (validate_rowset_meta_keys(entities, &result) != 0) {
+        return -1;
+    }
+
+    return result.inconsistent_entities > 0 || result.error_entities > 0 ? -1 : 0;
+}
+
+int MigrateValidator::validate_table_version(Transaction* txn, MetaReader& meta_reader,
+                                             int64_t db_id, int64_t table_id) {
+    // Read old version key
+    std::string old_key = table_version_key({instance_id_, db_id, table_id});
+    std::string old_value;
+    TxnErrorCode old_err = txn->get(old_key, &old_value);
+
+    // Read new version key using MetaReader
+    Versionstamp new_version;
+    TxnErrorCode new_err = meta_reader.get_table_version(txn, table_id, &new_version, true);
+
+    bool old_exists = (old_err == TxnErrorCode::TXN_OK);
+    bool new_exists = (new_err == TxnErrorCode::TXN_OK);
+
+    if (old_exists != new_exists) {
+        LOG_WARNING("table version key existence mismatch")
+                .tag("table_id", table_id)
+                .tag("db_id", db_id)
+                .tag("old_key", hex(old_key))
+                .tag("old_exists", old_exists)
+                .tag("new_exists", new_exists);
+        return 1; // inconsistent
+    }
+
+    if (old_err != TxnErrorCode::TXN_OK && old_err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        LOG_WARNING("failed to read old table version key").tag("error", old_err);
+        return -1;
+    }
+
+    if (new_err != TxnErrorCode::TXN_OK && new_err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        LOG_WARNING("failed to read new table version key").tag("error", new_err);
+        return -1;
+    }
+
+    return 0; // consistent
+}
+
+int MigrateValidator::validate_table_version_keys(const CollectedEntities& entities,
+                                                  ValidationResult* result) {
+    LOG_INFO("begin to validate table version keys").tag("count", entities.tables.size());
+
+    for (const auto& [table_id, db_table] : entities.tables) {
+        result->total_entities++;
+        auto [db_id, _] = db_table;
+
+        std::unique_ptr<Transaction> txn;
+        TxnErrorCode err = txn_kv_->create_txn(&txn);
+        if (err != TxnErrorCode::TXN_OK) {
+            LOG_WARNING("failed to create txn for validation").tag("error", err);
+            result->error_entities++;
+            continue;
+        }
+
+        MetaReader meta_reader(instance_id_, txn_kv_.get());
+        int ret = validate_table_version(txn.get(), meta_reader, db_id, table_id);
+        if (ret == 0) {
+            result->validated_entities++;
+        } else if (ret == 1) {
+            result->inconsistent_entities++;
+        } else {
+            result->error_entities++;
+        }
+    }
+
+    return 0;
+}
+
+int MigrateValidator::validate_partition_version(Transaction* txn, MetaReader& meta_reader,
+                                                 int64_t db_id, int64_t table_id,
+                                                 int64_t partition_id, bool* exists) {
+    AnnotateTag partition_tag("partition_id", partition_id);
+    AnnotateTag table_tag("table_id", table_id);
+    AnnotateTag db_tag("db_id", db_id);
+
+    // Read old version key
+    std::string old_key = partition_version_key({instance_id_, db_id, table_id, partition_id});
+    std::string old_value;
+    TxnErrorCode old_err = txn->get(old_key, &old_value);
+
+    // Read new version key using MetaReader
+    VersionPB new_version;
+    Versionstamp new_versionstamp;
+    TxnErrorCode new_err = meta_reader.get_partition_version(txn, partition_id, &new_version,
+                                                             &new_versionstamp, true);
+
+    bool old_exists = (old_err == TxnErrorCode::TXN_OK);
+    bool new_exists = (new_err == TxnErrorCode::TXN_OK);
+
+    if (old_exists != new_exists) {
+        LOG_WARNING("partition version key existence mismatch")
+                .tag("old_key", hex(old_key))
+                .tag("old_exists", old_exists)
+                .tag("new_exists", new_exists);
+        return 1; // inconsistent
+    }
+
+    if (old_err != TxnErrorCode::TXN_OK && old_err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        LOG_WARNING("failed to read old partition version key").tag("error", old_err);
+        return -1;
+    }
+
+    if (new_err != TxnErrorCode::TXN_OK && new_err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        LOG_WARNING("failed to read new partition version key").tag("error", new_err);
+        return -1;
+    }
+
+    if (!old_exists) {
+        *exists = false;
+        return 0; // both not exist
+    }
+
+    // Compare values
+    VersionPB old_version;
+    if (!old_version.ParseFromString(old_value)) {
+        LOG_WARNING("failed to parse old partition version");
+        return -1;
+    }
+
+    std::string old_serialized, new_serialized;
+    if (!old_version.SerializeToString(&old_serialized) ||
+        !new_version.SerializeToString(&new_serialized)) {
+        LOG_WARNING("failed to serialize partition version for comparison")
+                .tag("old_value", old_version.ShortDebugString())
+                .tag("new_value", new_version.ShortDebugString());
+        return -1;
+    }
+
+    if (old_serialized != new_serialized) {
+        LOG_WARNING("partition version content mismatch")
+                .tag("old_value", old_version.ShortDebugString())
+                .tag("new_value", new_version.ShortDebugString());
+        return 1;
+    }
+
+    *exists = true;
+    return 0;
+}
+
+int MigrateValidator::validate_partition_keys(const CollectedEntities& entities,
+                                              ValidationResult* result) {
+    LOG_INFO("begin to validate partition keys").tag("count", entities.partitions.size());
+
+    for (const auto& [partition_id, db_table_partition] : entities.partitions) {
+        result->total_entities++;
+        auto [db_id, table_id, _] = db_table_partition;
+
+        std::unique_ptr<Transaction> txn;
+        TxnErrorCode err = txn_kv_->create_txn(&txn);
+        if (err != TxnErrorCode::TXN_OK) {
+            LOG_WARNING("failed to create txn for validation").tag("error", err);
+            result->error_entities++;
+            continue;
+        }
+
+        bool exists = false;
+        MetaReader meta_reader(instance_id_, txn_kv_.get());
+        int ret = validate_partition_version(txn.get(), meta_reader, db_id, table_id, partition_id,
+                                             &exists);
+        result->apply_validation_result(ret);
+        if (!exists) {
+            continue;
+        }
+
+        ret = validate_partition_index_keys(txn.get(), partition_id, db_id, table_id);
+        result->apply_validation_result(ret);
+        ret = validate_partition_meta_key(txn.get(), partition_id, db_id, table_id);
+        result->apply_validation_result(ret);
+    }
+
+    return 0;
+}
+
+int MigrateValidator::validate_tablet_index(Transaction* txn, MetaReader& meta_reader,
+                                            int64_t tablet_id) {
+    AnnotateTag tablet_tag("tablet_id", tablet_id);
+
+    // Read old version key
+    std::string old_key = meta_tablet_idx_key({instance_id_, tablet_id});
+    std::string old_value;
+    TxnErrorCode old_err = txn->get(old_key, &old_value);
+
+    // Read new version key using MetaReader
+    TabletIndexPB new_tablet_index;
+    TxnErrorCode new_err = meta_reader.get_tablet_index(txn, tablet_id, &new_tablet_index, true);
+
+    bool old_exists = (old_err == TxnErrorCode::TXN_OK);
+    bool new_exists = (new_err == TxnErrorCode::TXN_OK);
+
+    if (old_exists != new_exists) {
+        LOG_WARNING("tablet index key existence mismatch")
+                .tag("old_key", hex(old_key))
+                .tag("old_exists", old_exists)
+                .tag("new_exists", new_exists);
+        return 1;
+    }
+
+    if (old_err != TxnErrorCode::TXN_OK && old_err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        LOG_WARNING("failed to read old tablet index key").tag("error", old_err);
+        return -1;
+    }
+
+    if (new_err != TxnErrorCode::TXN_OK && new_err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        LOG_WARNING("failed to read new tablet index key").tag("error", new_err);
+        return -1;
+    }
+
+    if (!old_exists) {
+        return 0;
+    }
+
+    // Compare values
+    TabletIndexPB old_tablet_index;
+    if (!old_tablet_index.ParseFromString(old_value)) {
+        LOG_WARNING("failed to parse old tablet index");
+        return -1;
+    }
+
+    std::string old_serialized, new_serialized;
+    if (!old_tablet_index.SerializeToString(&old_serialized) ||
+        !new_tablet_index.SerializeToString(&new_serialized)) {
+        LOG_WARNING("failed to serialize tablet index for comparison");
+        return -1;
+    }
+
+    if (old_serialized != new_serialized) {
+        LOG_WARNING("tablet index content mismatch")
+                .tag("old_size", old_serialized.size())
+                .tag("new_size", new_serialized.size());
+        return 1;
+    }
+
+    int64_t db_id = new_tablet_index.db_id();
+    int64_t table_id = new_tablet_index.table_id();
+    int64_t index_id = new_tablet_index.index_id();
+    int64_t partition_id = new_tablet_index.partition_id();
+    std::string inverted_index_key = versioned::tablet_inverted_index_key(
+            {instance_id_, db_id, table_id, index_id, partition_id, tablet_id});
+    std::string value;
+    TxnErrorCode err = txn->get(inverted_index_key, &value);
+    if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        LOG_WARNING("tablet inverted index key should exist after migration")
+                .tag("key", hex(inverted_index_key));
+        return 1;
+    } else if (err != TxnErrorCode::TXN_OK) {
+        LOG_WARNING("failed to read tablet inverted index key").tag("error", err);
+        return -1;
+    }
+
+    return 0;
+}
+
+int MigrateValidator::validate_tablet_meta(Transaction* txn, MetaReader& meta_reader,
+                                           int64_t table_id, int64_t index_id, int64_t partition_id,
+                                           int64_t tablet_id) {
+    // Read old version key
+    std::string old_key =
+            meta_tablet_key({instance_id_, table_id, index_id, partition_id, tablet_id});
+    std::string old_value;
+    TxnErrorCode old_err = txn->get(old_key, &old_value);
+
+    // Read new version key using MetaReader
+    doris::TabletMetaCloudPB new_tablet_meta;
+    Versionstamp new_versionstamp;
+    TxnErrorCode new_err =
+            meta_reader.get_tablet_meta(txn, tablet_id, &new_tablet_meta, &new_versionstamp, true);
+
+    bool old_exists = (old_err == TxnErrorCode::TXN_OK);
+    bool new_exists = (new_err == TxnErrorCode::TXN_OK);
+
+    if (old_exists != new_exists) {
+        LOG_WARNING("tablet meta key existence mismatch")
+                .tag("tablet_id", tablet_id)
+                .tag("old_key", hex(old_key))
+                .tag("old_exists", old_exists)
+                .tag("new_exists", new_exists);
+        return 1;
+    }
+
+    if (old_err != TxnErrorCode::TXN_OK && old_err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        LOG_WARNING("failed to read old tablet meta key").tag("error", old_err);
+        return -1;
+    }
+
+    if (new_err != TxnErrorCode::TXN_OK && new_err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        LOG_WARNING("failed to read new tablet meta key").tag("error", new_err);
+        return -1;
+    }
+
+    if (!old_exists) {
+        return 0;
+    }
+
+    // Compare values
+    doris::TabletMetaCloudPB old_tablet_meta;
+    if (!old_tablet_meta.ParseFromString(old_value)) {
+        LOG_WARNING("failed to parse old tablet meta").tag("tablet_id", tablet_id);
+        return -1;
+    }
+
+    std::string old_serialized, new_serialized;
+    if (!old_tablet_meta.SerializeToString(&old_serialized) ||
+        !new_tablet_meta.SerializeToString(&new_serialized)) {
+        LOG_WARNING("failed to serialize tablet meta for comparison");
+        return -1;
+    }
+
+    if (old_serialized != new_serialized) {
+        LOG_WARNING("tablet meta content mismatch")
+                .tag("tablet_id", tablet_id)
+                .tag("old_size", old_serialized.size())
+                .tag("new_size", new_serialized.size());
+        return 1;
+    }
+
+    return 0;
+}
+
+int MigrateValidator::validate_tablet_keys(const CollectedEntities& entities,
+                                           ValidationResult* result) {
+    LOG_INFO("begin to validate tablet keys").tag("count", entities.tablets.size());
+
+    for (const auto& [tablet_id, table_index_partition_tablet] : entities.tablets) {
+        result->total_entities++;
+        auto [table_id, index_id, partition_id, _] = table_index_partition_tablet;
+
+        std::unique_ptr<Transaction> txn;
+        TxnErrorCode err = txn_kv_->create_txn(&txn);
+        if (err != TxnErrorCode::TXN_OK) {
+            LOG_WARNING("failed to create txn for validation").tag("error", err);
+            result->error_entities++;
+            continue;
+        }
+
+        MetaReader meta_reader(instance_id_, txn_kv_.get());
+        int ret = validate_tablet_meta(txn.get(), meta_reader, table_id, index_id, partition_id,
+                                       tablet_id);
+        result->apply_validation_result(ret);
+        ret = validate_tablet_index(txn.get(), meta_reader, tablet_id);
+        result->apply_validation_result(ret);
+        ret = validate_tablet_stats(txn.get(), meta_reader, tablet_id);
+        result->apply_validation_result(ret);
+    }
+
+    return 0;
+}
+
+int MigrateValidator::validate_index_schema(Transaction* txn, MetaReader& meta_reader,
+                                            int64_t index_id, int64_t schema_version,
+                                            bool* exists) {
+    AnnotateTag index_tag("index_id", index_id);
+    AnnotateTag schema_version_tag("schema_version", schema_version);
+
+    // Read old version key using blob_get
+    std::string old_key = meta_schema_key({instance_id_, index_id, schema_version});
+    ValueBuf old_value_buf;
+    doris::TabletSchemaCloudPB old_schema;
+    TxnErrorCode old_err = blob_get(txn, old_key, &old_value_buf);
+    bool old_exists = (old_err == TxnErrorCode::TXN_OK);
+    if (old_exists && !old_value_buf.to_pb(&old_schema)) {
+        LOG_WARNING("failed to parse old tablet schema").tag("key", hex(old_key));
+        return -1;
+    }
+
+    // Read new version key using MetaReader
+    doris::TabletSchemaCloudPB new_schema;
+    TxnErrorCode new_err =
+            meta_reader.get_tablet_schema(txn, index_id, schema_version, &new_schema, true);
+    bool new_exists = (new_err == TxnErrorCode::TXN_OK);
+
+    if (old_exists != new_exists) {
+        LOG_WARNING("tablet schema existence mismatch")
+                .tag("old_key", hex(old_key))
+                .tag("old_exists", old_exists)
+                .tag("new_exists", new_exists);
+        return 1;
+    }
+
+    if (old_err != TxnErrorCode::TXN_OK && old_err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        LOG_WARNING("failed to read old tablet schema").tag("error", old_err);
+        return -1;
+    }
+
+    if (new_err != TxnErrorCode::TXN_OK && new_err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        LOG_WARNING("failed to read new tablet schema").tag("error", new_err);
+        return -1;
+    }
+
+    if (!old_exists) {
+        *exists = false;
+        return 0;
+    }
+
+    // Compare values
+    std::string old_serialized, new_serialized;
+    if (!old_schema.SerializeToString(&old_serialized) ||
+        !new_schema.SerializeToString(&new_serialized)) {
+        LOG_WARNING("failed to serialize tablet schema for comparison");
+        return -1;
+    }
+
+    if (old_serialized != new_serialized) {
+        LOG_WARNING("tablet schema content mismatch")
+                .tag("old_size", old_serialized.size())
+                .tag("new_size", new_serialized.size());
+        return 1;
+    }
+
+    *exists = true;
+    return 0;
+}
+
+int MigrateValidator::validate_tablet_schema_keys(const CollectedEntities& entities,
+                                                  ValidationResult* result) {
+    LOG_INFO("begin to validate tablet schema keys").tag("count", entities.schemas.size());
+
+    std::set<int64_t> existing_indexes;
+    for (const auto& [index_id, schema_version] : entities.schemas) {
+        result->total_entities++;
+
+        std::unique_ptr<Transaction> txn;
+        TxnErrorCode err = txn_kv_->create_txn(&txn);
+        if (err != TxnErrorCode::TXN_OK) {
+            LOG_WARNING("failed to create txn for validation").tag("error", err);
+            result->error_entities++;
+            continue;
+        }
+
+        bool exists = false;
+        MetaReader meta_reader(instance_id_, txn_kv_.get());
+        int ret = validate_index_schema(txn.get(), meta_reader, index_id, schema_version, &exists);
+        result->apply_validation_result(ret);
+        if (exists && !existing_indexes.contains(index_id)) {
+            existing_indexes.insert(index_id);
+            auto it = entities.indexes.find(index_id);
+            if (it == entities.indexes.end()) {
+                // Index not found, skip
+                continue;
+            }
+
+            auto [db_id, table_id, _] = it->second;
+            ret = validate_index_index_keys(txn.get(), index_id, db_id, table_id);
+            result->apply_validation_result(ret);
+
+            ret = validate_index_meta_key(txn.get(), index_id, db_id, table_id);
+            result->apply_validation_result(ret);
+        }
+    }
+
+    return 0;
+}
+
+int MigrateValidator::validate_rowset_metas(Transaction* txn, MetaReader& meta_reader,
+                                            int64_t tablet_id) {
+    // Get rowsets from old version (0x01)
+    std::string begin_key = meta_rowset_key({instance_id_, tablet_id, 0});
+    std::string end_key = meta_rowset_key({instance_id_, tablet_id, INT64_MAX});
+    FullRangeGetOptions opts;
+    opts.snapshot = true;
+    opts.prefetch = true;
+    auto iter = txn->full_range_get(begin_key, end_key, opts);
+
+    std::map<int64_t, doris::RowsetMetaCloudPB> old_rowsets;
+    for (auto kvp = iter->next(); kvp.has_value(); kvp = iter->next()) {
+        auto&& [key, value] = *kvp;
+        doris::RowsetMetaCloudPB rowset_meta;
+        if (!rowset_meta.ParseFromArray(value.data(), value.size())) {
+            LOG_WARNING("failed to parse old rowset meta").tag("tablet_id", tablet_id);
+            return -1;
+        }
+        old_rowsets[rowset_meta.end_version()] = rowset_meta;
+    }
+    if (!iter->is_valid()) {
+        LOG_WARNING("failed to iterate old rowset metas")
+                .tag("tablet_id", tablet_id)
+                .tag("error", iter->error_code());
+        return -1;
+    }
+
+    // Get rowsets from new version (0x03) using MetaReader
+    std::vector<doris::RowsetMetaCloudPB> new_rowset_metas;
+    TxnErrorCode err = meta_reader.get_rowset_metas(
+            txn, tablet_id, 0, std::numeric_limits<int64_t>::max(), &new_rowset_metas, true);
+    if (err != TxnErrorCode::TXN_OK && err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        LOG_WARNING("failed to read new rowset metas")
+                .tag("tablet_id", tablet_id)
+                .tag("error", err);
+        return -1;
+    }
+
+    std::map<int64_t, doris::RowsetMetaCloudPB> new_rowsets;
+    for (auto&& rowset_meta : new_rowset_metas) {
+        new_rowsets[rowset_meta.end_version()] = rowset_meta;
+    }
+
+    // Check if all old rowsets are covered by new rowsets
+    for (auto&& [version, old_rowset] : old_rowsets) {
+        auto it = new_rowsets.find(version);
+        if (it == new_rowsets.end()) {
+            // Not found in new rowsets
+            LOG_WARNING("rowset meta missing in versioned space")
+                    .tag("tablet_id", tablet_id)
+                    .tag("version", version)
+                    .tag("rowset_id", old_rowset.rowset_id_v2());
+            return 1; // inconsistent
+        }
+
+        std::string old_serialized, new_serialized;
+        if (!old_rowset.SerializeToString(&old_serialized) ||
+            !it->second.SerializeToString(&new_serialized)) {
+            LOG_WARNING("failed to serialize rowset meta for comparison")
+                    .tag("tablet_id", tablet_id)
+                    .tag("version", version);
+            return -1;
+        }
+
+        if (old_serialized != new_serialized) {
+            LOG_WARNING("rowset meta content mismatch")
+                    .tag("tablet_id", tablet_id)
+                    .tag("version", version)
+                    .tag("old_rowset", old_rowset.ShortDebugString())
+                    .tag("new_rowset", it->second.ShortDebugString());
+            return 1; // inconsistent
+        }
+    }
+
+    return 0;
+}
+
+int MigrateValidator::validate_rowset_meta_keys(const CollectedEntities& entities,
+                                                ValidationResult* result) {
+    LOG_INFO("begin to validate rowset meta keys").tag("count", entities.tablets.size());
+
+    for (const auto& [tablet_id, _] : entities.tablets) {
+        result->total_entities++;
+
+        std::unique_ptr<Transaction> txn;
+        TxnErrorCode err = txn_kv_->create_txn(&txn);
+        if (err != TxnErrorCode::TXN_OK) {
+            LOG_WARNING("failed to create txn for validation").tag("error", err);
+            result->error_entities++;
+            continue;
+        }
+
+        MetaReader meta_reader(instance_id_, txn_kv_.get());
+        int ret = validate_rowset_metas(txn.get(), meta_reader, tablet_id);
+        result->apply_validation_result(ret);
+    }
+
+    return 0;
+}
+
+int MigrateValidator::validate_tablet_stats(Transaction* txn, MetaReader& meta_reader,
+                                            int64_t tablet_id) {
+    // Get old version stats (0x01)
+    TabletStatsPB old_stats;
+    TabletStats old_detached_stats;
+
+    std::string tablet_idx_key = meta_tablet_idx_key({instance_id_, tablet_id});
+    std::string value;
+    TabletIndexPB tablet_idx;
+    TxnErrorCode err = txn->get(tablet_idx_key, &value);
+    if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        // Tablet was deleted, both should not exist
+        return 0;
+    } else if (err != TxnErrorCode::TXN_OK) {
+        LOG_WARNING("failed to get tablet index for stats validation")
+                .tag("tablet_id", tablet_id)
+                .tag("error", err);
+        return -1;
+    } else if (!tablet_idx.ParseFromString(value)) {
+        LOG_WARNING("failed to parse tablet index for stats validation")
+                .tag("tablet_id", tablet_id);
+        return -1;
+    }
+
+    tablet_idx.set_tablet_id(tablet_id);
+    MetaServiceCode code = MetaServiceCode::OK;
+    std::string msg;
+    internal_get_tablet_stats(code, msg, txn, instance_id_, tablet_idx, old_stats,
+                              old_detached_stats);
+    bool old_exists = (code == MetaServiceCode::OK);
+    if (code != MetaServiceCode::OK && code != MetaServiceCode::TABLET_NOT_FOUND) {
+        LOG_WARNING("failed to get old tablet stats").tag("tablet_id", tablet_id).tag("code", code);
+        return -1;
+    }
+    merge_tablet_stats(old_stats, old_detached_stats);
+
+    // Get new version stats (0x03)
+    TabletStatsPB new_load_stats, new_compact_stats;
+    TxnErrorCode load_err =
+            meta_reader.get_tablet_load_stats(txn, tablet_id, &new_load_stats, nullptr, true);
+    TxnErrorCode compact_err =
+            meta_reader.get_tablet_compact_stats(txn, tablet_id, &new_compact_stats, nullptr, true);
+
+    bool new_load_exists = (load_err == TxnErrorCode::TXN_OK);
+    bool new_compact_exists = (compact_err == TxnErrorCode::TXN_OK);
+    bool new_exists = new_load_exists || new_compact_exists;
+
+    if (old_exists != new_exists) {
+        LOG_WARNING("tablet stats existence mismatch")
+                .tag("tablet_id", tablet_id)
+                .tag("old_exists", old_exists)
+                .tag("new_load_exists", new_load_exists)
+                .tag("new_compact_exists", new_compact_exists);
+        return 1;
+    }
+
+    if (!old_exists) {
+        return 0;
+    }
+
+    TabletStatsPB new_stats;
+    MetaReader::merge_tablet_stats(new_load_stats, new_compact_stats, &new_stats);
+
+    std::string old_serialized, new_serialized;
+    if (!old_stats.SerializeToString(&old_serialized) ||
+        !new_stats.SerializeToString(&new_serialized)) {
+        LOG_WARNING("failed to serialize tablet stats for comparison").tag("tablet_id", tablet_id);
+        return -1;
+    }
+
+    if (old_serialized != new_serialized) {
+        LOG_WARNING("tablet stats content mismatch")
+                .tag("tablet_id", tablet_id)
+                .tag("old_stats", old_stats.ShortDebugString())
+                .tag("new_stats", new_stats.ShortDebugString());
+        return 1;
+    }
+
+    return 0;
+}
+
+int MigrateValidator::validate_partition_index_keys(Transaction* txn, int64_t partition_id,
+                                                    int64_t db_id, int64_t table_id) {
+    AnnotateTag partition_tag("partition_id", partition_id);
+    AnnotateTag table_tag("table_id", table_id);
+    AnnotateTag db_tag("db_id", db_id);
+
+    MetaReader meta_reader(instance_id_);
+
+    // Validate partition_index_key
+    PartitionIndexPB partition_index;
+    TxnErrorCode err = meta_reader.get_partition_index(txn, partition_id, &partition_index, true);
+
+    if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        LOG_WARNING("partition index key not found in versioned space");
+        return 1;
+    } else if (err != TxnErrorCode::TXN_OK) {
+        LOG_WARNING("failed to read partition index").tag("error", err);
+        return -1;
+    }
+
+    // Validate content
+    if (partition_index.db_id() != db_id || partition_index.table_id() != table_id) {
+        LOG_WARNING("partition index content mismatch")
+                .tag("actual_db_id", partition_index.db_id())
+                .tag("actual_table_id", partition_index.table_id());
+        return 1;
+    }
+
+    // Validate partition_inverted_index_key
+    std::string inverted_key =
+            versioned::partition_inverted_index_key({instance_id_, db_id, table_id, partition_id});
+    std::string value;
+    err = txn->get(inverted_key, &value);
+    if (err != TxnErrorCode::TXN_OK) {
+        LOG_WARNING("partition inverted index key not found").tag("key", hex(inverted_key));
+        return 1;
+    }
+
+    return 0;
+}
+
+int MigrateValidator::validate_partition_meta_key(Transaction* txn, int64_t partition_id,
+                                                  int64_t db_id, int64_t table_id) {
+    AnnotateTag partition_tag("partition_id", partition_id);
+    std::string partition_meta_key = versioned::meta_partition_key({instance_id_, partition_id});
+    std::string value;
+    Versionstamp value_version;
+    TxnErrorCode err = versioned_get(txn, partition_meta_key, &value_version, &value, true);
+    if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        LOG_WARNING("partition meta key not found in versioned space");
+        return 1;
+    } else if (err != TxnErrorCode::TXN_OK) {
+        LOG_WARNING("failed to read partition meta").tag("error", err);
+        return -1;
+    }
+
+    return 0;
+}
+
+int MigrateValidator::validate_index_index_keys(Transaction* txn, int64_t index_id, int64_t db_id,
+                                                int64_t table_id) {
+    MetaReader meta_reader(instance_id_);
+
+    // Validate index_index_key
+    IndexIndexPB index_index;
+    TxnErrorCode err = meta_reader.get_index_index(txn, index_id, &index_index, true);
+
+    if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        LOG_WARNING("index index key not found in versioned space").tag("index_id", index_id);
+        return 1;
+    } else if (err != TxnErrorCode::TXN_OK) {
+        LOG_WARNING("failed to read index index").tag("index_id", index_id).tag("error", err);
+        return -1;
+    }
+
+    // Validate content
+    if (index_index.db_id() != db_id || index_index.table_id() != table_id) {
+        LOG_WARNING("index index content mismatch")
+                .tag("index_id", index_id)
+                .tag("expected_db_id", db_id)
+                .tag("actual_db_id", index_index.db_id())
+                .tag("expected_table_id", table_id)
+                .tag("actual_table_id", index_index.table_id());
+        return 1;
+    }
+
+    // Validate index_inverted_key
+    std::string inverted_key =
+            versioned::index_inverted_key({instance_id_, db_id, table_id, index_id});
+    std::string value;
+    err = txn->get(inverted_key, &value);
+    if (err != TxnErrorCode::TXN_OK) {
+        LOG_WARNING("index inverted key not found")
+                .tag("index_id", index_id)
+                .tag("key", hex(inverted_key));
+        return 1;
+    }
+
+    return 0;
+}
+
+int MigrateValidator::validate_index_meta_key(Transaction* txn, int64_t index_id, int64_t db_id,
+                                              int64_t table_id) {
+    AnnotateTag index_tag("index_id", index_id);
+    std::string index_meta_key = versioned::meta_index_key({instance_id_, index_id});
+    std::string value;
+    Versionstamp value_version;
+    TxnErrorCode err = versioned_get(txn, index_meta_key, &value_version, &value, true);
+    if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        LOG_WARNING("index meta key not found in versioned space");
+        return 1;
+    } else if (err != TxnErrorCode::TXN_OK) {
+        LOG_WARNING("failed to read index meta").tag("error", err);
+        return -1;
     }
 
     return 0;

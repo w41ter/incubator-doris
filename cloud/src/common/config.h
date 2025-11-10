@@ -378,6 +378,8 @@ CONF_Bool(enable_multi_version_status, "false");
 // The new instance snapshot switch status will be set to SNAPSHOT_SWITCH_ON, and the auto snapshot will be open.
 CONF_Bool(enable_cluster_snapshot, "false");
 CONF_Bool(enable_snapshot_data_migrator, "false");
+CONF_Bool(enable_snapshot_data_migrator_validation, "false");
+CONF_Bool(allow_snapshot_data_validation_failure, "true");
 CONF_Bool(enable_snapshot_chain_compactor, "false");
 CONF_Int32(snapshot_data_migrator_concurrent, "2");
 CONF_Int32(snapshot_chain_compactor_concurrent, "2");
