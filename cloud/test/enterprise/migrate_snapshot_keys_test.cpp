@@ -219,13 +219,17 @@ std::string next_rowset_id() {
 }
 
 void add_tablet(CreateTabletsRequest& req, int64_t table_id, int64_t index_id, int64_t partition_id,
-                int64_t tablet_id, TabletStatePB state = TabletStatePB::PB_RUNNING) {
+                int64_t tablet_id, TabletStatePB state = TabletStatePB::PB_RUNNING,
+                bool mow = false) {
     auto tablet = req.add_tablet_metas();
     tablet->set_table_id(table_id);
     tablet->set_index_id(index_id);
     tablet->set_partition_id(partition_id);
     tablet->set_tablet_id(tablet_id);
     tablet->set_tablet_state(state);
+    if (mow) {
+        tablet->set_enable_unique_key_merge_on_write(true);
+    }
     auto schema = tablet->mutable_schema();
     schema->set_schema_version(0);
     auto first_rowset = tablet->add_rs_metas();
@@ -238,13 +242,14 @@ void add_tablet(CreateTabletsRequest& req, int64_t table_id, int64_t index_id, i
 
 void create_tablet(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
                    int64_t db_id, int64_t table_id, int64_t index_id, int64_t partition_id,
-                   int64_t tablet_id, TabletStatePB state = TabletStatePB::PB_RUNNING) {
+                   int64_t tablet_id, TabletStatePB state = TabletStatePB::PB_RUNNING,
+                   bool mow = false) {
     brpc::Controller cntl;
     CreateTabletsRequest req;
     CreateTabletsResponse res;
     req.set_db_id(db_id);
     req.set_cloud_unique_id(cloud_unique_id);
-    add_tablet(req, table_id, index_id, partition_id, tablet_id, state);
+    add_tablet(req, table_id, index_id, partition_id, tablet_id, state, mow);
     meta_service->create_tablets(&cntl, &req, &res, nullptr);
     ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
     ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << tablet_id;
@@ -749,6 +754,116 @@ void drop_instance(MetaServiceProxy* meta_service, const std::string& instance_i
     meta_service->alter_instance(&cntl, &req, &res, nullptr);
     ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
     ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
+}
+
+void get_delete_bitmap_lock(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
+                            int64_t table_id, int64_t partition_id, int64_t lock_id,
+                            int64_t initiator) {
+    brpc::Controller cntl;
+    GetDeleteBitmapUpdateLockRequest req;
+    GetDeleteBitmapUpdateLockResponse res;
+    req.set_cloud_unique_id(cloud_unique_id);
+    req.set_table_id(table_id);
+    req.add_partition_ids(partition_id);
+    req.set_expiration(10);
+    req.set_lock_id(lock_id);
+    req.set_initiator(initiator);
+    meta_service->get_delete_bitmap_update_lock(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+}
+
+void remove_delete_bitmap_lock(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
+                               int64_t table_id, int64_t lock_id, int64_t initiator) {
+    brpc::Controller cntl;
+    RemoveDeleteBitmapUpdateLockRequest req;
+    RemoveDeleteBitmapUpdateLockResponse res;
+    req.set_cloud_unique_id(cloud_unique_id);
+    req.set_table_id(table_id);
+    req.set_lock_id(lock_id);
+    req.set_initiator(initiator);
+    meta_service->remove_delete_bitmap_update_lock(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+}
+
+void update_delete_bitmap(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
+                          int64_t table_id, int64_t partition_id, int64_t tablet_id,
+                          int64_t lock_id, int64_t initiator, const std::string& rowset_id,
+                          DeleteBitmapPB& delete_bitmap_pb, int64_t version) {
+    brpc::Controller cntl;
+    UpdateDeleteBitmapRequest req;
+    UpdateDeleteBitmapResponse res;
+    req.set_cloud_unique_id(cloud_unique_id);
+    req.set_table_id(table_id);
+    req.set_partition_id(partition_id);
+    req.set_lock_id(lock_id);
+    req.set_initiator(initiator);
+    req.set_tablet_id(tablet_id);
+
+    if (version == 1 || version == 3) {
+        for (size_t i = 0; i < delete_bitmap_pb.rowset_ids_size(); ++i) {
+            req.add_rowset_ids(delete_bitmap_pb.rowset_ids(i));
+            req.add_segment_ids(delete_bitmap_pb.segment_ids(i));
+            req.add_versions(delete_bitmap_pb.versions(i));
+            req.add_segment_delete_bitmaps(delete_bitmap_pb.segment_delete_bitmaps(i));
+        }
+    }
+    if (version == 2 || version == 3) {
+        DeleteBitmapStoragePB delete_bitmap_storage_pb;
+        delete_bitmap_storage_pb.set_store_in_fdb(true);
+        *(delete_bitmap_storage_pb.mutable_delete_bitmap()) = std::move(delete_bitmap_pb);
+        *(req.add_delete_bitmap_storages()) = std::move(delete_bitmap_storage_pb);
+        req.add_delta_rowset_ids(rowset_id);
+    }
+    meta_service->update_delete_bitmap(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+}
+
+void get_delete_bitmap(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
+                       int64_t tablet_id, const std::string& rowset_id, int64_t version,
+                       DeleteBitmapPB& delete_bitmap_pb) {
+    brpc::Controller cntl;
+    GetDeleteBitmapRequest req;
+    GetDeleteBitmapResponse res;
+    req.set_cloud_unique_id(cloud_unique_id);
+    req.set_tablet_id(tablet_id);
+    req.set_store_version(version);
+    req.add_rowset_ids(rowset_id);
+    req.add_begin_versions(0);
+    req.add_end_versions(INT64_MAX);
+    meta_service->get_delete_bitmap(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+    if (version == 1 || version == 3) {
+        for (int i = 0; i < res.rowset_ids_size(); ++i) {
+            delete_bitmap_pb.add_rowset_ids(res.rowset_ids(i));
+            delete_bitmap_pb.add_segment_ids(res.segment_ids(i));
+            delete_bitmap_pb.add_versions(res.versions(i));
+            delete_bitmap_pb.add_segment_delete_bitmaps(res.segment_delete_bitmaps(i));
+        }
+    }
+    if (version == 2 || version == 3) {
+        if (res.delete_bitmap_storages_size() > 0) {
+            ASSERT_EQ(res.delete_bitmap_storages_size(), 1);
+            ASSERT_EQ(res.delete_bitmap_storages(0).store_in_fdb(), true);
+            delete_bitmap_pb = res.delete_bitmap_storages(0).delete_bitmap();
+        }
+    }
+}
+
+std::string generate_random_string(int length) {
+    std::string char_set = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    std::random_device rd;
+    std::mt19937 generator(rd());
+    std::uniform_int_distribution<int> distribution(0, char_set.length() - 1);
+
+    std::string randomString;
+    for (int i = 0; i < length; ++i) {
+        randomString += char_set[distribution(generator)];
+    }
+    return randomString;
 }
 
 std::unique_ptr<InstanceRecycler> get_instance_recycler(
@@ -1885,4 +2000,200 @@ TEST(MigrateSnapshotKeysTest, SchemaChangeAfterMigrated2) {
     enable_instance_multi_version_disabled(meta_service.get(), instance_id);
     get_tablet_stats(meta_service.get(), cloud_unique_id, new_tablet_id_1, old_tablet_stats);
     tablet_stats_must_equals(new_tablet_stats, old_tablet_stats);
+}
+
+TEST(MigrateSnapshotKeysTest, DeleteBitmap) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+    std::string instance_id = "migrate_snapshot_keys_delete_bitmap_test_instance";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id, TabletStatePB::PB_RUNNING, true);
+
+    // Phase 1: Single version mode - insert 5 rowsets (version 2-6)
+    for (int i = 0; i < 5; i++) {
+        insert_rowset(meta_service.get(), cloud_unique_id, db_id, fmt::format("label_{}", i),
+                      table_id, partition_id, tablet_id);
+    }
+
+    // update delete bitmap v1
+    size_t large_dbm_size = 300 * 1000 * 3;
+    {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, 6, rowsets);
+
+        int64_t lock_id = -1;
+        int64_t initiator = 1234;
+        get_delete_bitmap_lock(meta_service.get(), cloud_unique_id, table_id, partition_id, lock_id,
+                               initiator);
+
+        std::string large_value = generate_random_string(large_dbm_size);
+        for (size_t i = 0; i < rowsets.size(); i++) {
+            auto& rowset = rowsets[i];
+            DeleteBitmapPB delete_bitmap_pb;
+            for (size_t j = 1; j < i; j++) {
+                delete_bitmap_pb.add_rowset_ids(rowsets[j].rowset_id_v2());
+                delete_bitmap_pb.add_segment_ids(0);
+                delete_bitmap_pb.add_versions(rowset.end_version());
+                delete_bitmap_pb.add_segment_delete_bitmaps(
+                        rowset.end_version() % 2 == 0 ? large_value : "bitmap_data");
+            }
+            update_delete_bitmap(meta_service.get(), cloud_unique_id, table_id, partition_id,
+                                 tablet_id, lock_id, initiator, rowset.rowset_id_v2(),
+                                 delete_bitmap_pb, 1);
+        }
+
+        remove_delete_bitmap_lock(meta_service.get(), cloud_unique_id, table_id, lock_id,
+                                  initiator);
+
+        for (size_t i = 1; i < rowsets.size(); i++) {
+            auto& rowset = rowsets[i];
+            {
+                DeleteBitmapPB delete_bitmap_pb;
+                get_delete_bitmap(meta_service.get(), cloud_unique_id, tablet_id,
+                                  rowset.rowset_id_v2(), 1, delete_bitmap_pb);
+                ASSERT_EQ(delete_bitmap_pb.rowset_ids_size(),
+                          rowsets.size() - rowset.end_version());
+            }
+            {
+                DeleteBitmapPB delete_bitmap_pb;
+                get_delete_bitmap(meta_service.get(), cloud_unique_id, tablet_id,
+                                  rowset.rowset_id_v2(), 2, delete_bitmap_pb);
+                ASSERT_EQ(delete_bitmap_pb.rowset_ids_size(), 0);
+            }
+        }
+    }
+
+    // Phase 2: Switch to multi-version write only
+    enable_instance_multi_version_write_only(meta_service.get(), instance_id);
+
+    // Phase 2: Dual write mode - insert 3 more rowsets (version 7-9)
+    for (int i = 5; i < 8; i++) {
+        insert_rowset(meta_service.get(), cloud_unique_id, db_id, fmt::format("label_{}", i),
+                      table_id, partition_id, tablet_id);
+    }
+
+    // update delete bitmap v2
+    {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, 9, rowsets);
+
+        int64_t lock_id = -1;
+        int64_t initiator = 1234;
+        get_delete_bitmap_lock(meta_service.get(), cloud_unique_id, table_id, partition_id, lock_id,
+                               initiator);
+
+        for (size_t i = 6; i < rowsets.size(); i++) {
+            auto& rowset = rowsets[i];
+            DeleteBitmapPB delete_bitmap_pb;
+            for (size_t j = 1; j < i; j++) {
+                delete_bitmap_pb.add_rowset_ids(rowsets[j].rowset_id_v2());
+                delete_bitmap_pb.add_segment_ids(0);
+                delete_bitmap_pb.add_versions(rowset.end_version());
+                delete_bitmap_pb.add_segment_delete_bitmaps("bitmap_data");
+            }
+            update_delete_bitmap(meta_service.get(), cloud_unique_id, table_id, partition_id,
+                                 tablet_id, lock_id, initiator, rowset.rowset_id_v2(),
+                                 delete_bitmap_pb, 2);
+        }
+
+        remove_delete_bitmap_lock(meta_service.get(), cloud_unique_id, table_id, lock_id,
+                                  initiator);
+
+        for (size_t i = 1; i < rowsets.size(); i++) {
+            auto& rowset = rowsets[i];
+            {
+                DeleteBitmapPB delete_bitmap_pb;
+                get_delete_bitmap(meta_service.get(), cloud_unique_id, tablet_id,
+                                  rowset.rowset_id_v2(), 1, delete_bitmap_pb);
+                if (i < 6) {
+                    ASSERT_EQ(delete_bitmap_pb.rowset_ids_size(), 6 - rowset.end_version());
+                } else {
+                    ASSERT_EQ(delete_bitmap_pb.rowset_ids_size(), 0);
+                }
+            }
+            {
+                DeleteBitmapPB delete_bitmap_pb;
+                get_delete_bitmap(meta_service.get(), cloud_unique_id, tablet_id,
+                                  rowset.rowset_id_v2(), 2, delete_bitmap_pb);
+                if (i < 6) {
+                    ASSERT_EQ(delete_bitmap_pb.rowset_ids_size(), 0);
+                } else {
+                    ASSERT_EQ(delete_bitmap_pb.rowset_ids_size(), rowset.start_version() - 2);
+                }
+            }
+        }
+    }
+
+    // Phase 3: Migrate old keys and switch to multi-version read write
+    {
+        InstanceInfoPB instance_info;
+        get_instance(meta_service.get(), cloud_unique_id, instance_info);
+        InstanceDataMigrator migrator(txn_kv, instance_info);
+        ASSERT_EQ(migrator.do_migrate(), 0);
+        enable_instance_multi_version_read_write(meta_service.get(), instance_id);
+
+        // Check the snapshot properties
+        SnapshotProperty property;
+        get_instance_snapshot_properties(meta_service.get(), instance_id, &property);
+        ASSERT_EQ(property.status, SnapshotSwitchStatus::SNAPSHOT_SWITCH_OFF);
+    }
+
+    // check delete bitmap
+    {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, 9, rowsets);
+        // <rowset_id, <dbm_version, dbm_size>>
+        std::map<std::string, std::vector<std::pair<int64_t, int64_t>>> rowset_map;
+
+        for (size_t i = 1; i < rowsets.size(); i++) {
+            auto& rowset = rowsets[i];
+            DeleteBitmapPB delete_bitmap_pb;
+            get_delete_bitmap(meta_service.get(), cloud_unique_id, tablet_id, rowset.rowset_id_v2(),
+                              2, delete_bitmap_pb);
+            ASSERT_EQ(delete_bitmap_pb.rowset_ids_size(), delete_bitmap_pb.versions_size());
+            ASSERT_EQ(delete_bitmap_pb.rowset_ids_size(),
+                      delete_bitmap_pb.segment_delete_bitmaps_size());
+            ASSERT_EQ(delete_bitmap_pb.rowset_ids_size(), delete_bitmap_pb.segment_ids_size());
+            if (i < 6) {
+                ASSERT_EQ(delete_bitmap_pb.rowset_ids_size(), 6 - rowset.start_version());
+            } else {
+                ASSERT_EQ(delete_bitmap_pb.rowset_ids_size(), rowset.start_version() - 2);
+            }
+
+            for (size_t j = 0; j < delete_bitmap_pb.rowset_ids_size(); j++) {
+                auto& rowset_id = delete_bitmap_pb.rowset_ids(j);
+                if (rowset_map.find(rowset_id) == rowset_map.end()) {
+                    rowset_map[rowset_id] = std::vector<std::pair<int64_t, int64_t>>();
+                }
+                rowset_map[rowset_id].emplace_back(
+                        std::make_pair(delete_bitmap_pb.versions(j),
+                                       delete_bitmap_pb.segment_delete_bitmaps(j).size()));
+            }
+        }
+
+        for (size_t i = 1; i < rowsets.size() - 1; i++) {
+            auto& rowset = rowsets[i];
+            auto iter = rowset_map.find(rowset.rowset_id_v2());
+            ASSERT_TRUE(iter != rowset_map.end());
+            auto& vec = iter->second;
+            ASSERT_EQ(vec.size(), 9 - rowset.start_version());
+            for (size_t j = 0; j < vec.size(); j++) {
+                auto version = vec[j].first;
+                auto delete_bitmap_size = vec[j].second;
+                if (rowset.end_version() <= 6 && version <= 6 && version % 2 == 0) {
+                    ASSERT_EQ(delete_bitmap_size, large_dbm_size);
+                } else {
+                    ASSERT_EQ(delete_bitmap_size, std::string("bitmap_data").size());
+                }
+            }
+        }
+    }
 }
