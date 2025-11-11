@@ -521,6 +521,7 @@ Status CloudMetaMgr::sync_tablet_rowsets_unlocked(CloudTablet* tablet,
             }
             req.set_base_compaction_cnt(tablet->base_compaction_cnt());
             req.set_cumulative_compaction_cnt(tablet->cumulative_compaction_cnt());
+            req.set_full_compaction_cnt(tablet->full_compaction_cnt());
             req.set_cumulative_point(tablet->cumulative_layer_point());
         }
         req.set_end_version(-1);
@@ -772,6 +773,7 @@ Status CloudMetaMgr::sync_tablet_rowsets_unlocked(CloudTablet* tablet,
             tablet->last_cumu_compaction_success_time_ms = stats.last_cumu_compaction_time_ms();
             tablet->set_base_compaction_cnt(stats.base_compaction_cnt());
             tablet->set_cumulative_compaction_cnt(stats.cumulative_compaction_cnt());
+            tablet->set_full_compaction_cnt(stats.full_compaction_cnt());
             tablet->set_cumulative_layer_point(stats.cumulative_point());
             tablet->reset_approximate_stats(stats.num_rowsets(), stats.num_segments(),
                                             stats.num_rows(), stats.data_size());
@@ -1471,24 +1473,6 @@ void CloudMetaMgr::remove_delete_bitmap_update_lock(int64_t table_id, int64_t lo
                      << ",tablet_id=" << tablet_id << ",lock_id=" << lock_id
                      << ",st=" << st.to_string();
     }
-}
-
-Status CloudMetaMgr::remove_old_version_delete_bitmap(
-        int64_t tablet_id,
-        const std::vector<std::tuple<std::string, uint64_t, uint64_t>>& to_delete) {
-    LOG(INFO) << "remove_old_version_delete_bitmap , tablet_id: " << tablet_id;
-    RemoveDeleteBitmapRequest req;
-    RemoveDeleteBitmapResponse res;
-    req.set_cloud_unique_id(config::cloud_unique_id);
-    req.set_tablet_id(tablet_id);
-    for (auto& value : to_delete) {
-        req.add_rowset_ids(std::get<0>(value));
-        req.add_begin_versions(std::get<1>(value));
-        req.add_end_versions(std::get<2>(value));
-    }
-    auto st = retry_rpc("remove old delete bitmap", req, &res,
-                        &MetaService_Stub::remove_delete_bitmap);
-    return st;
 }
 
 void CloudMetaMgr::check_table_size_correctness(const RowsetMeta& rs_meta) {

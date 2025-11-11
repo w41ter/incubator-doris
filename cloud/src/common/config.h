@@ -23,7 +23,7 @@ namespace doris::cloud::config {
 
 CONF_Int32(brpc_listen_port, "5000");
 CONF_Int32(brpc_num_threads, "64");
-// connections without data transmission for so many seconds will be closed
+// connections without data transmission for so many seconds will be closed.
 // Set -1 to disable it.
 CONF_Int32(brpc_idle_timeout_sec, "-1");
 CONF_String(hostname, "");
@@ -278,7 +278,7 @@ CONF_mInt64(max_txn_commit_byte, "7340032");
 CONF_Bool(enable_cloud_txn_lazy_commit, "true");
 CONF_Int32(txn_lazy_commit_rowsets_thresold, "1000");
 CONF_Int32(txn_lazy_commit_num_threads, "8");
-CONF_Int32(txn_lazy_max_rowsets_per_batch, "1000");
+CONF_mInt64(txn_lazy_max_rowsets_per_batch, "1000");
 // max TabletIndexPB num for batch get
 CONF_Int32(max_tablet_index_num_per_batch, "1000");
 
@@ -325,4 +325,6 @@ CONF_mString(ca_cert_file_paths,
              "/etc/ssl/ca-bundle.pem");
 
 CONF_Bool(enable_check_fe_drop_in_safe_time, "true");
+CONF_mBool(enable_logging_conflict_keys, "false");
+
 } // namespace doris::cloud::config

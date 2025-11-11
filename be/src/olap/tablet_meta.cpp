@@ -1012,25 +1012,19 @@ void TabletMeta::_check_mow_rowset_cache_version_size(size_t rowset_cache_versio
         rowset_cache_version_size > _rs_metas.size() + _stale_rs_metas.size()) {
         std::stringstream ss;
         auto rowset_ids = _delete_bitmap->get_rowset_cache_version();
-        for (const auto& rowset_id : rowset_ids) {
-            bool found = false;
+        std::set<std::string> tablet_rowset_ids;
+        {
+            std::shared_lock rlock(_meta_lock);
             for (auto& rs_meta : _rs_metas) {
-                if (rs_meta->rowset_id() == rowset_id) {
-                    found = true;
-                    break;
-                }
-            }
-            if (found) {
-                continue;
+                tablet_rowset_ids.emplace(rs_meta->rowset_id().to_string());
             }
             for (auto& rs_meta : _stale_rs_metas) {
-                if (rs_meta->rowset_id() == rowset_id) {
-                    found = true;
-                    break;
-                }
+                tablet_rowset_ids.emplace(rs_meta->rowset_id().to_string());
             }
-            if (!found) {
-                ss << rowset_id.to_string() << ", ";
+        }
+        for (const auto& rowset_id : rowset_ids) {
+            if (tablet_rowset_ids.find(rowset_id) == tablet_rowset_ids.end()) {
+                ss << rowset_id << ", ";
             }
         }
         // size(rowset_cache_version) <= size(_rs_metas) + size(_stale_rs_metas) + size(_unused_rs)
@@ -1335,54 +1329,6 @@ void DeleteBitmap::merge(const DeleteBitmap& other) {
     }
 }
 
-void DeleteBitmap::add_to_remove_queue(
-        const std::string& version_str,
-        const std::vector<std::tuple<int64_t, DeleteBitmap::BitmapKey, DeleteBitmap::BitmapKey>>&
-                vector) {
-    std::shared_lock l(stale_delete_bitmap_lock);
-    _stale_delete_bitmap.emplace(version_str, vector);
-}
-
-void DeleteBitmap::remove_stale_delete_bitmap_from_queue(const std::vector<std::string>& vector) {
-    if (!config::enable_delete_bitmap_merge_on_compaction) {
-        return;
-    }
-    std::shared_lock l(stale_delete_bitmap_lock);
-    //<rowset_id, start_version, end_version>
-    std::vector<std::tuple<std::string, uint64_t, uint64_t>> to_delete;
-    int64_t tablet_id = -1;
-    for (auto& version_str : vector) {
-        auto it = _stale_delete_bitmap.find(version_str);
-        if (it != _stale_delete_bitmap.end()) {
-            auto delete_bitmap_vector = it->second;
-            for (auto& delete_bitmap_tuple : it->second) {
-                if (tablet_id < 0) {
-                    tablet_id = std::get<0>(delete_bitmap_tuple);
-                }
-                auto start_bmk = std::get<1>(delete_bitmap_tuple);
-                auto end_bmk = std::get<2>(delete_bitmap_tuple);
-                // the key range of to be removed is [start_bmk,end_bmk),
-                // due to the different definitions of the right boundary,
-                // so use end_bmk as right boundary when removing local delete bitmap,
-                // use (end_bmk - 1) as right boundary when removing ms delete bitmap
-                remove(start_bmk, end_bmk);
-                to_delete.emplace_back(std::make_tuple(std::get<0>(start_bmk).to_string(), 0,
-                                                       std::get<2>(end_bmk) - 1));
-            }
-            _stale_delete_bitmap.erase(version_str);
-        }
-    }
-    if (tablet_id == -1 || to_delete.empty()) {
-        return;
-    }
-    CloudStorageEngine& engine = ExecEnv::GetInstance()->storage_engine().to_cloud();
-    auto st = engine.meta_mgr().remove_old_version_delete_bitmap(tablet_id, to_delete);
-    if (!st.ok()) {
-        LOG(WARNING) << "fail to remove_stale_delete_bitmap_from_queue for tablet=" << tablet_id
-                     << ",st=" << st;
-    }
-}
-
 uint64_t DeleteBitmap::get_delete_bitmap_count() {
     std::shared_lock l(lock);
     uint64_t count = 0;
@@ -1412,11 +1358,11 @@ void DeleteBitmap::clear_rowset_cache_version() {
     VLOG_DEBUG << "clear agg cache version for tablet=" << _tablet_id;
 }
 
-std::set<RowsetId> DeleteBitmap::get_rowset_cache_version() {
-    std::set<RowsetId> set;
+std::set<std::string> DeleteBitmap::get_rowset_cache_version() {
+    std::set<std::string> set;
     std::shared_lock l(_rowset_cache_version_lock);
     for (auto& [k, _] : _rowset_cache_version) {
-        set.insert(k);
+        set.insert(k.to_string());
     }
     return set;
 }

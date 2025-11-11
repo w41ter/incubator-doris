@@ -5637,12 +5637,8 @@ public class Env {
 
     // Switch catalog of this session
     public void changeCatalog(ConnectContext ctx, String catalogName) throws DdlException {
-        CatalogIf catalogIf = catalogMgr.getCatalog(catalogName);
-        if (catalogIf == null) {
-            throw new DdlException(ErrorCode.ERR_UNKNOWN_CATALOG.formatErrorMsg(catalogName),
-                    ErrorCode.ERR_UNKNOWN_CATALOG);
-        }
-
+        CatalogIf catalogIf = catalogMgr.getCatalogOrException(catalogName,
+                                 catalog -> new DdlException(("Unknown catalog " + catalog)));
         String currentDB = ctx.getDatabase();
         if (StringUtils.isNotEmpty(currentDB)) {
             // When dropped the current catalog in current context, the current catalog will be null.

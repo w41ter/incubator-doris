@@ -140,6 +140,13 @@ struct TResultFileSinkOptions {
     // orc_writer_version = 1 means doris FE is higher than version 2.1.5
     // orc_writer_version = 0 means doris FE is less than or equal to version 2.1.5
     20: optional i64 orc_writer_version;
+    //iceberg write sink use int64
+    //hive write sink use int96
+    //export data to file use by user define properties
+    21: optional bool enable_int96_timestamps
+    // currently only for csv
+    // TODO: merge with parquet_compression_type and orc_compression_type
+    22: optional PlanNodes.TFileCompressType compression_type
 }
 
 struct TMemoryScratchSink {

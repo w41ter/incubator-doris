@@ -83,6 +83,14 @@ jobs:
                 echo "COMMENT_USER_ID ${COMMENT_USER_ID} is allowed to skip buildall for branch-selectdb-doris-3.1"
                 echo "comment_trigger=false" | tee -a "$GITHUB_OUTPUT"
                 echo "comment_skip=true" | tee -a "$GITHUB_OUTPUT"
+            elif [[ "${COMMENT_USER_ID}" == '98214048' && "${TARGET_BRANCH}" == *'branch-3.0'* ]]; then
+                echo "COMMENT_USER_ID ${COMMENT_USER_ID} is allowed to skip buildall for branch-3.0"
+                echo "comment_trigger=false" | tee -a "$GITHUB_OUTPUT"
+                echo "comment_skip=true" | tee -a "$GITHUB_OUTPUT"
+            elif [[ "${COMMENT_USER_ID}" == '101034200' && "${TARGET_BRANCH}" == *'branch-3.1'* ]]; then
+                echo "COMMENT_USER_ID ${COMMENT_USER_ID} is allowed to skip buildall for branch-3.1"
+                echo "comment_trigger=false" | tee -a "$GITHUB_OUTPUT"
+                echo "comment_skip=true" | tee -a "$GITHUB_OUTPUT"
             else
                 echo "COMMENT_USER_ID ${COMMENT_USER_ID} is not allowed to skip buildall."
                 exit

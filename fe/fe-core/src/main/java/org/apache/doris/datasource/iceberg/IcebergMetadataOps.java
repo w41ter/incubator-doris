@@ -116,7 +116,13 @@ public class IcebergMetadataOps implements ExternalMetadataOps {
 
     @Override
     public List<String> listTableNames(String dbName) {
-        List<TableIdentifier> tableIdentifiers = catalog.listTables(getNamespace(dbName));
+        List<TableIdentifier> tableIdentifiers = null;
+        try {
+            tableIdentifiers = preExecutionAuthenticator.execute(() -> catalog.listTables(getNamespace(dbName)));
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to list table names, error message is:"
+                    + Util.getRootCauseMessage(e), e);
+        }
         return tableIdentifiers.stream().map(TableIdentifier::name).collect(Collectors.toList());
     }
 
