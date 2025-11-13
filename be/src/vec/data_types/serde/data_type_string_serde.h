@@ -307,15 +307,16 @@ public:
                                const cctz::time_zone& ctz) const override {
         const auto& string_column = assert_cast<const ColumnType&>(column);
         auto& builder = assert_cast<arrow::StringBuilder&>(*array_builder);
+        const auto arrow_type_name = array_builder->type()->name();
+        const auto column_name = column.get_name();
         for (size_t string_i = start; string_i < end; ++string_i) {
             if (null_map && (*null_map)[string_i]) {
-                checkArrowStatus(builder.AppendNull(), column.get_name(),
-                                 array_builder->type()->name());
+                checkArrowStatus(builder.AppendNull(), column_name, arrow_type_name);
                 continue;
             }
             auto string_ref = string_column.get_data_at(string_i);
-            checkArrowStatus(builder.Append(string_ref.data, string_ref.size), column.get_name(),
-                             array_builder->type()->name());
+            checkArrowStatus(builder.Append(string_ref.data, string_ref.size), column_name,
+                             arrow_type_name);
         }
     }
     void read_column_from_arrow(IColumn& column, const arrow::Array* arrow_array, int start,
