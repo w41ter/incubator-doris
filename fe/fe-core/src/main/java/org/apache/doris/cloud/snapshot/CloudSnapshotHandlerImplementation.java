@@ -27,6 +27,7 @@ import org.apache.doris.cloud.system.CloudSystemInfoService;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.Pair;
+import org.apache.doris.common.util.DebugPointUtil;
 import org.apache.doris.journal.JournalCursor;
 import org.apache.doris.journal.JournalEntity;
 import org.apache.doris.master.Checkpoint;
@@ -212,6 +213,9 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
             Checkpoint checkpoint = Env.getCurrentEnv().getCheckpointer();
             checkpoint.getLock().readLock().lock();
             try {
+                if (DebugPointUtil.isEnable("CloudSnapshotHandler.uploadImage.fail")) {
+                    throw new Exception("inject CloudSnapshotHandler.uploadImage.fail");
+                }
                 uploadImage(snapshotId, imageUrl, objInfo, logId);
             } finally {
                 checkpoint.getLock().readLock().unlock();
@@ -326,6 +330,10 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
 
         // 3. compress files
         File zipFile = compressFiles(snapshotId, files);
+
+        while (DebugPointUtil.isEnable("CloudSnapshotHandler.uploadImage.wait")) {
+            Thread.sleep(5000);
+        }
 
         // 4, upload zip file
         RemoteBase remote = RemoteBase.newInstance(new RemoteBase.ObjectInfo(objInfo));
