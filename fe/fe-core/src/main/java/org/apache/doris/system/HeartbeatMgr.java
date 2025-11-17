@@ -192,8 +192,9 @@ public class HeartbeatMgr extends MasterDaemon {
                     boolean isChanged = be.handleHbResponse(hbResponse, isReplay);
                     if (hbResponse.getStatus() == HbStatus.OK) {
                         long newStartTime = be.getLastStartTime();
+                        // oldStartTime > 0 means it is not the first heartbeat
                         if (!isReplay && Config.enable_abort_txn_by_checking_coordinator_be
-                                && oldStartTime != newStartTime) {
+                                && oldStartTime != newStartTime && oldStartTime > 0) {
                             Env.getCurrentGlobalTransactionMgr().abortTxnWhenCoordinateBeRestart(
                                     be.getId(), be.getHost(), newStartTime);
                         }
