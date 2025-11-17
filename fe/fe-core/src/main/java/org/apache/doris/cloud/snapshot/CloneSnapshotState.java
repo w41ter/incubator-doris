@@ -18,7 +18,6 @@
 package org.apache.doris.cloud.snapshot;
 
 import org.apache.doris.cloud.proto.Cloud;
-import org.apache.doris.cloud.storage.RemoteBase;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
 
@@ -57,10 +56,6 @@ public class CloneSnapshotState {
         @JsonProperty("provider")
         private String provider;
 
-        public RemoteBase.ObjectInfo getObjInfo() {
-            return new RemoteBase.ObjectInfo(getProvider(), ak, sk, bucket, endpoint, region, prefix);
-        }
-
         public Cloud.ObjectStoreInfoPB getObjectStoreInfoPB() {
             return Cloud.ObjectStoreInfoPB.newBuilder().setAk(ak).setSk(sk).setBucket(bucket).setPrefix(prefix)
                     .setEndpoint(endpoint).setExternalEndpoint(externalEndpoint).setRegion(region)
@@ -68,11 +63,11 @@ public class CloneSnapshotState {
         }
 
         private Cloud.ObjectStoreInfoPB.Provider getProvider() {
-            Cloud.ObjectStoreInfoPB.Provider value = Cloud.ObjectStoreInfoPB.Provider.valueOf(provider);
-            if (value == null) {
+            try {
+                return Cloud.ObjectStoreInfoPB.Provider.valueOf(provider);
+            } catch (Exception e) {
                 throw new IllegalArgumentException("Unknown provider: " + provider);
             }
-            return value;
         }
     }
 
@@ -98,10 +93,6 @@ public class CloneSnapshotState {
 
     public boolean isSuccessor() {
         return isSuccessor != null && isSuccessor.booleanValue();
-    }
-
-    public RemoteBase.ObjectInfo getObjInfo() {
-        return objInfo.getObjInfo();
     }
 
     public Cloud.ObjectStoreInfoPB getObjectStoreInfoPB() {
@@ -138,6 +129,7 @@ public class CloneSnapshotState {
             checkNotNull("obj_info.external_endpoint", objInfo.externalEndpoint);
             checkNotNull("obj_info.region", objInfo.region);
             checkNotNull("obj_info.provider", objInfo.provider);
+            objInfo.getProvider();
         }
     }
 }
