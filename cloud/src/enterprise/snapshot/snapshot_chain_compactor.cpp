@@ -712,8 +712,6 @@ int CompactExecutor::compact_rowset_key(int64_t tablet_id) {
 }
 
 int CompactExecutor::compact_partition_meta_key(Transaction* txn, int64_t partition_id) {
-    AnnotateTag partition_id_tag("partition_id", partition_id);
-
     std::string key = versioned::meta_partition_key({instance_id_, partition_id});
     std::string value;
     Versionstamp versionstamp;
@@ -742,8 +740,6 @@ int CompactExecutor::compact_partition_meta_key(Transaction* txn, int64_t partit
 
 int CompactExecutor::compact_partition_index_key(Transaction* txn, int64_t partition_id,
                                                  PartitionIndexPB& index_pb) {
-    AnnotateTag partition_id_tag("partition_id", partition_id);
-
     MetaReader meta_reader(instance_id_, snapshot_versionstamp_);
     TxnErrorCode err = meta_reader.get_partition_index(txn, partition_id, &index_pb);
     if (err == TxnErrorCode::TXN_OK) {
@@ -776,8 +772,6 @@ int CompactExecutor::compact_partition_index_key(Transaction* txn, int64_t parti
 
 int CompactExecutor::compact_partition_inverted_index_key(Transaction* txn, int64_t db_id,
                                                           int64_t table_id, int64_t partition_id) {
-    AnnotateTag partition_id_tag("partition_id", partition_id);
-
     std::string key =
             versioned::partition_inverted_index_key({instance_id_, db_id, table_id, partition_id});
     std::string value;
@@ -799,8 +793,6 @@ int CompactExecutor::compact_partition_inverted_index_key(Transaction* txn, int6
 }
 
 int CompactExecutor::compact_partition_version_key(Transaction* txn, int64_t partition_id) {
-    AnnotateTag partition_id_tag("partition_id", partition_id);
-
     MetaReader meta_reader(instance_id_, snapshot_versionstamp_);
     VersionPB version_pb;
     Versionstamp versionstamp;
@@ -847,8 +839,6 @@ int CompactExecutor::compact_partition_version_key(Transaction* txn, int64_t par
 }
 
 int CompactExecutor::compact_index_meta_key(Transaction* txn, int64_t index_id) {
-    AnnotateTag index_id_tag("index_id", index_id);
-
     std::string meta_key = versioned::meta_index_key({instance_id_, index_id});
     std::string value;
     Versionstamp versionstamp;
@@ -877,8 +867,6 @@ int CompactExecutor::compact_index_meta_key(Transaction* txn, int64_t index_id) 
 
 int CompactExecutor::compact_index_index_key(Transaction* txn, int64_t index_id,
                                              IndexIndexPB& index_pb) {
-    AnnotateTag index_id_tag("index_id", index_id);
-
     MetaReader meta_reader(instance_id_, snapshot_versionstamp_);
     TxnErrorCode err = meta_reader.get_index_index(txn, index_id, &index_pb);
     if (err == TxnErrorCode::TXN_OK) {
@@ -911,8 +899,6 @@ int CompactExecutor::compact_index_index_key(Transaction* txn, int64_t index_id,
 
 int CompactExecutor::compact_index_inverted_index_key(Transaction* txn, int64_t db_id,
                                                       int64_t table_id, int64_t index_id) {
-    AnnotateTag index_id_tag("index_id", index_id);
-
     std::string key = versioned::index_inverted_key({instance_id_, db_id, table_id, index_id});
     std::string value;
     TxnErrorCode err = txn->get(key, &value);
@@ -931,8 +917,6 @@ int CompactExecutor::compact_index_inverted_index_key(Transaction* txn, int64_t 
 }
 
 int CompactExecutor::compact_tablet_meta_key(Transaction* txn, int64_t tablet_id) {
-    AnnotateTag tablet_id_tag("tablet_id", tablet_id);
-
     MetaReader meta_reader(instance_id_, snapshot_versionstamp_);
     doris::TabletMetaCloudPB tablet_meta;
     Versionstamp meta_version;
@@ -965,8 +949,6 @@ int CompactExecutor::compact_tablet_meta_key(Transaction* txn, int64_t tablet_id
 
 int CompactExecutor::compact_tablet_index_key(Transaction* txn, int64_t tablet_id,
                                               TabletIndexPB& tablet_index) {
-    AnnotateTag tablet_id_tag("tablet_id", tablet_id);
-
     MetaReader meta_reader(instance_id_, snapshot_versionstamp_);
     TxnErrorCode err = meta_reader.get_tablet_index(txn, tablet_id, &tablet_index);
     if (err == TxnErrorCode::TXN_OK) {
@@ -1000,8 +982,6 @@ int CompactExecutor::compact_tablet_index_key(Transaction* txn, int64_t tablet_i
 int CompactExecutor::compact_tablet_inverted_index_key(Transaction* txn, int64_t db_id,
                                                        int64_t table_id, int64_t index_id,
                                                        int64_t partition_id, int64_t tablet_id) {
-    AnnotateTag tablet_id_tag("tablet_id", tablet_id);
-
     std::string key = versioned::tablet_inverted_index_key(
             {instance_id_, db_id, table_id, index_id, partition_id, tablet_id});
     std::string value;
@@ -1021,8 +1001,6 @@ int CompactExecutor::compact_tablet_inverted_index_key(Transaction* txn, int64_t
 }
 
 int CompactExecutor::compact_tablet_load_stats_key(Transaction* txn, int64_t tablet_id) {
-    AnnotateTag tablet_id_tag("tablet_id", tablet_id);
-
     MetaReader meta_reader(instance_id_, snapshot_versionstamp_);
     TabletStatsPB tablet_stats;
     Versionstamp versionstamp;
@@ -1060,8 +1038,6 @@ int CompactExecutor::compact_tablet_load_stats_key(Transaction* txn, int64_t tab
 }
 
 int CompactExecutor::compact_tablet_compact_stats_key(Transaction* txn, int64_t tablet_id) {
-    AnnotateTag tablet_id_tag("tablet_id", tablet_id);
-
     MetaReader meta_reader(instance_id_, snapshot_versionstamp_);
     TabletStatsPB tablet_stats;
     Versionstamp versionstamp;
@@ -1100,7 +1076,6 @@ int CompactExecutor::compact_tablet_compact_stats_key(Transaction* txn, int64_t 
 
 int CompactExecutor::compact_meta_schema_key(Transaction* txn, int64_t index_id,
                                              int64_t schema_version) {
-    AnnotateTag index_id_tag("index_id", index_id);
     AnnotateTag schema_version_tag("schema_version", schema_version);
 
     MetaReader meta_reader(instance_id_, snapshot_versionstamp_);
@@ -1136,7 +1111,6 @@ int CompactExecutor::compact_meta_schema_key(Transaction* txn, int64_t index_id,
 }
 
 int CompactExecutor::compact_rowset_load_key(Transaction* txn, int64_t tablet_id, int64_t version) {
-    AnnotateTag tablet_id_tag("tablet_id", tablet_id);
     AnnotateTag version_id_tag("version", version);
 
     MetaReader meta_reader(instance_id_, snapshot_versionstamp_);
@@ -1170,25 +1144,28 @@ int CompactExecutor::compact_rowset_load_key(Transaction* txn, int64_t tablet_id
         return -1;
     }
 
-    rowset_meta.set_reference_instance_id(source_instance_id_);
+    if (!rowset_meta.has_reference_instance_id()) {
+        rowset_meta.set_reference_instance_id(source_instance_id_);
+    }
     std::string load_key = versioned::meta_rowset_load_key({instance_id_, tablet_id, version});
     if (!versioned::document_put(txn, load_key, versionstamp, std::move(rowset_meta))) {
         LOG_WARNING("failed to serialize versioned rowset meta");
         return -1;
     }
 
+    auto reference_instance_id = rowset_meta.reference_instance_id();
     std::string rowset_ref_count_key = versioned::data_rowset_ref_count_key(
-            {source_instance_id_, tablet_id, rowset_meta.rowset_id_v2()});
-    LOG(INFO) << "add rowset ref count key, instance_id=" << source_instance_id_
-              << ", rowset_id=" << rowset_meta.rowset_id_v2()
-              << ", key=" << hex(rowset_ref_count_key);
+            {reference_instance_id, tablet_id, rowset_meta.rowset_id_v2()});
+    LOG_INFO("add rowset ref count key")
+            .tag("reference_instance_id", reference_instance_id)
+            .tag("rowset_id", rowset_meta.rowset_id_v2())
+            .tag("key", hex(rowset_ref_count_key));
     txn->atomic_add(rowset_ref_count_key, 1);
     return 0;
 }
 
 int CompactExecutor::compact_rowset_compact_key(Transaction* txn, int64_t tablet_id,
                                                 int64_t version) {
-    AnnotateTag tablet_id_tag("tablet_id", tablet_id);
     AnnotateTag version_id_tag("version", version);
 
     MetaReader meta_reader(instance_id_, snapshot_versionstamp_);
@@ -1216,7 +1193,9 @@ int CompactExecutor::compact_rowset_compact_key(Transaction* txn, int64_t tablet
         return -1;
     }
 
-    rowset_meta.set_reference_instance_id(source_instance_id_);
+    if (!rowset_meta.has_reference_instance_id()) {
+        rowset_meta.set_reference_instance_id(source_instance_id_);
+    }
     std::string compact_key =
             versioned::meta_rowset_compact_key({instance_id_, tablet_id, version});
     if (!versioned::document_put(txn, compact_key, versionstamp, std::move(rowset_meta))) {
@@ -1224,18 +1203,19 @@ int CompactExecutor::compact_rowset_compact_key(Transaction* txn, int64_t tablet
         return -1;
     }
 
+    auto reference_instance_id = rowset_meta.reference_instance_id();
     std::string rowset_ref_count_key = versioned::data_rowset_ref_count_key(
-            {source_instance_id_, tablet_id, rowset_meta.rowset_id_v2()});
-    LOG(INFO) << "add rowset ref count key, instance_id=" << source_instance_id_
-              << ", rowset_id=" << rowset_meta.rowset_id_v2()
-              << ", key=" << hex(rowset_ref_count_key);
+            {reference_instance_id, tablet_id, rowset_meta.rowset_id_v2()});
+    LOG_INFO("add rowset ref count key")
+            .tag("reference_instance_id", reference_instance_id)
+            .tag("rowset_id", rowset_meta.rowset_id_v2())
+            .tag("key", hex(rowset_ref_count_key));
     txn->atomic_add(rowset_ref_count_key, 1);
     return 0;
 }
 
 int CompactExecutor::compact_delete_bitmap_key(Transaction* txn, int64_t tablet_id,
                                                std::string rowset_id) {
-    AnnotateTag tablet_id_tag("tablet_id", tablet_id);
     AnnotateTag rowset_id_tag("rowset_id", rowset_id);
 
     std::string key = versioned::meta_delete_bitmap_key({instance_id_, tablet_id, rowset_id});
