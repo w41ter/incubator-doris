@@ -62,7 +62,7 @@ using HeapSortCursorBlockSPtr = std::shared_ptr<HeapSortCursorBlockView>;
 
 struct HeapSortCursorImpl {
 public:
-    HeapSortCursorImpl(int row_id, HeapSortCursorBlockSPtr block_view)
+    HeapSortCursorImpl(size_t row_id, HeapSortCursorBlockSPtr block_view)
             : _row_id(row_id), _block_view(block_view) {}
 
     HeapSortCursorImpl(const HeapSortCursorImpl& other) {
