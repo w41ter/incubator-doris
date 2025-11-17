@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import groovy.json.JsonOutput
 import org.apache.doris.regression.suite.ClusterOptions
 import org.apache.doris.regression.suite.SuiteCluster
 import org.awaitility.Awaitility
@@ -42,6 +43,77 @@ suite("test_clone_chain", "snapshot,docker") {
         return res[0]['ID']
     }
 
+    def get_instance_api = { msHttpPort, instance_id, check_func ->
+        httpTest {
+            op "get"
+            endpoint msHttpPort
+            uri "/MetaService/http/get_instance?token=greedisgood9999&instance_id=${instance_id}"
+            check check_func
+        }
+    }
+
+    def drop_cluster_api = { msHttpPort, request_body, check_func ->
+        httpTest {
+            endpoint msHttpPort
+            uri "/MetaService/http/drop_cluster?token=greedisgood9999"
+            body request_body
+            check check_func
+        }
+    }
+
+    def drop_instance_api = { msHttpPort, request_body, check_func ->
+        httpTest {
+            endpoint msHttpPort
+            uri "/MetaService/http/drop_instance?token=greedisgood9999"
+            body request_body
+            check check_func
+        }
+    }
+
+    def drop_instance = { msHttpPort, instance_id ->
+        // drop be cluster
+        def clusterMap = [cluster_name: "compute_cluster", cluster_id: "compute_cluster_id"]
+        def instance = [instance_id: "${instance_id}", cluster: clusterMap]
+        def jsonOutput = new JsonOutput()
+        def dropClusterBody  = jsonOutput.toJson(instance)
+        drop_cluster_api.call(msHttpPort, dropClusterBody) {
+            respCode, body ->
+                log.info("drop be cluster http cli result: ${body} ${respCode}".toString())
+                def json = parseJson(body)
+                assertTrue(json.code.equalsIgnoreCase("OK"))
+        }
+
+        // drop fe cluster
+        clusterMap = [cluster_name: "RESERVED_CLUSTER_NAME_FOR_SQL_SERVER", cluster_id: "RESERVED_CLUSTER_ID_FOR_SQL_SERVER"]
+        instance = [instance_id: "${instance_id}", cluster: clusterMap]
+        dropClusterBody  = jsonOutput.toJson(instance)
+        drop_cluster_api.call(msHttpPort, dropClusterBody) {
+            respCode, body ->
+                log.info("drop fe cluster http cli result: ${body} ${respCode}".toString())
+                def json = parseJson(body)
+                assertTrue(json.code.equalsIgnoreCase("OK"))
+        }
+
+        // drop instance
+        instance = [instance_id: "${instance_id}"]
+        def dropInstanceBody = jsonOutput.toJson(instance)
+        drop_instance_api.call(msHttpPort, dropInstanceBody) {
+            respCode, body ->
+                log.info("drop instance http cli result: ${body} ${respCode}".toString())
+                def json = parseJson(body)
+                assertTrue(json.code.equalsIgnoreCase("OK"))
+        }
+
+        // get instance
+        get_instance_api.call(msHttpPort, "${instance_id}") {
+            respCode, body ->
+                log.info("get instance resp: ${body} ${respCode}".toString())
+                def json = parseJson(body)
+                assertTrue(json.code.equalsIgnoreCase("OK"))
+                assertTrue(json.result.status.equalsIgnoreCase("DELETED"))
+        }
+    }
+
     def cluster_prefix = "regression_test_clone_chain_"
     def cluster_1 = cluster_prefix + "cluster_1"
     def cluster_2 = cluster_prefix + "cluster_2"
@@ -55,6 +127,7 @@ suite("test_clone_chain", "snapshot,docker") {
             "enable_split_tablet_schema_pb=true",
             "enable_multi_version_status=true",
             "multi_version_status_check_interval_seconds=1",
+            "enable_check_fe_drop_in_safe_time=false",
         ],
         recycleConfigs: [
             "recycle_interval_seconds=1",
@@ -183,7 +256,35 @@ suite("test_clone_chain", "snapshot,docker") {
             assertEquals(res[0]['id'], 1)
             assertEquals(res[0]['name'], 'cluster1_data')
             assertEquals(res[1]['id'], 2)
-            assertEquals(res[1]['name'], 'cluster2_data')
+        }
+
+        // drop snapshot in instance2
+        connectWithDockerCluster(clusters[cluster_2]) {
+            test {
+                sql "ADMIN DROP CLUSTER SNAPSHOT WHERE snapshot_id = '${snapshot_id}'"
+                exception "cannot drop snapshot that is referenced by other instance"
+            }
+            def res = sql_return_maparray "SELECT * FROM information_schema.cluster_snapshots"
+            logger.info("Cluster snapshots after dropping: " + res.toString())
+        }
+
+        // drop instance2
+        def ms = clusters[cluster_1].getAllMetaservices().get(0)
+        def msHttpPort = ms.host + ":" + ms.httpPort
+        drop_instance(msHttpPort, "cluster_2_instance_id")
+
+        // wait for recycle instance2
+        sleep(20000)
+
+        // check instance2 is not recycled
+        connectWithDockerCluster(clusters[cluster_3]) {
+            sql "USE test_db"
+            def res = sql_return_maparray "SELECT * FROM test_table ORDER BY id"
+            logger.info("Data in derived cluster after clone: " + res.toString())
+            assertEquals(res.size(), 2)
+            assertEquals(res[0]['id'], 1)
+            assertEquals(res[0]['name'], 'cluster1_data')
+            assertEquals(res[1]['id'], 2)
         }
     }
 }

@@ -1698,6 +1698,62 @@ TEST(MetaServiceSnapshotTest, DropSnapshotTest) {
         ASSERT_TRUE(found_prepare);
         ASSERT_FALSE(found_dropped); // Ensure dropped snapshots are not listed
     }
+
+    // Create and commit a snapshot
+    std::string referenced_snapshot_id;
+    {
+        brpc::Controller cntl;
+        BeginSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_timeout_seconds(3600);
+        req.set_auto_snapshot(true);
+        req.set_ttl_seconds(7200);
+        req.set_snapshot_label("test_drop_referenced");
+        BeginSnapshotResponse res;
+        meta_service->begin_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                     &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+        referenced_snapshot_id = res.snapshot_id();
+
+        // Commit it
+        CommitSnapshotRequest commit_req;
+        commit_req.set_cloud_unique_id(cloud_unique_id);
+        commit_req.set_snapshot_id(referenced_snapshot_id);
+        commit_req.set_image_url(res.image_url());
+        commit_req.set_last_journal_id(12345);
+        CommitSnapshotResponse commit_res;
+        meta_service->commit_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                      &commit_req, &commit_res, nullptr);
+        ASSERT_EQ(commit_res.status().code(), MetaServiceCode::OK);
+    }
+    // Clone it
+    {
+        brpc::Controller cntl;
+        CloneInstanceRequest req;
+        req.set_clone_type(CloneInstanceRequest::READ_ONLY);
+        req.set_from_instance_id("test_instance");
+        req.set_from_snapshot_id(referenced_snapshot_id);
+        req.set_new_instance_id("readonly_clone");
+
+        CloneInstanceResponse res;
+        meta_service->clone_instance(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                     &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+    }
+    // Test drop snapshot which is referenced (should fail)
+    {
+        brpc::Controller cntl;
+        DropSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_snapshot_id(referenced_snapshot_id);
+        DropSnapshotResponse res;
+        meta_service->drop_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                    &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+        ASSERT_TRUE(res.status().msg().find(
+                            "cannot drop snapshot that is referenced by other instance") !=
+                    std::string::npos);
+    }
 }
 
 TEST(MetaServiceSnapshotTest, BeginAutoSnapshotDisabledTest) {

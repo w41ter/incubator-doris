@@ -765,6 +765,21 @@ void SnapshotManager::drop_snapshot(std::string_view instance_id,
         return;
     }
 
+    bool has_references = false;
+    MetaReader meta_reader(instance_id);
+    err = meta_reader.has_snapshot_references(txn.get(), snapshot_versionstamp, &has_references,
+                                              false);
+    if (err != TxnErrorCode::TXN_OK) {
+        status->set_code(cast_as<ErrCategory::READ>(err));
+        status->set_msg("failed to check snapshot references, snapshot_id=" + snapshot_id);
+        return;
+    } else if (has_references) {
+        // still has references, cannot drop
+        status->set_code(MetaServiceCode::INVALID_ARGUMENT);
+        status->set_msg("cannot drop snapshot that is referenced by other instance");
+        return;
+    }
+
     // Mark snapshot as RECYCLED instead of directly deleting it
     // This allows the recycler to clean up the object storage data
     snapshot_pb.set_status(SnapshotStatus::SNAPSHOT_RECYCLED);
