@@ -567,6 +567,10 @@ public class Config extends ConfigBase {
             "The timeout of RPC between FE and Broker, in milliseconds"})
     public static int broker_timeout_ms = 10000; // 10s
 
+    @ConfField(mutable = true, masterOnly = true, description = {"是否启用新的 globbing list 语法。",
+            "Whether to enable the new globbing list syntax."})
+    public static boolean enable_glob_list_v2 = false;
+
     @ConfField(description = {"主键高并发点查短路径超时时间。",
             "The timeout of RPC for high concurrenty short circuit query"})
     public static int point_query_timeout_ms = 10000; // 10s

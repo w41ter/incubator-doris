@@ -19,6 +19,7 @@ package org.apache.doris.fs.remote;
 
 import org.apache.doris.analysis.StorageBackend;
 import org.apache.doris.backup.Status;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.security.authentication.AuthenticationConfig;
 import org.apache.doris.common.security.authentication.HadoopAuthenticator;
@@ -158,7 +159,9 @@ public class S3FileSystem extends ObjFileSystem {
             LOG.info("aws role arn mode, use globListImplV2");
             return globListImplV2(remotePath, result, fileNameOnly);
         }
-
+        if (Config.enable_glob_list_v2) {
+            return globListImplV2(remotePath, result, fileNameOnly);
+        }
         return globListImplV1(remotePath, result, fileNameOnly);
     }
 
