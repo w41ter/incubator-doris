@@ -379,6 +379,7 @@ void update_delete_bitmap(MetaServiceProxy* meta_service, const std::string& clo
     req.set_lock_id(lock_id);
     req.set_initiator(initiator);
     req.set_tablet_id(tablet_id);
+    req.set_store_version(2);
 
     DeleteBitmapPB delete_bitmap_pb;
     auto num = 10;
