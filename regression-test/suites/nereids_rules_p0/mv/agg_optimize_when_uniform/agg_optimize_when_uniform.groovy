@@ -370,7 +370,7 @@ suite("agg_optimize_when_uniform") {
     order_qt_query6_0_before "${query6_0}"
     async_mv_rewrite_success(db, mv6_0, query6_0, "mv6_0")
 
-    def plan_6 = """explain verbose ${query6_0}"""
+    def plan_6 = sql """explain verbose ${query6_0}"""
     logger.info("plan_6 is " + plan_6)
 
     qt_shape6_0_after """explain shape plan ${query6_0}"""
