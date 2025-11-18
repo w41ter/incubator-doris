@@ -364,20 +364,14 @@ int MigrateExecutor::migrate_table_version_key(int64_t db_id, int64_t table_id) 
 int MigrateExecutor::migrate_table_version_keys() {
     LOG_INFO("begin to migrate table version keys");
 
-    std::unique_ptr<Transaction> scan_txn;
-    TxnErrorCode err = txn_kv_->create_txn(&scan_txn);
-    if (err != TxnErrorCode::TXN_OK) {
-        LOG_WARNING("failed to create txn for migrate table version keys").tag("error", err);
-        return -1;
-    }
-
     std::string begin_key = table_version_key({instance_id_, 0, 0});
     std::string end_key = table_version_key({instance_id_, INT64_MAX, INT64_MAX});
 
     FullRangeGetOptions opts;
     opts.snapshot = true;
     opts.prefetch = true;
-    auto iter = scan_txn->full_range_get(begin_key, end_key, opts);
+    opts.txn_kv = txn_kv_;
+    auto iter = txn_kv_->full_range_get(begin_key, end_key, opts);
 
     int total_keys = 0;
     int migrated_keys = 0;
@@ -493,13 +487,6 @@ int MigrateExecutor::migrate_tablet_schema_key(int64_t index_id, int64_t schema_
 int MigrateExecutor::migrate_tablet_schema_keys() {
     LOG_INFO("begin to migrate tablet schema keys");
 
-    std::unique_ptr<Transaction> scan_txn;
-    TxnErrorCode err = txn_kv_->create_txn(&scan_txn);
-    if (err != TxnErrorCode::TXN_OK) {
-        LOG_WARNING("failed to create txn for migrate tablet schema keys").tag("error", err);
-        return -1;
-    }
-
     // Construct the range for tablet schema keys in 0x01 space
     std::string begin_key = meta_schema_key({instance_id_, 0, 0});
     std::string end_key = meta_schema_key({instance_id_, INT64_MAX, INT64_MAX});
@@ -507,7 +494,8 @@ int MigrateExecutor::migrate_tablet_schema_keys() {
     FullRangeGetOptions opts;
     opts.snapshot = true;
     opts.prefetch = true;
-    auto iter = scan_txn->full_range_get(begin_key, end_key, opts);
+    opts.txn_kv = txn_kv_;
+    auto iter = txn_kv_->full_range_get(begin_key, end_key, opts);
 
     int total_keys = 0;
     int migrated_keys = 0;
@@ -665,13 +653,6 @@ int MigrateExecutor::migrate_partition_version_key(int64_t db_id, int64_t table_
 int MigrateExecutor::migrate_partition_version_keys() {
     LOG_INFO("begin to migrate partition version keys");
 
-    std::unique_ptr<Transaction> scan_txn;
-    TxnErrorCode err = txn_kv_->create_txn(&scan_txn);
-    if (err != TxnErrorCode::TXN_OK) {
-        LOG_WARNING("failed to create txn for migrate partition version keys").tag("error", err);
-        return -1;
-    }
-
     // Construct the range for partition version keys in 0x01 space
     std::string begin_key = partition_version_key({instance_id_, 0, 0, 0});
     std::string end_key = partition_version_key({instance_id_, INT64_MAX, INT64_MAX, INT64_MAX});
@@ -679,7 +660,8 @@ int MigrateExecutor::migrate_partition_version_keys() {
     FullRangeGetOptions opts;
     opts.snapshot = true;
     opts.prefetch = true;
-    auto iter = scan_txn->full_range_get(begin_key, end_key, opts);
+    opts.txn_kv = txn_kv_;
+    auto iter = txn_kv_->full_range_get(begin_key, end_key, opts);
 
     int total_keys = 0;
     int migrated_keys = 0;
@@ -902,20 +884,14 @@ int MigrateExecutor::migrate_meta_tablet_idx_key(int64_t tablet_id) {
 int MigrateExecutor::migrate_tablet_index_keys() {
     LOG_INFO("begin to migrate tablet index keys");
 
-    std::unique_ptr<Transaction> scan_txn;
-    TxnErrorCode err = txn_kv_->create_txn(&scan_txn);
-    if (err != TxnErrorCode::TXN_OK) {
-        LOG_WARNING("failed to create txn to migrate tablet index keys").tag("error", err);
-        return -1;
-    }
-
     std::string begin_key = meta_tablet_idx_key({instance_id_, 0});
     std::string end_key = meta_tablet_idx_key({instance_id_, INT64_MAX});
 
     FullRangeGetOptions opts;
     opts.snapshot = true;
     opts.prefetch = true;
-    auto iter = scan_txn->full_range_get(begin_key, end_key, opts);
+    opts.txn_kv = txn_kv_;
+    auto iter = txn_kv_->full_range_get(begin_key, end_key, opts);
 
     int total_keys = 0;
     int migrated_keys = 0;
@@ -1017,13 +993,6 @@ int MigrateExecutor::migrate_meta_tablet_key(int64_t table_id, int64_t index_id,
 int MigrateExecutor::migrate_meta_tablet_keys() {
     LOG_INFO("begin to migrate meta tablet keys");
 
-    std::unique_ptr<Transaction> scan_txn;
-    TxnErrorCode err = txn_kv_->create_txn(&scan_txn);
-    if (err != TxnErrorCode::TXN_OK) {
-        LOG_WARNING("failed to create txn for migrate meta tablet keys").tag("error", err);
-        return -1;
-    }
-
     std::string begin_key = meta_tablet_key({instance_id_, 0, 0, 0, 0});
     std::string end_key =
             meta_tablet_key({instance_id_, INT64_MAX, INT64_MAX, INT64_MAX, INT64_MAX});
@@ -1031,7 +1000,8 @@ int MigrateExecutor::migrate_meta_tablet_keys() {
     FullRangeGetOptions opts;
     opts.snapshot = true;
     opts.prefetch = true;
-    auto iter = scan_txn->full_range_get(begin_key, end_key, opts);
+    opts.txn_kv = txn_kv_;
+    auto iter = txn_kv_->full_range_get(begin_key, end_key, opts);
 
     int total_keys = 0;
     int migrated_keys = 0;
@@ -1559,13 +1529,6 @@ int MigrateExecutor::migrate_tablet_stats_keys() {
 int MigrateExecutor::get_all_tablets(std::vector<int64_t>* tablet_ids) {
     tablet_ids->clear();
 
-    std::unique_ptr<Transaction> scan_txn;
-    TxnErrorCode err = txn_kv_->create_txn(&scan_txn);
-    if (err != TxnErrorCode::TXN_OK) {
-        LOG_WARNING("failed to create txn for get all tablets").tag("error", err);
-        return -1;
-    }
-
     // Construct the range for meta tablet index keys in 0x01 space
     std::string begin_key = meta_tablet_idx_key({instance_id_, 0});
     std::string end_key = meta_tablet_idx_key({instance_id_, INT64_MAX});
@@ -1573,7 +1536,8 @@ int MigrateExecutor::get_all_tablets(std::vector<int64_t>* tablet_ids) {
     FullRangeGetOptions opts;
     opts.snapshot = true;
     opts.prefetch = true;
-    auto iter = scan_txn->full_range_get(begin_key, end_key, opts);
+    opts.txn_kv = txn_kv_;
+    auto iter = txn_kv_->full_range_get(begin_key, end_key, opts);
 
     for (auto kvp = iter->next(); kvp.has_value(); kvp = iter->next()) {
         auto&& [key, value] = *kvp;
@@ -1599,8 +1563,8 @@ int MigrateExecutor::get_all_tablets(std::vector<int64_t>* tablet_ids) {
 int MigrateExecutor::get_tablet_version_graph(
         int64_t tablet_id, std::map<int64_t, doris::RowsetMetaCloudPB>* version_graph) {
     version_graph->clear();
-    std::unique_ptr<Transaction> scan_txn;
-    TxnErrorCode err = txn_kv_->create_txn(&scan_txn);
+    std::unique_ptr<Transaction> txn;
+    TxnErrorCode err = txn_kv_->create_txn(&txn);
     if (err != TxnErrorCode::TXN_OK) {
         LOG_WARNING("failed to create txn for get tablet version graph")
                 .tag("tablet_id", tablet_id)
@@ -1614,7 +1578,7 @@ int MigrateExecutor::get_tablet_version_graph(
     FullRangeGetOptions opts;
     opts.snapshot = true;
     opts.prefetch = true;
-    auto iter = scan_txn->full_range_get(begin_key, end_key, opts);
+    auto iter = txn->full_range_get(begin_key, end_key, opts);
     for (auto kvp = iter->next(); kvp.has_value(); kvp = iter->next()) {
         auto&& [_, value] = *kvp;
         doris::RowsetMetaCloudPB rowset_meta;
@@ -1790,13 +1754,6 @@ int SnapshotManager::migrate_to_versioned_keys(InstanceDataMigrator* migrator) {
 // ==================== MigrateValidator Implementation ====================
 
 int MigrateValidator::collect_all_entities(CollectedEntities* entities) {
-    std::unique_ptr<Transaction> txn;
-    TxnErrorCode err = txn_kv_->create_txn(&txn);
-    if (err != TxnErrorCode::TXN_OK) {
-        LOG_WARNING("failed to create txn for collecting entities").tag("error", err);
-        return -1;
-    }
-
     // Collect table version keys
     {
         std::string begin_key = table_version_key({instance_id_, 0, 0});
@@ -1804,7 +1761,8 @@ int MigrateValidator::collect_all_entities(CollectedEntities* entities) {
         FullRangeGetOptions opts;
         opts.snapshot = true;
         opts.prefetch = true;
-        auto iter = txn->full_range_get(begin_key, end_key, opts);
+        opts.txn_kv = txn_kv_;
+        auto iter = txn_kv_->full_range_get(begin_key, end_key, opts);
         for (auto kvp = iter->next(); kvp.has_value(); kvp = iter->next()) {
             auto&& [key, value] = *kvp;
             int64_t db_id = -1, table_id = -1;
@@ -1830,7 +1788,8 @@ int MigrateValidator::collect_all_entities(CollectedEntities* entities) {
         FullRangeGetOptions opts;
         opts.snapshot = true;
         opts.prefetch = true;
-        auto iter = txn->full_range_get(begin_key, end_key, opts);
+        opts.txn_kv = txn_kv_;
+        auto iter = txn_kv_->full_range_get(begin_key, end_key, opts);
         for (auto kvp = iter->next(); kvp.has_value(); kvp = iter->next()) {
             auto&& [key, value] = *kvp;
             int64_t db_id = -1, table_id = -1, partition_id = -1;
@@ -1855,7 +1814,8 @@ int MigrateValidator::collect_all_entities(CollectedEntities* entities) {
         FullRangeGetOptions opts;
         opts.snapshot = true;
         opts.prefetch = true;
-        auto iter = txn->full_range_get(begin_key, end_key, opts);
+        opts.txn_kv = txn_kv_;
+        auto iter = txn_kv_->full_range_get(begin_key, end_key, opts);
         for (auto kvp = iter->next(); kvp.has_value(); kvp = iter->next()) {
             auto&& [key, value] = *kvp;
             int64_t tablet_id = -1;
@@ -1892,7 +1852,8 @@ int MigrateValidator::collect_all_entities(CollectedEntities* entities) {
         FullRangeGetOptions opts;
         opts.snapshot = true;
         opts.prefetch = true;
-        auto iter = txn->full_range_get(begin_key, end_key, opts);
+        opts.txn_kv = txn_kv_;
+        auto iter = txn_kv_->full_range_get(begin_key, end_key, opts);
 
         std::string last_key = "";
         for (auto kvp = iter->next(); kvp.has_value(); kvp = iter->next()) {

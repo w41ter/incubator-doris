@@ -1260,20 +1260,14 @@ int CompactExecutor::compact_delete_bitmap_key(Transaction* txn, int64_t tablet_
 int CompactExecutor::get_all_tables(std::vector<int64_t>* table_ids) {
     table_ids->clear();
 
-    std::unique_ptr<Transaction> scan_txn;
-    TxnErrorCode err = txn_kv_->create_txn(&scan_txn);
-    if (err != TxnErrorCode::TXN_OK) {
-        LOG_WARNING("failed to create txn for get all tables").tag("error", err);
-        return -1;
-    }
-
     std::string begin_key = versioned::table_version_key({source_instance_id_, 0});
     std::string end_key = versioned::table_version_key({source_instance_id_, INT64_MAX});
 
     FullRangeGetOptions opts;
     opts.snapshot = true;
     opts.prefetch = true;
-    auto iter = scan_txn->full_range_get(begin_key, end_key, opts);
+    opts.txn_kv = txn_kv_;
+    auto iter = txn_kv_->full_range_get(begin_key, end_key, opts);
 
     int64_t last_table_id = -1;
     for (auto kvp = iter->next(); kvp.has_value(); kvp = iter->next()) {
@@ -1305,20 +1299,14 @@ int CompactExecutor::get_all_tables(std::vector<int64_t>* table_ids) {
 int CompactExecutor::get_all_partitions(std::vector<int64_t>* partition_ids) {
     partition_ids->clear();
 
-    std::unique_ptr<Transaction> scan_txn;
-    TxnErrorCode err = txn_kv_->create_txn(&scan_txn);
-    if (err != TxnErrorCode::TXN_OK) {
-        LOG_WARNING("failed to create txn for get all partitions").tag("error", err);
-        return -1;
-    }
-
     std::string begin_key = versioned::meta_partition_key({source_instance_id_, 0});
     std::string end_key = versioned::meta_partition_key({source_instance_id_, INT64_MAX});
 
     FullRangeGetOptions opts;
     opts.snapshot = true;
     opts.prefetch = true;
-    auto iter = scan_txn->full_range_get(begin_key, end_key, opts);
+    opts.txn_kv = txn_kv_;
+    auto iter = txn_kv_->full_range_get(begin_key, end_key, opts);
 
     int64_t last_partition_id = -1;
     for (auto kvp = iter->next(); kvp.has_value(); kvp = iter->next()) {
@@ -1351,20 +1339,14 @@ int CompactExecutor::get_all_partitions(std::vector<int64_t>* partition_ids) {
 int CompactExecutor::get_all_indexes(std::vector<int64_t>* index_ids) {
     index_ids->clear();
 
-    std::unique_ptr<Transaction> scan_txn;
-    TxnErrorCode err = txn_kv_->create_txn(&scan_txn);
-    if (err != TxnErrorCode::TXN_OK) {
-        LOG_WARNING("failed to create txn for get all indexes").tag("error", err);
-        return -1;
-    }
-
     std::string begin_key = versioned::meta_index_key({source_instance_id_, 0});
     std::string end_key = versioned::meta_index_key({source_instance_id_, INT64_MAX});
 
     FullRangeGetOptions opts;
     opts.snapshot = true;
     opts.prefetch = true;
-    auto iter = scan_txn->full_range_get(begin_key, end_key, opts);
+    opts.txn_kv = txn_kv_;
+    auto iter = txn_kv_->full_range_get(begin_key, end_key, opts);
 
     int64_t last_index_id = -1;
     for (auto kvp = iter->next(); kvp.has_value(); kvp = iter->next()) {
@@ -1434,20 +1416,14 @@ int CompactExecutor::get_all_index_schema_versions(Transaction* txn, int64_t ind
 int CompactExecutor::get_all_tablets(std::vector<int64_t>* tablet_ids) {
     tablet_ids->clear();
 
-    std::unique_ptr<Transaction> scan_txn;
-    TxnErrorCode err = txn_kv_->create_txn(&scan_txn);
-    if (err != TxnErrorCode::TXN_OK) {
-        LOG_WARNING("failed to create txn for get all tablets").tag("error", err);
-        return -1;
-    }
-
     std::string begin_key = versioned::meta_tablet_key({source_instance_id_, 0});
     std::string end_key = versioned::meta_tablet_key({source_instance_id_, INT64_MAX});
 
     FullRangeGetOptions opts;
     opts.snapshot = true;
     opts.prefetch = true;
-    auto iter = scan_txn->full_range_get(begin_key, end_key, opts);
+    opts.txn_kv = txn_kv_;
+    auto iter = txn_kv_->full_range_get(begin_key, end_key, opts);
 
     int64_t last_tablet_id = -1;
     for (auto kvp = iter->next(); kvp.has_value(); kvp = iter->next()) {
