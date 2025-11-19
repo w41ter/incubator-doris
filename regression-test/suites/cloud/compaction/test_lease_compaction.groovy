@@ -25,6 +25,7 @@ suite("test_lease_compaction") {
     println("the be unique id is " + beUniqueIdList);
 
     sleep(1000)
+    def resp
     for (unique_id : beUniqueIdList) {
         resp = get_cluster.call(unique_id);
         for (cluster : resp) {

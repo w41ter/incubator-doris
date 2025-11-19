@@ -132,6 +132,9 @@ suite('test_overdue') {
         result = sql """ show databases """
         logger.info("when warehouse is normal the result of sql from root is {}", result)
 
+        def user
+        def password
+        def url
         result = connect(user = "${user}", password = '', url = context.config.jdbcUrl) {
             sql """ show databases """
         }
