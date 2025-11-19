@@ -136,11 +136,18 @@ echo \$new_line >> ./bin/regression-test/conf/regression-conf-custom.groovy
 new_line="feHttpPassword=\"\$feCloudHttpPassword\""
 echo \$new_line >> ./bin/regression-test/conf/regression-conf-custom.groovy
 
-new_line="excludeSuites=\"test_stage_ram\""
-echo \$new_line >> ./bin/regression-test/conf/regression-conf-custom.groovy
-
 new_line="pluginPath=\"bin/regression-test/plugins\""
 echo \$new_line >> ./bin/regression-test/conf/regression-conf-custom.groovy
+
+# due to aws adapts iam role, but copy into will fail in this mode
+# so all aws not run copy into case
+if [[ "\$host" =~ "amazonaws.com" ]];then
+    new_line="excludeSuites=\"test_stage_ram,test_internal_stage_http_data_api,test_internal_stage_smoke\""
+    echo \$new_line >> ./bin/regression-test/conf/regression-conf-custom.groovy
+else
+    new_line="excludeSuites=\"test_stage_ram\""
+    echo \$new_line >> ./bin/regression-test/conf/regression-conf-custom.groovy
+fi
 
 # start smoke test
 
