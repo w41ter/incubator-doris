@@ -2905,4 +2905,144 @@ TEST(MetaServiceSnapshotTest, GetInstanceWithPredecessorSuccessorTest) {
     }
 }
 
+TEST(MetaServiceHttpTest, DropInstanceTest) {
+    auto meta_service = get_meta_service(true);
+    const char* const cloud_unique_id = "test_cloud_unique_id";
+
+    // Setup SyncPoint for encryption
+    auto* sp = SyncPoint::get_instance();
+    sp->enable_processing();
+    sp->set_call_back("encrypt_ak_sk:get_encryption_key", [](auto&& args) {
+        auto* ret = try_any_cast<int*>(args[0]);
+        *ret = 0;
+        auto* key = try_any_cast<std::string*>(args[1]);
+        *key = "selectdbselectdbselectdbselectdb";
+        auto* key_id = try_any_cast<int64_t*>(args[2]);
+        *key_id = 1;
+    });
+    sp->set_call_back("decrypt_ak_sk:get_encryption_key", [](auto&& args) {
+        auto* key = try_any_cast<std::string*>(args[0]);
+        *key = "selectdbselectdbselectdbselectdb";
+        auto* ret = try_any_cast<int*>(args[1]);
+        *ret = 0;
+    });
+
+    // Cleanup SyncPoint when test finishes
+    DORIS_CLOUD_DEFER {
+        sp->disable_processing();
+        sp->clear_all_call_backs();
+    };
+
+    std::string instance_id = "test_instance";
+    // Create test instance first
+    {
+        brpc::Controller cntl;
+        CreateInstanceRequest req;
+        req.set_instance_id(instance_id);
+        req.set_user_id("test_user");
+        req.set_name("test_name");
+        ObjectStoreInfoPB obj;
+        obj.set_ak("123");
+        obj.set_sk("321");
+        obj.set_bucket("456");
+        obj.set_prefix("654");
+        obj.set_endpoint("789");
+        obj.set_region("987");
+        obj.set_external_endpoint("888");
+        obj.set_provider(ObjectStoreInfoPB::BOS);
+        req.mutable_obj_info()->CopyFrom(obj);
+
+        CreateInstanceResponse res;
+        meta_service->create_instance(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                      &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+    }
+
+    // Enable multi version for the test instance
+    {
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(meta_service->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+        std::string instance_key_str = instance_key(instance_id);
+        std::string instance_value;
+        ASSERT_EQ(txn->get(instance_key_str, &instance_value), TxnErrorCode::TXN_OK);
+        InstanceInfoPB instance_info;
+        ASSERT_TRUE(instance_info.ParseFromString(instance_value));
+        instance_info.set_snapshot_switch_status(SnapshotSwitchStatus::SNAPSHOT_SWITCH_ON);
+        txn->put(instance_key_str, instance_info.SerializeAsString());
+        ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+    }
+
+    // Begin snapshot
+    std::string snapshot_id = "";
+    {
+        BeginSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_auto_snapshot(false);
+        req.set_timeout_seconds(12);
+        req.set_ttl_seconds(3600);
+        req.set_request_ip("127.0.0.1");
+        req.set_snapshot_label("snapshot_label");
+
+        brpc::Controller cnt;
+        BeginSnapshotResponse resp;
+        meta_service->begin_snapshot(&cnt, &req, &resp, brpc::DoNothing());
+        ASSERT_FALSE(cnt.Failed()) << cnt.ErrorText();
+        ASSERT_EQ(resp.status().code(), MetaServiceCode::OK) << resp.ShortDebugString();
+        snapshot_id = resp.snapshot_id();
+    }
+
+    // Commit snapshot
+    {
+        CommitSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_snapshot_id(snapshot_id);
+        req.set_image_url("/test/snapshot/url");
+        req.set_last_journal_id(100);
+        req.set_request_ip("127.0.0.1");
+
+        brpc::Controller cntl;
+        CommitSnapshotResponse res;
+        meta_service->commit_snapshot(&cntl, &req, &res, nullptr);
+        ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
+    }
+
+    // Cannot drop instance because it has snapshots
+    {
+        brpc::Controller cntl;
+        AlterInstanceRequest req;
+        AlterInstanceResponse res;
+        req.set_instance_id(instance_id);
+        req.set_op(AlterInstanceRequest::DROP);
+        meta_service->alter_instance(&cntl, &req, &res, nullptr);
+        ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT) << res.ShortDebugString();
+        ASSERT_TRUE(res.status().msg().find("instance has snapshots") != std::string::npos);
+    }
+
+    // Drop snapshot
+    {
+        brpc::Controller cntl;
+        DropSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_snapshot_id(snapshot_id);
+        DropSnapshotResponse res;
+        meta_service->drop_snapshot(&cntl, &req, &res, nullptr);
+        ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+    }
+
+    // Drop instance
+    {
+        brpc::Controller cntl;
+        AlterInstanceRequest req;
+        AlterInstanceResponse res;
+        req.set_instance_id(instance_id);
+        req.set_op(AlterInstanceRequest::DROP);
+        meta_service->alter_instance(&cntl, &req, &res, nullptr);
+        ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
+    }
+}
+
 } // namespace doris::cloud

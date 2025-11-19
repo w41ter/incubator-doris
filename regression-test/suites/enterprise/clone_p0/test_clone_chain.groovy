@@ -258,7 +258,7 @@ suite("test_clone_chain", "snapshot,docker") {
             assertEquals(res[1]['id'], 2)
         }
 
-        // drop snapshot in instance2
+        // cannot drop snapshot in instance2 because instance3 references it
         connectWithDockerCluster(clusters[cluster_2]) {
             test {
                 sql "ADMIN DROP CLUSTER SNAPSHOT WHERE snapshot_id = '${snapshot_id}'"
@@ -268,24 +268,23 @@ suite("test_clone_chain", "snapshot,docker") {
             logger.info("Cluster snapshots after dropping: " + res.toString())
         }
 
-        // drop instance2
+        // cannot drop instance2 because has snapshots
         def ms = clusters[cluster_1].getAllMetaservices().get(0)
         def msHttpPort = ms.host + ":" + ms.httpPort
-        drop_instance(msHttpPort, "cluster_2_instance_id")
 
-        // wait for recycle instance2
-        sleep(20000)
+        // drop instance3
+        drop_instance(msHttpPort, "cluster_3_instance_id")
 
-        // check instance2 is not recycled
-        connectWithDockerCluster(clusters[cluster_3]) {
-            sql "USE test_db"
-            def res = sql_return_maparray "SELECT * FROM test_table ORDER BY id"
-            logger.info("Data in derived cluster after clone: " + res.toString())
-            assertEquals(res.size(), 2)
-            assertEquals(res[0]['id'], 1)
-            assertEquals(res[0]['name'], 'cluster1_data')
-            assertEquals(res[1]['id'], 2)
+        // drop snapshot in instance2
+        connectWithDockerCluster(clusters[cluster_2]) {
+            sql "ADMIN DROP CLUSTER SNAPSHOT WHERE snapshot_id = '${snapshot_id}'"
+            def res = sql_return_maparray "SELECT * FROM information_schema.cluster_snapshots"
+            logger.info("Cluster snapshots after dropping: " + res.toString())
+            assertEquals(res.size(), 0)
         }
+
+        // drop instance2
+        drop_instance(msHttpPort, "cluster_2_instance_id")
     }
 }
 
