@@ -48,11 +48,15 @@ suite("test_snapshot_basic", "snapshot,docker") {
 
     def opt = new ClusterOptions(
         cloudMode: true, feNum: 1, beNum: 1, msNum: 1,
+        feConfigs: [
+            "cloud_auto_snapshot_min_interval_seconds=5",
+        ],
         msConfigs: [
             "enable_split_rowset_meta=true",
             "enable_split_tablet_schema_pb=true",
             "enable_multi_version_status=true",
             "multi_version_status_check_interval_seconds=1",
+            "snapshot_min_interval_seconds=5"
         ],
         recycleConfigs: [
             "recycle_interval_seconds=1",
@@ -152,6 +156,24 @@ suite("test_snapshot_basic", "snapshot,docker") {
         res = sql_return_maparray "SELECT * FROM information_schema.cluster_snapshots"
         logger.info("Cluster snapshots after dropping auto snapshot: " + res.toString())
         assertFalse(res.any { it['AUTO'] == true })
+
+        // case 6. Set auto snapshot snapshot_interval_seconds = 5
+        sql "ADMIN SET AUTO CLUSTER SNAPSHOT PROPERTIES('snapshot_interval_seconds'='5', 'max_reserved_snapshots'='3')"
+
+        Awaitility.await().pollInterval(java.time.Duration.ofSeconds(6)).atMost(java.time.Duration.ofMinutes(5)).until {
+            def res2 = sql_return_maparray "SELECT * FROM information_schema.cluster_snapshots WHERE LABEL LIKE 'auto_snapshot_%' and STATE = 'SNAPSHOT_NORMAL'"
+            logger.info("Auto snapshots with 5 seconds interval: " + res2.toString())
+            return res2.size() >= 3
+        }
+
+        // case 7. Set auto snapshot max_reserved_snapshots = 0: Disable auto snapshot and recycle all auto snapshots
+        sql "ADMIN SET AUTO CLUSTER SNAPSHOT PROPERTIES('max_reserved_snapshots'='0')"
+
+        Awaitility.await().pollInterval(java.time.Duration.ofSeconds(2)).atMost(java.time.Duration.ofMinutes(5)).until {
+            def res2 = sql_return_maparray "SELECT * FROM information_schema.cluster_snapshots WHERE LABEL LIKE 'auto_snapshot_%'"
+            logger.info("Auto snapshots with max reserved 0 snapshots : " + res2.toString())
+            return res2.size() == 0
+        }
     }
 }
 
