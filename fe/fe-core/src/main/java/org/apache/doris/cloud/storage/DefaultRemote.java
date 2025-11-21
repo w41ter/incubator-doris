@@ -161,7 +161,7 @@ public class DefaultRemote extends RemoteBase {
             URI endpointUri = URI.create("http://" + obj.getEndpoint());
             s3Client = S3Client.builder().endpointOverride(endpointUri).credentialsProvider(scp)
                     .region(Region.of(obj.getRegion()))
-                    .serviceConfiguration(S3Configuration.builder().checksumValidationEnabled(false).build())
+                    .serviceConfiguration(S3Configuration.builder().chunkedEncodingEnabled(false).build())
                     .build();
         }
     }
