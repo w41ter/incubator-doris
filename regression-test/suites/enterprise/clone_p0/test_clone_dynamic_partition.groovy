@@ -42,16 +42,24 @@ suite("test_clone_dynamic_partition", "snapshot,docker") {
         return res[0]['ID']
     }
 
-    def wait_for_partition_num = { expected_num ->
+    def wait_for_partition_num = { cluster, database, table_name, expected_num ->
         for (int i = 0; i < 40; i++) {
-            def res = sql "show partitions from test_table"
+            def res = null
+            connectWithDockerCluster(cluster) {
+                sql "USE ${database}"
+                res = sql "show partitions from ${table_name}"
+            }
             if (res.size() == expected_num) {
                 break
             } else {
                 sleep(2000)
             }
         }
-        def res = sql "show partitions from test_table"
+        def res = null
+        connectWithDockerCluster(cluster) {
+            sql "USE ${database}"
+            res = sql "show partitions from ${table_name}"
+        }
         logger.info("partitions: " + res.toString())
         assertEquals(res.size(), expected_num)
     }
@@ -148,7 +156,7 @@ suite("test_clone_dynamic_partition", "snapshot,docker") {
             """
 
             // wait for 6 dynamic partitions to be created and 1 history partition to be dropped
-            wait_for_partition_num(8)
+            wait_for_partition_num(clusters[base_name], "test_db", "test_table", 8)
             res = sql "select * from test_table"
             assertEquals(res.size(), 4)
             drop_catalog_recycle_bin()
@@ -177,7 +185,7 @@ suite("test_clone_dynamic_partition", "snapshot,docker") {
             // enable dynamic partition scheduler
             sql """ ADMIN SET FRONTEND CONFIG ("dynamic_partition_enable" = "true") """
             // wait for 1 history partition to be dropped, 2 new partitions to be created
-            wait_for_partition_num(9)
+            wait_for_partition_num(clusters[base_name], "test_db", "test_table", 9)
             res = sql "select * from test_table"
             assertEquals(res.size(), 4)
             drop_catalog_recycle_bin()
@@ -185,7 +193,7 @@ suite("test_clone_dynamic_partition", "snapshot,docker") {
             // alter table to drop 1 history partition
             sql """ ALTER TABLE test_table SET ("dynamic_partition.reserved_history_periods"="[2025-08-01,2025-08-02]");"""
             // wait for 1 history partition to be dropped
-            wait_for_partition_num(8)
+            wait_for_partition_num(clusters[base_name], "test_db", "test_table", 8)
             res = sql "select * from test_table"
             assertEquals(res.size(), 2)
             drop_catalog_recycle_bin()
@@ -226,7 +234,7 @@ suite("test_clone_dynamic_partition", "snapshot,docker") {
             sql """ ADMIN SET FRONTEND CONFIG ("dynamic_partition_enable" = "true") """
 
             // check 9 partitions: create 2 partitions and drop 1 history partition
-            wait_for_partition_num(9)
+            wait_for_partition_num(clusters[derived_name], "test_db", "test_table", 9)
             res = sql_return_maparray "SELECT * FROM test_table"
             logger.info("Data in derived cluster after clone: " + res.toString())
             assertEquals(res.size(), 4)
@@ -235,7 +243,7 @@ suite("test_clone_dynamic_partition", "snapshot,docker") {
 
             // alter table to drop 1 history partition
             sql """ ALTER TABLE test_table SET ("dynamic_partition.reserved_history_periods"="[2025-09-01,2025-09-02]");"""
-            wait_for_partition_num(8)
+            wait_for_partition_num(clusters[derived_name], "test_db", "test_table", 8)
             res = sql "select * from test_table"
             assertEquals(res.size(), 2)
             assertEquals(res[0][0].toString(), '2025-09-01')

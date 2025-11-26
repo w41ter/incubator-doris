@@ -31,7 +31,15 @@ suite("test_clone_basic", "snapshot,docker") {
             connectWithDockerCluster(cluster) {
                 def res = sql_return_maparray "SELECT * FROM information_schema.cluster_snapshots WHERE LABEL='${snapshot_label}'"
                 logger.info("Snapshot ${snapshot_label} status: " + res.toString())
-                return res.size() == 1 && res[0]['STATE'] != 'SNAPSHOT_PREPARE'
+                if (res.size() == 1) {
+                    def state = res[0]['STATE']
+                    if (state == 'SNAPSHOT_NORMAL') {
+                        return true
+                    } else if (state == 'SNAPSHOT_ABORTED' || state == 'SNAPSHOT_FAILED') {
+                        throw new Exception("Snapshot ${snapshot_label} failed with state: ${state}")
+                    }
+                }
+                return false
             }
         }
     }
