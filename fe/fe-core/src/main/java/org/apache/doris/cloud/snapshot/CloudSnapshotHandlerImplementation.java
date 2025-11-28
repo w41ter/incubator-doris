@@ -75,7 +75,6 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
     private CloudSnapshotJob autoSnapshotJob = null;
     private long autoSnapshotIntervalSeconds;
     private long lastFinishedAutoSnapshotTime = -1; // second
-    private boolean autoSnapshotJobInitialized = false;
 
     // manual snapshot jobs
     private LinkedBlockingQueue<CloudSnapshotJob> manualSnapshotJobs = Queues.newLinkedBlockingQueue();
@@ -90,9 +89,7 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
     protected void runAfterCatalogReady() {
         try {
             getLastFinishedAutoSnapshotTime();
-            if (!autoSnapshotJobInitialized) {
-                refreshAutoSnapshotJob();
-            }
+            refreshAutoSnapshotJob();
             executeJobs();
         } catch (Throwable e) {
             LOG.warn("failed to process one round of cloud snapshot", e);
@@ -123,8 +120,7 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
         } else {
             this.autoSnapshotJob = null;
         }
-        autoSnapshotJobInitialized = true;
-        LOG.info("auto snapshot job is {}, interval: {}", this.autoSnapshotJob != null ? "ON" : "OFF",
+        LOG.debug("auto snapshot job is {}, interval: {}", this.autoSnapshotJob != null ? "ON" : "OFF",
                 this.autoSnapshotIntervalSeconds);
     }
 

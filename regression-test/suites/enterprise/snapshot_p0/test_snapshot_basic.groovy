@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import groovy.json.JsonOutput
 import org.apache.doris.regression.suite.ClusterOptions
 import org.apache.doris.regression.suite.SuiteCluster
 import org.awaitility.Awaitility
@@ -43,6 +44,17 @@ suite("test_snapshot_basic", "snapshot,docker") {
                 }
             }
             return true
+        }
+    }
+
+    def instance_id = "default_instance_id"
+    def token = "greedisgood9999"
+    def set_snapshot_property = { msHttpPort, request_body, check_func ->
+        httpTest {
+            endpoint msHttpPort
+            uri "/MetaService/http/set_snapshot_property?token=$token"
+            body request_body
+            check check_func
         }
     }
 
@@ -172,6 +184,44 @@ suite("test_snapshot_basic", "snapshot,docker") {
         Awaitility.await().pollInterval(java.time.Duration.ofSeconds(2)).atMost(java.time.Duration.ofMinutes(5)).until {
             def res2 = sql_return_maparray "SELECT * FROM information_schema.cluster_snapshots WHERE LABEL LIKE 'auto_snapshot_%'"
             logger.info("Auto snapshots with max reserved 0 snapshots : " + res2.toString())
+            return res2.size() == 0
+        }
+
+        // case 8. Set auto snapshot max_reserved_snapshots = 3 by http api
+        def msList = cluster.getMetaservices()
+        def (ip, port) = msList[0].getHttpAddress()
+        def host = "${ip}:${port}"
+        def property_json = ["max_reserved_snapshots": "3"]
+        def instance_property_json = ["instance_id": instance_id, "properties": property_json]
+        def jsonOutput = new JsonOutput()
+        def property_body = jsonOutput.toJson(instance_property_json)
+        set_snapshot_property.call(host, property_body) {
+            respCode, body ->
+                log.info("set_snapshot_property http cli result: ${body} ${respCode}".toString())
+                def json = parseJson(body)
+                assertTrue(json.code.equalsIgnoreCase("OK"))
+        }
+
+        Awaitility.await().pollInterval(java.time.Duration.ofSeconds(6)).atMost(java.time.Duration.ofMinutes(5)).until {
+            def res2 = sql_return_maparray "SELECT * FROM information_schema.cluster_snapshots WHERE LABEL LIKE 'auto_snapshot_%' and STATE = 'SNAPSHOT_NORMAL'"
+            logger.info("Auto snapshots with 5 seconds interval: " + res2.toString())
+            return res2.size() >= 3
+        }
+
+        // case 9. Set auto snapshot max_reserved_snapshots = 0 by http api
+        property_json = ["max_reserved_snapshots": "0"]
+        instance_property_json = ["instance_id": instance_id, "properties": property_json]
+        property_body = jsonOutput.toJson(instance_property_json)
+        set_snapshot_property.call(host, property_body) {
+            respCode, body ->
+                log.info("set_snapshot_property http cli result: ${body} ${respCode}".toString())
+                def json = parseJson(body)
+                assertTrue(json.code.equalsIgnoreCase("OK"))
+        }
+
+        Awaitility.await().pollInterval(java.time.Duration.ofSeconds(6)).atMost(java.time.Duration.ofMinutes(5)).until {
+            def res2 = sql_return_maparray "SELECT * FROM information_schema.cluster_snapshots WHERE LABEL LIKE 'auto_snapshot_%' and STATE = 'SNAPSHOT_NORMAL'"
+            logger.info("Auto snapshots with max reserved 0 snapshots: " + res2.toString())
             return res2.size() == 0
         }
     }
