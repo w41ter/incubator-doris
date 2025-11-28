@@ -70,6 +70,7 @@ run() {
 
     # start minio docker to run case test_rountine_load
     sed -i "s/^CONTAINER_UID=\"doris--\"/CONTAINER_UID=\"doris-external--\"/" "${teamcity_build_checkoutDir}"/docker/thirdparties/custom_settings.env
+    sed -i "s/oss-cn-hongkong.aliyuncs.com/oss-cn-hongkong-internal.aliyuncs.com/" "${teamcity_build_checkoutDir}"/docker/thirdparties/custom_settings.env
     if bash "${teamcity_build_checkoutDir}"/docker/thirdparties/run-thirdparties-docker.sh -c minio ||
         bash "${teamcity_build_checkoutDir}"/docker/thirdparties/run-thirdparties-docker.sh -c minio; then
         echo "INFO: start minio docker success"
