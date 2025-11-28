@@ -78,7 +78,7 @@ class FunctionContext;
 } // namespace doris
 
 namespace doris::vectorized {
-static const re2::RE2 JSON_PATTERN("^([^\\\"\\[\\]]*)(?:\\[([0-9]+|\\*)\\])?");
+static const re2::RE2 JSON_PATTERN(R"(^([^\"\[\]]*)(?:\[([0-9]+|\*)\])?)");
 
 template <typename T, typename U>
 void char_split(std::vector<T>& res, const U& var, char p) {
@@ -129,63 +129,100 @@ void get_parsed_paths(const T& path_exprs, std::vector<JsonPath>* parsed_paths) 
 }
 
 rapidjson::Value* match_value(const std::vector<JsonPath>& parsed_paths, rapidjson::Value* document,
-                              rapidjson::Document::AllocatorType& mem_allocator,
-                              bool is_insert_null = false) {
-    rapidjson::Value* root = document;
-    rapidjson::Value* array_obj = nullptr;
-    for (int i = 1; i < parsed_paths.size(); i++) {
-        if (root == nullptr || root->IsNull()) {
-            return nullptr;
-        }
+                              rapidjson::Document::AllocatorType& mem_allocator) {
+    if (parsed_paths.size() == 1) {
+        return document;
+    } else if (parsed_paths.empty()) {
+        return nullptr;
+    }
 
-        if (UNLIKELY(!parsed_paths[i].is_valid)) {
-            return nullptr;
-        }
+    std::vector<rapidjson::Value*> values;
+    std::vector<rapidjson::Value*> results;
+    results.emplace_back(document);
 
-        const std::string& col = parsed_paths[i].key;
-        int index = parsed_paths[i].idx;
-        if (LIKELY(!col.empty())) {
-            if (root->IsObject()) {
-                if (!root->HasMember(col.c_str())) {
-                    return nullptr;
-                } else {
-                    root = &((*root)[col.c_str()]);
+    bool is_wildcard = false;
+    auto pick_element_from_array = [&results, &is_wildcard](const JsonPath& path,
+                                                            rapidjson::Value* value) {
+        if (path.idx == -2) { // [*]
+            if (LIKELY(value->IsArray())) {
+                is_wildcard = true;
+                for (auto* it = value->Begin(); it != value->End(); ++it) {
+                    results.emplace_back(it);
                 }
-            } else {
-                // root is not a nested type, return NULL
-                return nullptr;
             }
+        } else if (!value->IsArray() && path.idx == 0) {
+            // Same as mysql and postgres
+            results.emplace_back(value);
+        } else if (value->IsArray() && path.idx >= 0 && path.idx < value->Size()) {
+            results.emplace_back(&(*value)[path.idx]);
         }
+    };
 
-        if (UNLIKELY(index != -1)) {
-            // judge the rapidjson:Value, which base the top's result,
-            // if not array return NULL;else get the index value from the array
-            if (root->IsArray()) {
-                if (root->IsNull()) {
-                    return nullptr;
-                } else if (index == -2) {
-                    // [*]
-                    array_obj = static_cast<rapidjson::Value*>(
-                            mem_allocator.Malloc(sizeof(rapidjson::Value)));
-                    array_obj->SetArray();
-
-                    for (int j = 0; j < root->Size(); j++) {
-                        rapidjson::Value v;
-                        v.CopyFrom((*root)[j], mem_allocator);
-                        array_obj->PushBack(v, mem_allocator);
+    for (size_t i = 1; i != parsed_paths.size(); ++i) {
+        values = std::move(results);
+        const auto& path = parsed_paths[i];
+        for (auto* pval : values) {
+            if (!path.key.empty()) {
+                if (LIKELY(pval->IsObject())) {
+                    if (path.key == "*") {
+                        is_wildcard = true;
+                        for (auto it = pval->MemberBegin(); it != pval->MemberEnd(); ++it) {
+                            if (path.idx != -1) {
+                                pick_element_from_array(path, &it->value);
+                            } else {
+                                results.emplace_back(&it->value);
+                            }
+                        }
+                        continue;
                     }
-                    root = array_obj;
-                } else if (index >= root->Size()) {
-                    return nullptr;
-                } else {
-                    root = &((*root)[index]);
+
+                    if (pval->HasMember(path.key.c_str())) {
+                        auto* obj = &((*pval)[path.key.c_str()]);
+                        if (path.idx != -1) {
+                            pick_element_from_array(path, obj);
+                        } else {
+                            results.emplace_back(obj);
+                        }
+                    }
                 }
-            } else {
-                return nullptr;
+                continue;
+            } else if (path.idx == -2) { // [*]
+                if (LIKELY(pval->IsArray())) {
+                    is_wildcard = true;
+                    for (auto* it = pval->Begin(); it != pval->End(); ++it) {
+                        results.emplace_back(it);
+                    }
+                }
+                continue;
+            } else if (!pval->IsArray() && path.idx == 0) {
+                // Same as mysql and postgres
+                results.emplace_back(pval);
+                continue;
+            } else if (!pval->IsArray() || path.idx <= -1 || path.idx >= pval->Size()) {
+                continue;
             }
+            results.emplace_back(&(*pval)[path.idx]);
         }
     }
-    return root;
+
+    if (is_wildcard) {
+        if (results.empty()) {
+            return nullptr;
+        }
+        auto* array_obj =
+                static_cast<rapidjson::Value*>(mem_allocator.Malloc(sizeof(rapidjson::Value)));
+        array_obj->SetArray();
+        for (const auto* pval : results) {
+            rapidjson::Value v;
+            v.CopyFrom(*pval, mem_allocator);
+            array_obj->PushBack(v, mem_allocator);
+        }
+        return array_obj;
+    } else if (results.size() == 1) {
+        return results[0];
+    }
+
+    return nullptr;
 }
 
 template <JsonFunctionType fntype>
