@@ -692,6 +692,98 @@ void SnapshotManager::abort_snapshot(std::string_view instance_id,
     }
 }
 
+void get_instance(Transaction* txn, const std::string_view& instance_id,
+                  InstanceInfoPB& instance_info, MetaServiceCode& code, std::string& error_msg) {
+    InstanceKeyInfo instance_key_info {instance_id};
+    std::string key = instance_key(instance_key_info);
+    std::string val;
+    TxnErrorCode err = txn->get(key, &val);
+    if (err != TxnErrorCode::TXN_OK) {
+        if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
+            code = MetaServiceCode::INVALID_ARGUMENT;
+        } else {
+            code = cast_as<ErrCategory::READ>(err);
+        }
+        error_msg = fmt::format("failed to get instance, instance_id={}, err={}", instance_id, err);
+        return;
+    }
+
+    if (!instance_info.ParseFromString(val)) {
+        code = MetaServiceCode::INVALID_ARGUMENT;
+        error_msg = "failed to parse instance info";
+        return;
+    }
+}
+
+// Get all snapshots of the specific instance.
+// If the instance is created by rollback, also get the snapshots of all its predecessor instances.
+// This method is used by list_snapshot, drop_snapshot, clone_instance.
+void get_all_snapshots(Transaction* txn, const std::string_view& instance_id,
+                       const std::string& required_snapshot_id,
+                       std::vector<std::pair<SnapshotPB, Versionstamp>>* snapshots,
+                       MetaServiceCode& code, std::string& error_msg) {
+    Versionstamp required_snapshot_versionstamp;
+    if (!required_snapshot_id.empty()) {
+        if (!parse_snapshot_versionstamp(required_snapshot_id, &required_snapshot_versionstamp)) {
+            code = MetaServiceCode::INVALID_ARGUMENT;
+            error_msg = "invalid snapshot_id format";
+            return;
+        }
+    }
+
+    InstanceInfoPB instance_info;
+    get_instance(txn, instance_id, instance_info, code, error_msg);
+    if (code != MetaServiceCode::OK) {
+        return;
+    }
+    std::string_view current_instance_id = instance_id;
+    if (instance_info.has_original_instance_id() && !instance_info.original_instance_id().empty()) {
+        // the earliest instance_id for rollback
+        current_instance_id = instance_info.original_instance_id();
+    }
+
+    do {
+        MetaReader meta_reader(current_instance_id);
+        if (required_snapshot_id.empty()) {
+            TxnErrorCode err = meta_reader.get_snapshots(txn, snapshots);
+            if (err != TxnErrorCode::TXN_OK) {
+                code = cast_as<ErrCategory::READ>(err);
+                error_msg = "failed to get snapshots";
+                return;
+            }
+        } else {
+            SnapshotPB snapshot_pb;
+            TxnErrorCode err =
+                    meta_reader.get_snapshot(txn, required_snapshot_versionstamp, &snapshot_pb);
+            if (err == TxnErrorCode::TXN_OK) {
+                snapshots->emplace_back(snapshot_pb, required_snapshot_versionstamp);
+                return;
+            } else if (err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
+                code = cast_as<ErrCategory::READ>(err);
+                error_msg = "failed to get snapshot";
+                return;
+            }
+        }
+        if (current_instance_id == instance_id) {
+            break;
+        }
+        get_instance(txn, current_instance_id, instance_info, code, error_msg);
+        if (code != MetaServiceCode::OK) {
+            return;
+        }
+        if (!instance_info.has_successor_instance_id() ||
+            instance_info.successor_instance_id().empty()) {
+            code = MetaServiceCode::INVALID_ARGUMENT;
+            error_msg = fmt::format(
+                    "successor_instance_id is empty for current instance_id={}, instance_id={}",
+                    current_instance_id, instance_id);
+            LOG_WARNING(error_msg);
+            return;
+        }
+        current_instance_id = instance_info.successor_instance_id();
+    } while (true);
+}
+
 void SnapshotManager::drop_snapshot(std::string_view instance_id,
                                     const DropSnapshotRequest& request,
                                     DropSnapshotResponse* response) {
@@ -723,32 +815,30 @@ void SnapshotManager::drop_snapshot(std::string_view instance_id,
         return;
     }
 
-    // Construct key using instance_id and use snapshot_id as versionstamp
-    std::string snapshot_full_key = versioned::snapshot_full_key({instance_id});
-    std::string snapshot_key = encode_versioned_key(snapshot_full_key, snapshot_versionstamp);
-    std::string snapshot_val;
-    err = txn->get(snapshot_key, &snapshot_val);
-    LOG(INFO) << "get versioned snapshot key=" << hex(snapshot_full_key)
-              << " version=" << snapshot_id;
-
-    if (err != TxnErrorCode::TXN_OK) {
-        if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
-            status->set_code(MetaServiceCode::TXN_ID_NOT_FOUND);
-            status->set_msg("snapshot not found, snapshot_id=" + snapshot_id);
-        } else {
-            status->set_code(cast_as<ErrCategory::READ>(err));
-            status->set_msg("failed to get snapshot, snapshot_id=" + snapshot_id);
-        }
+    // Get snapshot
+    std::vector<std::pair<SnapshotPB, Versionstamp>> snapshots;
+    MetaServiceCode code = MetaServiceCode::OK;
+    std::string error_msg;
+    get_all_snapshots(txn.get(), instance_id, snapshot_id, &snapshots, code, error_msg);
+    if (code != MetaServiceCode::OK) {
+        status->set_code(code);
+        status->set_msg(error_msg);
         LOG(WARNING) << status->msg() << " err=" << err;
         return;
     }
-
-    SnapshotPB snapshot_pb;
-    if (!snapshot_pb.ParseFromString(snapshot_val)) {
-        status->set_code(MetaServiceCode::PROTOBUF_PARSE_ERR);
-        status->set_msg("failed to parse SnapshotPB");
+    if (snapshots.empty()) {
+        status->set_code(MetaServiceCode::TXN_ID_NOT_FOUND);
+        status->set_msg("snapshot not found, snapshot_id=" + snapshot_id);
         return;
     }
+    if (snapshots.size() > 1) {
+        // it is impossible.
+        LOG_WARNING("more than one snapshot")
+                .tag("instance_id", instance_id)
+                .tag("snapshot_id", snapshot_id)
+                .tag("snapshot_num", snapshots.size());
+    }
+    SnapshotPB& snapshot_pb = snapshots.front().first;
 
     if (snapshot_pb.status() == SnapshotStatus::SNAPSHOT_RECYCLED) {
         // Already dropped, return success to handle RPC retry
@@ -766,7 +856,7 @@ void SnapshotManager::drop_snapshot(std::string_view instance_id,
     }
 
     bool has_references = false;
-    MetaReader meta_reader(instance_id);
+    MetaReader meta_reader(snapshot_pb.instance_id());
     err = meta_reader.has_snapshot_references(txn.get(), snapshot_versionstamp, &has_references,
                                               false);
     if (err != TxnErrorCode::TXN_OK) {
@@ -791,6 +881,8 @@ void SnapshotManager::drop_snapshot(std::string_view instance_id,
         return;
     }
 
+    std::string snapshot_full_key = versioned::snapshot_full_key({snapshot_pb.instance_id()});
+    std::string snapshot_key = encode_versioned_key(snapshot_full_key, snapshot_versionstamp);
     txn->put(snapshot_key, updated_snapshot_val);
 
     LOG_INFO("drop snapshot completed, marked as RECYCLED")
@@ -826,58 +918,28 @@ void SnapshotManager::list_snapshot(std::string_view instance_id,
         return;
     }
 
-    std::string snapshot_full_key = versioned::snapshot_full_key({instance_id});
+    std::vector<std::pair<SnapshotPB, Versionstamp>> snapshots;
+    MetaServiceCode code = MetaServiceCode::OK;
+    std::string error_msg;
+    get_all_snapshots(txn.get(), instance_id, required_snapshot_id, &snapshots, code, error_msg);
+    if (code != MetaServiceCode::OK) {
+        status->set_code(code);
+        status->set_msg(error_msg);
+        LOG(WARNING) << status->msg() << " err=" << err;
+        return;
+    }
 
-    std::map<std::string, SnapshotInfoPB> snapshots_map;
-
-    if (!required_snapshot_id.empty()) {
-        // Optimize for specific snapshot ID query - directly get the snapshot
-        Versionstamp snapshot_versionstamp;
-        if (!parse_snapshot_versionstamp(required_snapshot_id, &snapshot_versionstamp)) {
-            status->set_code(MetaServiceCode::INVALID_ARGUMENT);
-            status->set_msg("invalid snapshot_id format");
-            return;
+    for (auto&& [snapshot_pb, snapshot_versionstamp] : snapshots) {
+        if (snapshot_pb.status() == SnapshotStatus::SNAPSHOT_RECYCLED) {
+            continue;
         }
-
-        std::string snapshot_key = encode_versioned_key(snapshot_full_key, snapshot_versionstamp);
-        std::string snapshot_val;
-        err = txn->get(snapshot_key, &snapshot_val);
-
-        if (err != TxnErrorCode::TXN_OK) {
-            if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
-                // Snapshot not found, return empty result
-                LOG(INFO) << "snapshot not found, snapshot_id=" << required_snapshot_id;
-                return;
-            } else {
-                status->set_code(cast_as<ErrCategory::READ>(err));
-                status->set_msg(fmt::format("failed to get snapshot, snapshot_id={}, err={}",
-                                            required_snapshot_id, err));
-                LOG(WARNING) << status->msg();
-                return;
-            }
-        }
-
-        SnapshotPB snapshot_pb;
-        if (!snapshot_pb.ParseFromString(snapshot_val)) {
-            status->set_code(MetaServiceCode::PROTOBUF_PARSE_ERR);
-            status->set_msg("failed to parse SnapshotPB");
-            return;
-        } else if (snapshot_pb.status() == SnapshotStatus::SNAPSHOT_RECYCLED) {
-            return; // Skip recycled snapshot
-        }
-
-        LOG_INFO("get snapshot versioned key")
-                .tag("snapshot_key", hex(snapshot_full_key))
-                .tag("instance_id", instance_id);
-
-        // Check if we should include aborted snapshots
         if (!include_aborted && snapshot_pb.status() == SnapshotStatus::SNAPSHOT_ABORTED) {
-            // Skip aborted snapshot, return empty result
-            return;
+            continue;
         }
 
+        std::string snapshot_id = snapshot_versionstamp.to_string();
         SnapshotInfoPB snapshot_info;
-        snapshot_info.set_snapshot_id(required_snapshot_id);
+        snapshot_info.set_snapshot_id(snapshot_id);
         snapshot_info.set_instance_id(snapshot_pb.instance_id());
         snapshot_info.set_status(snapshot_pb.status());
         snapshot_info.set_type(snapshot_pb.type());
@@ -913,137 +975,28 @@ void SnapshotManager::list_snapshot(std::string_view instance_id,
             snapshot_info.set_reason(snapshot_pb.reason());
         }
 
-        snapshots_map[required_snapshot_id] = std::move(snapshot_info);
-    } else {
-        // No specific snapshot ID requested - scan all snapshots
-        // Use full_range_get to get ALL versions of the snapshot key
-        std::string begin_key = encode_versioned_key(snapshot_full_key, Versionstamp::min());
-        std::string end_key = encode_versioned_key(snapshot_full_key, Versionstamp::max());
-
-        FullRangeGetOptions opts;
-        opts.reverse = true; // Get the latest version first
-        opts.begin_key_selector = RangeKeySelector::FIRST_GREATER_OR_EQUAL;
-        opts.end_key_selector = RangeKeySelector::FIRST_GREATER_THAN;
-
-        auto iter = txn->full_range_get(begin_key, end_key, std::move(opts));
-
-        if (!iter->is_valid() && iter->error_code() != TxnErrorCode::TXN_OK) {
-            status->set_code(cast_as<ErrCategory::READ>(iter->error_code()));
-            status->set_msg(fmt::format("failed to scan snapshots, err={}", iter->error_code()));
-            LOG(WARNING) << status->msg();
+        MetaReader reader(snapshot_info.instance_id(), txn_kv_.get());
+        std::vector<std::string> derived_instance_ids;
+        TxnErrorCode err = reader.find_derived_instance_ids(txn.get(), snapshot_versionstamp,
+                                                            &derived_instance_ids);
+        if (err != TxnErrorCode::TXN_OK) {
+            status->set_code(MetaServiceCode::KV_TXN_GET_ERR);
+            status->set_msg(
+                    fmt::format("failed to find derived instance ids for snapshot {}, err={}",
+                                snapshot_id, err));
+            LOG_WARNING(status->msg()).tag("instance_id", snapshot_info.instance_id());
             return;
         }
 
-        while (iter->has_next()) {
-            auto element = iter->next();
-            if (!element.has_value()) {
-                if (iter->error_code() != TxnErrorCode::TXN_OK) {
-                    status->set_code(cast_as<ErrCategory::READ>(iter->error_code()));
-                    status->set_msg(
-                            fmt::format("failed to scan snapshots, err={}", iter->error_code()));
-                    LOG(WARNING) << status->msg();
-                    return;
-                }
-                break;
+        if (!derived_instance_ids.empty()) {
+            // Add derived instance IDs to the snapshot info
+            for (const auto& instance_id : derived_instance_ids) {
+                snapshot_info.add_derived_instance_ids(instance_id);
             }
 
-            auto [versioned_key, snapshot_val] = element.value();
-
-            // Extract version stamp from the versioned key
-            Versionstamp version_stamp;
-            std::string_view key_copy = versioned_key;
-            if (!decode_versioned_key(&key_copy, &version_stamp)) {
-                LOG(WARNING) << "failed to decode versioned key=" << hex(versioned_key);
-                continue;
-            }
-
-            SnapshotPB snapshot_pb;
-            if (!snapshot_pb.ParseFromString(std::string(snapshot_val))) {
-                LOG(WARNING) << "failed to parse SnapshotPB for snapshot_id="
-                             << version_stamp.to_string();
-                continue;
-            } else if (snapshot_pb.status() == SnapshotStatus::SNAPSHOT_RECYCLED) {
-                continue; // Skip recycled snapshot
-            }
-
-            LOG_INFO("get snapshot versioned key")
-                    .tag("snapshot_key", hex(snapshot_full_key))
-                    .tag("instance_id", version_stamp.to_string());
-
-            if (!include_aborted && snapshot_pb.status() == SnapshotStatus::SNAPSHOT_ABORTED) {
-                continue;
-            }
-
-            std::string snapshot_id = version_stamp.to_string();
-            SnapshotInfoPB snapshot_info;
-            snapshot_info.set_snapshot_id(snapshot_id);
-            snapshot_info.set_instance_id(snapshot_pb.instance_id());
-            snapshot_info.set_status(snapshot_pb.status());
-            snapshot_info.set_type(snapshot_pb.type());
-
-            if (snapshot_pb.has_image_url()) {
-                snapshot_info.set_image_url(snapshot_pb.image_url());
-            }
-            if (snapshot_pb.has_last_journal_id()) {
-                snapshot_info.set_journal_id(snapshot_pb.last_journal_id());
-            }
-            if (snapshot_pb.has_create_at()) {
-                snapshot_info.set_create_at(snapshot_pb.create_at());
-            }
-            if (snapshot_pb.has_finish_at()) {
-                snapshot_info.set_finish_at(snapshot_pb.finish_at());
-            }
-            if (snapshot_pb.has_snapshot_ancestor()) {
-                snapshot_info.set_ancestor_id(snapshot_pb.snapshot_ancestor());
-            }
-            if (snapshot_pb.has_auto_()) {
-                snapshot_info.set_auto_snapshot(snapshot_pb.auto_());
-            }
-            if (snapshot_pb.has_ttl_seconds()) {
-                snapshot_info.set_ttl_seconds(snapshot_pb.ttl_seconds());
-            }
-            if (snapshot_pb.has_timeout_seconds()) {
-                snapshot_info.set_timeout_seconds(snapshot_pb.timeout_seconds());
-            }
-            if (snapshot_pb.has_label()) {
-                snapshot_info.set_snapshot_label(snapshot_pb.label());
-            }
-            if (snapshot_pb.has_reason()) {
-                snapshot_info.set_reason(snapshot_pb.reason());
-            }
-
-            snapshots_map[snapshot_id] = std::move(snapshot_info);
-        }
-    }
-
-    // Enhance snapshot info with derivation relationship information
-    MetaReader reader(instance_id, txn_kv_.get());
-    for (auto& [snapshot_id, snapshot_info] : snapshots_map) {
-        // Find derived instance IDs using this snapshot
-        Versionstamp snapshot_versionstamp;
-        if (parse_snapshot_versionstamp(snapshot_id, &snapshot_versionstamp)) {
-            std::vector<std::string> derived_instance_ids;
-            TxnErrorCode err = reader.find_derived_instance_ids(txn.get(), snapshot_versionstamp,
-                                                                &derived_instance_ids);
-            if (err != TxnErrorCode::TXN_OK) {
-                status->set_code(MetaServiceCode::KV_TXN_GET_ERR);
-                status->set_msg(
-                        fmt::format("failed to find derived instance ids for snapshot {}, err={}",
-                                    snapshot_id, err));
-                LOG_WARNING(status->msg()).tag("instance_id", instance_id);
-                return;
-            }
-
-            if (!derived_instance_ids.empty()) {
-                // Add derived instance IDs to the snapshot info
-                for (const auto& instance_id : derived_instance_ids) {
-                    snapshot_info.add_derived_instance_ids(instance_id);
-                }
-
-                LOG_INFO("snapshot has derived instances")
-                        .tag("snapshot_id", snapshot_id)
-                        .tag("derived_count", derived_instance_ids.size());
-            }
+            LOG_INFO("snapshot has derived instances")
+                    .tag("snapshot_id", snapshot_id)
+                    .tag("derived_count", derived_instance_ids.size());
         }
 
         *response->add_snapshots() = std::move(snapshot_info);
@@ -1137,37 +1090,44 @@ MetaServiceCode SnapshotManager::validate_writable_clone_request(
     return MetaServiceCode::OK;
 }
 
-TxnErrorCode SnapshotManager::validate_source_snapshot(Transaction* txn,
-                                                       const std::string& from_instance_id,
-                                                       const Versionstamp& snapshot_versionstamp,
-                                                       SnapshotPB* snapshot_pb,
-                                                       std::string* error_msg) {
-    MetaReader reader(from_instance_id);
-    TxnErrorCode err = reader.get_snapshot(txn, snapshot_versionstamp, snapshot_pb);
-    if (err != TxnErrorCode::TXN_OK) {
-        if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
-            *error_msg = fmt::format("snapshot not found: instance_id={} snapshot_id={}",
-                                     from_instance_id, snapshot_versionstamp.to_string());
-        } else {
-            *error_msg = "failed to get snapshot";
-        }
-        return err;
+void SnapshotManager::validate_source_snapshot(Transaction* txn,
+                                               const std::string& from_instance_id,
+                                               const std::string& from_snapshot_id,
+                                               SnapshotPB* snapshot_pb, MetaServiceCode& code,
+                                               std::string& error_msg) {
+    std::vector<std::pair<SnapshotPB, Versionstamp>> snapshots;
+    get_all_snapshots(txn, from_instance_id, from_snapshot_id, &snapshots, code, error_msg);
+    if (code != MetaServiceCode::OK) {
+        return;
     }
+    if (snapshots.empty()) {
+        code = MetaServiceCode::INVALID_ARGUMENT;
+        error_msg = fmt::format("snapshot not found: instance_id={} snapshot_id={}",
+                                from_instance_id, from_snapshot_id);
+        return;
+    }
+    if (snapshots.size() > 1) {
+        // it is impossible.
+        LOG_WARNING("more than one snapshot")
+                .tag("instance_id", from_instance_id)
+                .tag("snapshot_id", from_snapshot_id)
+                .tag("snapshot_num", snapshots.size());
+    }
+    *snapshot_pb = snapshots[0].first;
 
     // Validate snapshot status
     if (snapshot_pb->status() != SnapshotStatus::SNAPSHOT_NORMAL) {
-        *error_msg = fmt::format("snapshot status is not NORMAL, current status: {}",
-                                 SnapshotStatus_Name(snapshot_pb->status()));
-        return TxnErrorCode::TXN_KEY_NOT_FOUND; // Use as invalid state indicator
+        code = MetaServiceCode::INVALID_ARGUMENT;
+        error_msg = fmt::format("snapshot status is not NORMAL, current status: {}",
+                                SnapshotStatus_Name(snapshot_pb->status()));
+        return;
     }
 
     LOG_INFO("snapshot validation completed successfully")
-            .tag("snapshot_id", snapshot_versionstamp.to_string())
+            .tag("snapshot_id", from_snapshot_id)
             .tag("snapshot_status", SnapshotStatus_Name(snapshot_pb->status()))
             .tag("create_at", snapshot_pb->create_at())
             .tag("image_url", snapshot_pb->image_url());
-
-    return TxnErrorCode::TXN_OK;
 }
 
 TxnErrorCode SnapshotManager::validate_source_instance(Transaction* txn,
@@ -1205,20 +1165,6 @@ TxnErrorCode SnapshotManager::validate_source_instance(Transaction* txn,
                                  InstanceInfoPB::Status_Name(from_instance_info->status()));
         return TxnErrorCode::TXN_KEY_NOT_FOUND;
     }
-
-    // Type-specific validation
-    if (clone_type == CloneInstanceRequest::ROLLBACK) {
-        // Validate source instance does not already have a successor instance
-        if (from_instance_info->has_successor_instance_id() &&
-            !from_instance_info->successor_instance_id().empty()) {
-            *error_msg = fmt::format(
-                    "source instance already has a successor instance: {}, ROLLBACK only one "
-                    "successor is allowed",
-                    from_instance_info->successor_instance_id());
-            return TxnErrorCode::TXN_KEY_NOT_FOUND;
-        }
-    }
-
     return TxnErrorCode::TXN_OK;
 }
 
@@ -1531,6 +1477,7 @@ void SnapshotManager::establish_snapshot_reference(Transaction* txn,
                                                    const Versionstamp& snapshot_versionstamp,
                                                    const std::string& new_instance_id) {
     LOG_INFO("starting snapshot reference relationship processing")
+            .tag("from_instance_id", from_instance_id)
             .tag("from_snapshot_id", snapshot_versionstamp.to_string())
             .tag("new_instance_id", new_instance_id);
 
@@ -1543,8 +1490,9 @@ void SnapshotManager::establish_snapshot_reference(Transaction* txn,
     txn->put(reference_key, reference_val);
 
     LOG_INFO("snapshot reference relationship established")
+            .tag("from_instance_id", from_instance_id)
             .tag("snapshot_id", snapshot_versionstamp.to_string())
-            .tag("instance_id", new_instance_id)
+            .tag("new_instance_id", new_instance_id)
             .tag("reference_key", hex(reference_key));
 }
 
@@ -1569,7 +1517,7 @@ MetaServiceCode SnapshotManager::handle_readonly_clone(Transaction* txn,
                                                        CloneInstanceResponse* response,
                                                        std::string* error_msg) {
     const std::string& new_instance_id = request.new_instance_id();
-    const std::string& from_instance_id = request.from_instance_id();
+    const std::string& from_instance_id = from_instance_info.instance_id();
     const std::string& from_snapshot_id = request.from_snapshot_id();
 
     LOG_INFO("starting READ_ONLY clone")
@@ -1610,10 +1558,6 @@ MetaServiceCode SnapshotManager::handle_readonly_clone(Transaction* txn,
     instance_key(new_key_info, &new_instance_key);
     txn->put(new_instance_key, new_instance_val);
 
-    InstanceKeyInfo source_key_info {from_instance_id};
-    std::string from_instance_key;
-    instance_key(source_key_info, &from_instance_key);
-
     MetaServiceCode storage_code = clone_storage_vault_entries(
             txn, from_instance_id, new_instance_id, from_instance_info, error_msg);
     if (storage_code != MetaServiceCode::OK) {
@@ -1651,7 +1595,7 @@ MetaServiceCode SnapshotManager::handle_writable_clone(Transaction* txn,
                                                        CloneInstanceResponse* response,
                                                        std::string* error_msg) {
     const std::string& new_instance_id = request.new_instance_id();
-    const std::string& from_instance_id = request.from_instance_id();
+    const std::string& from_instance_id = from_instance_info.instance_id();
     const std::string& from_snapshot_id = request.from_snapshot_id();
 
     LOG_INFO("starting WRITABLE clone")
@@ -1723,10 +1667,12 @@ MetaServiceCode SnapshotManager::handle_writable_clone(Transaction* txn,
     return MetaServiceCode::OK;
 }
 
-MetaServiceCode SnapshotManager::handle_rollback_clone(
-        Transaction* txn, const CloneInstanceRequest& request, const SnapshotPB& snapshot_pb,
-        const InstanceInfoPB& from_instance_info, const Versionstamp& snapshot_versionstamp,
-        CloneInstanceResponse* response, std::string* error_msg) {
+MetaServiceCode SnapshotManager::handle_rollback_clone(Transaction* txn,
+                                                       const CloneInstanceRequest& request,
+                                                       const SnapshotPB& snapshot_pb,
+                                                       const InstanceInfoPB& from_instance_info,
+                                                       CloneInstanceResponse* response,
+                                                       std::string* error_msg) {
     const std::string& new_instance_id = request.new_instance_id();
     const std::string& from_instance_id = request.from_instance_id();
     const std::string& from_snapshot_id = request.from_snapshot_id();
@@ -1741,8 +1687,9 @@ MetaServiceCode SnapshotManager::handle_rollback_clone(
 
     // Update key fields for the new instance
     target_instance_info.set_instance_id(new_instance_id);
-    target_instance_info.set_source_snapshot_id(snapshot_versionstamp.to_string());
-    target_instance_info.set_source_instance_id(from_instance_id);
+    target_instance_info.set_source_snapshot_id(from_snapshot_id);
+    // the source instance is the real instance which creates this snapshot
+    target_instance_info.set_source_instance_id(snapshot_pb.instance_id());
     target_instance_info.set_ctime(std::time(nullptr));
 
     // Set original instance relationship
@@ -1839,31 +1786,32 @@ void SnapshotManager::clone_instance(const CloneInstanceRequest& request,
         return;
     }
 
+    std::string from_instance_id = request.from_instance_id();
     SnapshotPB snapshot_pb;
-    err = validate_source_snapshot(txn.get(), request.from_instance_id(), snapshot_versionstamp,
-                                   &snapshot_pb, &error_msg);
-    if (err != TxnErrorCode::TXN_OK) {
-        if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
-            status->set_code(MetaServiceCode::INVALID_ARGUMENT);
-        } else {
-            status->set_code(cast_as<ErrCategory::READ>(err));
-        }
+    validate_source_snapshot(txn.get(), from_instance_id, request.from_snapshot_id(), &snapshot_pb,
+                             code, error_msg);
+    if (code != MetaServiceCode::OK) {
+        status->set_code(code);
         status->set_msg(error_msg);
         return;
     }
 
-    // Validate snapshot belongs to source instance
-    if (snapshot_pb.instance_id() != request.from_instance_id()) {
-        status->set_code(MetaServiceCode::INVALID_ARGUMENT);
-        status->set_msg("snapshot does not belong to the specified source instance");
-        return;
+    // If the from_instance is created by rollback, the snapshot may be created in its predecessor
+    // instances. For READ_ONLY and WRITABLE clone, set its source instance to the real instance
+    // which creates this snapshot.
+    if (request.clone_type() != CloneInstanceRequest::ROLLBACK &&
+        snapshot_pb.instance_id() != request.from_instance_id()) {
+        from_instance_id = snapshot_pb.instance_id();
+        LOG_INFO("clone instance change from_instance_id")
+                .tag("request from_instance_id", request.from_instance_id())
+                .tag("snapshot instance_id", snapshot_pb.instance_id())
+                .tag("snapshot_id", request.from_snapshot_id());
     }
 
     // 4. Validate source instance
     InstanceInfoPB from_instance_info;
-    err = validate_source_instance(txn.get(), request.from_instance_id(),
-                                   request.from_snapshot_id(), request.clone_type(),
-                                   &from_instance_info, &error_msg);
+    err = validate_source_instance(txn.get(), from_instance_id, request.from_snapshot_id(),
+                                   request.clone_type(), &from_instance_info, &error_msg);
     if (err != TxnErrorCode::TXN_OK) {
         if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
             status->set_code(MetaServiceCode::CLUSTER_NOT_FOUND);
@@ -1872,6 +1820,19 @@ void SnapshotManager::clone_instance(const CloneInstanceRequest& request,
         }
         status->set_msg(error_msg);
         return;
+    }
+    // Type-specific validation
+    if (request.clone_type() == CloneInstanceRequest::ROLLBACK) {
+        // Validate source instance does not already have a successor instance
+        if (from_instance_info.has_successor_instance_id() &&
+            !from_instance_info.successor_instance_id().empty()) {
+            status->set_code(MetaServiceCode::INVALID_ARGUMENT);
+            status->set_msg(fmt::format(
+                    "source instance already has a successor instance: {}, ROLLBACK only one "
+                    "successor is allowed",
+                    from_instance_info.successor_instance_id()));
+            return;
+        }
     }
 
     // 5. Handle clone by type
@@ -1885,8 +1846,8 @@ void SnapshotManager::clone_instance(const CloneInstanceRequest& request,
                                      &error_msg);
         break;
     case CloneInstanceRequest::ROLLBACK:
-        code = handle_rollback_clone(txn.get(), request, snapshot_pb, from_instance_info,
-                                     snapshot_versionstamp, response, &error_msg);
+        code = handle_rollback_clone(txn.get(), request, snapshot_pb, from_instance_info, response,
+                                     &error_msg);
         break;
     default:
         code = MetaServiceCode::INVALID_ARGUMENT;
@@ -1900,7 +1861,7 @@ void SnapshotManager::clone_instance(const CloneInstanceRequest& request,
     }
 
     // 6. Establish snapshot reference relationship
-    establish_snapshot_reference(txn.get(), request.from_instance_id(), snapshot_versionstamp,
+    establish_snapshot_reference(txn.get(), snapshot_pb.instance_id(), snapshot_versionstamp,
                                  request.new_instance_id());
 
     // 7. Commit transaction
@@ -1923,14 +1884,15 @@ void SnapshotManager::clone_instance(const CloneInstanceRequest& request,
     // 8. Notify instance refresh
     notify_refresh_instance(txn_kv_, request.new_instance_id(), nullptr, /*include_self=*/true);
     if (request.clone_type() == CloneInstanceRequest::ROLLBACK) {
-        notify_refresh_instance(txn_kv_, request.from_instance_id(), nullptr,
+        notify_refresh_instance(txn_kv_, from_instance_id, nullptr,
                                 /*include_self=*/true);
     }
 
     // Log operation completion
     LOG_INFO("clone_instance operation completed successfully")
             .tag("operation_type", CloneInstanceRequest::CloneType_Name(request.clone_type()))
-            .tag("from_instance_id", request.from_instance_id())
+            .tag("request_from_instance_id", request.from_instance_id())
+            .tag("from_instance_id", from_instance_id)
             .tag("from_snapshot_id", request.from_snapshot_id())
             .tag("new_instance_id", request.new_instance_id())
             .tag("request_ip", request.has_request_ip() ? request.request_ip() : "")

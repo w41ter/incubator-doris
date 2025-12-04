@@ -73,10 +73,11 @@ private:
     doris::cloud::MetaServiceCode validate_writable_clone_request(
             const doris::cloud::CloneInstanceRequest& request, std::string* error_msg);
 
-    doris::cloud::TxnErrorCode validate_source_snapshot(
-            doris::cloud::Transaction* txn, const std::string& from_instance_id,
-            const doris::cloud::Versionstamp& snapshot_versionstamp,
-            doris::cloud::SnapshotPB* snapshot_pb, std::string* error_msg);
+    void validate_source_snapshot(doris::cloud::Transaction* txn,
+                                  const std::string& from_instance_id,
+                                  const std::string& from_snapshot_id,
+                                  doris::cloud::SnapshotPB* snapshot_pb,
+                                  doris::cloud::MetaServiceCode& code, std::string& error_msg);
 
     doris::cloud::TxnErrorCode validate_source_instance(
             doris::cloud::Transaction* txn, const std::string& from_instance_id,
@@ -101,7 +102,6 @@ private:
             doris::cloud::Transaction* txn, const doris::cloud::CloneInstanceRequest& request,
             const doris::cloud::SnapshotPB& snapshot_pb,
             const doris::cloud::InstanceInfoPB& from_instance_info,
-            const doris::cloud::Versionstamp& snapshot_versionstamp,
             doris::cloud::CloneInstanceResponse* response, std::string* error_msg);
 
     // Helper functions

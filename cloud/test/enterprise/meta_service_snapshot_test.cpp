@@ -123,6 +123,470 @@ int get_snapshot(std::unique_ptr<MetaServiceProxy>& meta_service, std::string& s
     return 0;
 }
 
+constexpr int DATA_DISK_SIZE_CONST = 100;
+constexpr int INDEX_DISK_SIZE_CONST = 10;
+constexpr int DISK_SIZE_CONST = 110;
+constexpr std::string_view RESOURCE_ID = "1";
+
+// Create a instance and refresh the resource manager.
+// This instance is MULTI_VERSION_ENABLED by default.
+void create_and_refresh_instance(MetaServiceProxy* service, std::string instance_id) {
+    InstanceInfoPB instance_info;
+    instance_info.set_instance_id(instance_id);
+    instance_info.mutable_resource_ids()->Add(std::string(RESOURCE_ID));
+    instance_info.set_multi_version_status(MultiVersionStatus::MULTI_VERSION_READ_WRITE);
+    instance_info.set_snapshot_switch_status(SnapshotSwitchStatus::SNAPSHOT_SWITCH_ON);
+    auto* obj_info = instance_info.mutable_obj_info()->Add();
+    obj_info->set_id(std::string(RESOURCE_ID));
+    obj_info->set_ak("mock_ak");
+    obj_info->set_sk("mock_sk");
+    obj_info->set_endpoint(config::test_s3_endpoint);
+    obj_info->set_region(config::test_s3_region);
+    obj_info->set_bucket(config::test_s3_bucket);
+    obj_info->set_prefix("");
+
+    std::unique_ptr<Transaction> txn;
+    ASSERT_EQ(service->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+    txn->put(instance_key(instance_id), instance_info.SerializeAsString());
+    ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+
+    service->resource_mgr()->refresh_instance(instance_id);
+    ASSERT_TRUE(service->resource_mgr()->is_version_write_enabled(instance_id));
+}
+
+void prepare_and_commit_index(MetaServiceProxy* service, const std::string& cloud_unique_id,
+                              int64_t db_id, int64_t table_id, int64_t index_id) {
+    IndexRequest request;
+    request.set_cloud_unique_id(cloud_unique_id);
+    request.set_db_id(db_id);
+    request.set_table_id(table_id);
+    request.add_index_ids(index_id);
+
+    IndexResponse response;
+    brpc::Controller cntl;
+    service->prepare_index(&cntl, &request, &response, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(response.status().code(), MetaServiceCode::OK) << response.ShortDebugString();
+
+    // Commit index
+    service->commit_index(&cntl, &request, &response, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(response.status().code(), MetaServiceCode::OK) << response.ShortDebugString();
+}
+
+void prepare_and_commit_partition(MetaServiceProxy* service, const std::string& cloud_unique_id,
+                                  int64_t db_id, int64_t table_id, int64_t partition_id,
+                                  int64_t index_id) {
+    PartitionRequest request;
+    request.set_cloud_unique_id(cloud_unique_id);
+    request.set_db_id(db_id);
+    request.set_table_id(table_id);
+    request.add_partition_ids(partition_id);
+    request.add_index_ids(index_id);
+
+    PartitionResponse response;
+    brpc::Controller cntl;
+    service->prepare_partition(&cntl, &request, &response, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(response.status().code(), MetaServiceCode::OK) << response.ShortDebugString();
+
+    // Commit partition
+    service->commit_partition(&cntl, &request, &response, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(response.status().code(), MetaServiceCode::OK) << response.ShortDebugString();
+}
+
+std::string next_rowset_id() {
+    static int cnt = 0;
+    return std::to_string(++cnt);
+}
+
+void add_tablet(CreateTabletsRequest& req, int64_t table_id, int64_t index_id, int64_t partition_id,
+                int64_t tablet_id, bool mow = false,
+                TabletStatePB state = TabletStatePB::PB_RUNNING) {
+    auto tablet = req.add_tablet_metas();
+    tablet->set_table_id(table_id);
+    tablet->set_index_id(index_id);
+    tablet->set_partition_id(partition_id);
+    tablet->set_tablet_id(tablet_id);
+    tablet->set_tablet_state(state);
+    if (mow) {
+        tablet->set_enable_unique_key_merge_on_write(true);
+    }
+    auto schema = tablet->mutable_schema();
+    schema->set_schema_version(0);
+    auto first_rowset = tablet->add_rs_metas();
+    first_rowset->set_rowset_id(0); // required
+    first_rowset->set_rowset_id_v2(next_rowset_id());
+    first_rowset->set_start_version(0);
+    first_rowset->set_end_version(1);
+    first_rowset->mutable_tablet_schema()->CopyFrom(*schema);
+}
+
+void create_tablet(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
+                   int64_t db_id, int64_t table_id, int64_t index_id, int64_t partition_id,
+                   int64_t tablet_id, bool mow = false,
+                   TabletStatePB state = TabletStatePB::PB_RUNNING) {
+    brpc::Controller cntl;
+    CreateTabletsRequest req;
+    CreateTabletsResponse res;
+    req.set_db_id(db_id);
+    req.set_cloud_unique_id(cloud_unique_id);
+    add_tablet(req, table_id, index_id, partition_id, tablet_id, mow, state);
+    meta_service->create_tablets(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << tablet_id;
+}
+
+void begin_txn(MetaServiceProxy* meta_service, const std::string& cloud_unique_id, int64_t db_id,
+               const std::string& label, int64_t table_id, int64_t& txn_id) {
+    brpc::Controller cntl;
+    BeginTxnRequest req;
+    BeginTxnResponse res;
+    req.set_cloud_unique_id(cloud_unique_id);
+    auto txn_info = req.mutable_txn_info();
+    txn_info->set_db_id(db_id);
+    txn_info->set_label(label);
+    txn_info->add_table_ids(table_id);
+    txn_info->set_timeout_ms(36000);
+    meta_service->begin_txn(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << label;
+    ASSERT_TRUE(res.has_txn_id()) << label;
+    txn_id = res.txn_id();
+}
+
+void commit_txn(MetaServiceProxy* meta_service, const std::string& cloud_unique_id, int64_t db_id,
+                int64_t txn_id, const std::string& label) {
+    brpc::Controller cntl;
+    CommitTxnRequest req;
+    CommitTxnResponse res;
+    req.set_cloud_unique_id(cloud_unique_id);
+    req.set_db_id(db_id);
+    req.set_txn_id(txn_id);
+    meta_service->commit_txn(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << label;
+}
+
+doris::RowsetMetaCloudPB create_rowset(int64_t txn_id, int64_t tablet_id, int partition_id = 10,
+                                       int64_t version = -1, int num_rows = 100) {
+    doris::RowsetMetaCloudPB rowset;
+    rowset.set_rowset_id(0); // required
+    rowset.set_rowset_id_v2(next_rowset_id());
+    rowset.set_tablet_id(tablet_id);
+    rowset.set_partition_id(partition_id);
+    rowset.set_txn_id(txn_id);
+    if (version > 0) {
+        rowset.set_start_version(version);
+        rowset.set_end_version(version);
+    }
+    rowset.set_resource_id(std::string(RESOURCE_ID));
+    rowset.set_num_segments(1);
+    rowset.set_num_rows(num_rows);
+    rowset.set_data_disk_size(num_rows * DATA_DISK_SIZE_CONST);
+    rowset.set_index_disk_size(num_rows * INDEX_DISK_SIZE_CONST);
+    rowset.set_total_disk_size(num_rows * DISK_SIZE_CONST);
+    rowset.mutable_tablet_schema()->set_schema_version(0);
+    rowset.set_txn_expiration(::time(nullptr)); // Required by DCHECK
+    auto* key_bounds = rowset.add_segments_key_bounds();
+    key_bounds->set_min_key("a");
+    key_bounds->set_max_key("z");
+    return rowset;
+}
+
+void prepare_rowset(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
+                    const doris::RowsetMetaCloudPB& rowset) {
+    brpc::Controller cntl;
+    CreateRowsetRequest req;
+    CreateRowsetResponse resp;
+    req.set_cloud_unique_id(cloud_unique_id);
+    req.mutable_rowset_meta()->CopyFrom(rowset);
+    meta_service->prepare_rowset(&cntl, &req, &resp, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(resp.status().code(), MetaServiceCode::OK) << rowset.ShortDebugString();
+}
+
+void commit_rowset(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
+                   const doris::RowsetMetaCloudPB& rowset) {
+    brpc::Controller cntl;
+    CreateRowsetRequest req;
+    CreateRowsetResponse resp;
+    req.set_cloud_unique_id(cloud_unique_id);
+    req.mutable_rowset_meta()->CopyFrom(rowset);
+    meta_service->commit_rowset(&cntl, &req, &resp, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(resp.status().code(), MetaServiceCode::OK) << rowset.ShortDebugString();
+}
+
+void insert_rowset(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
+                   int64_t db_id, const std::string& label, int64_t table_id, int64_t partition_id,
+                   int64_t tablet_id, std::string* rowset_id = nullptr) {
+    int64_t txn_id = 0;
+    ASSERT_NO_FATAL_FAILURE(
+            begin_txn(meta_service, cloud_unique_id, db_id, label, table_id, txn_id));
+    auto rowset = create_rowset(txn_id, tablet_id, partition_id);
+    if (rowset_id) {
+        *rowset_id = rowset.rowset_id_v2();
+    }
+    ASSERT_NO_FATAL_FAILURE(prepare_rowset(meta_service, cloud_unique_id, rowset));
+    ASSERT_NO_FATAL_FAILURE(commit_rowset(meta_service, cloud_unique_id, rowset));
+    ASSERT_NO_FATAL_FAILURE(commit_txn(meta_service, cloud_unique_id, db_id, txn_id, label));
+}
+
+void get_tablet_stats(MetaService* meta_service, const std::string& cloud_unique_id,
+                      int64_t tablet_id, TabletStatsPB& stats) {
+    brpc::Controller cntl;
+    GetTabletStatsRequest req;
+    GetTabletStatsResponse res;
+    req.set_cloud_unique_id(cloud_unique_id);
+    auto idx = req.add_tablet_idx();
+    idx->set_tablet_id(tablet_id);
+    meta_service->get_tablet_stats(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(res.status().code(), MetaServiceCode::OK)
+            << tablet_id << ", Response: " << res.ShortDebugString();
+    stats = res.tablet_stats(0);
+}
+
+struct SnapshotContext {
+    std::string snapshot_id;
+    std::string image_url;
+    std::string label;
+    ObjectStoreInfoPB store_info;
+    int derived_instance_size;
+};
+
+void begin_snapshot(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
+                    const std::string& snapshot_label, SnapshotContext* ctx,
+                    bool auto_snapshot = true) {
+    BeginSnapshotRequest req;
+    req.set_cloud_unique_id(cloud_unique_id);
+    req.set_auto_snapshot(auto_snapshot);
+    req.set_timeout_seconds(12);
+    req.set_ttl_seconds(3600);
+    req.set_request_ip("127.0.0.1");
+    req.set_snapshot_label(snapshot_label);
+
+    brpc::Controller cnt;
+    BeginSnapshotResponse resp;
+    meta_service->begin_snapshot(&cnt, &req, &resp, brpc::DoNothing());
+
+    ASSERT_FALSE(cnt.Failed()) << cnt.ErrorText();
+    ASSERT_EQ(resp.status().code(), MetaServiceCode::OK) << resp.ShortDebugString();
+
+    ctx->snapshot_id = resp.snapshot_id();
+    ctx->image_url = resp.image_url();
+    ctx->store_info = resp.obj_info();
+    ctx->label = snapshot_label;
+}
+
+void commit_snapshot(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
+                     const std::string& snapshot_id, const std::string& image_url,
+                     int64_t last_journal_id) {
+    CommitSnapshotRequest req;
+    req.set_cloud_unique_id(cloud_unique_id);
+    req.set_snapshot_id(snapshot_id);
+    req.set_image_url(image_url);
+    req.set_last_journal_id(last_journal_id);
+    req.set_request_ip("127.0.0.1");
+
+    brpc::Controller cntl;
+    CommitSnapshotResponse res;
+    meta_service->commit_snapshot(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
+}
+
+void list_snapshot(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
+                   std::vector<SnapshotContext>* snapshots,
+                   const std::string& required_snapshot_id = "", int expected_num = -1,
+                   bool include_aborted = false) {
+    ListSnapshotRequest req;
+    req.set_cloud_unique_id(cloud_unique_id);
+    if (!required_snapshot_id.empty()) {
+        req.set_required_snapshot_id(required_snapshot_id);
+    }
+    if (include_aborted) {
+        req.set_include_aborted(include_aborted);
+    }
+
+    brpc::Controller cntl;
+    ListSnapshotResponse res;
+    meta_service->list_snapshot(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
+    if (expected_num >= 0) {
+        ASSERT_EQ(expected_num, res.snapshots().size())
+                << ", cloud_unique_id=" << cloud_unique_id
+                << ", required_snapshot_id=" << required_snapshot_id
+                << ", include_aborted=" << include_aborted;
+    }
+    if (!snapshots) {
+        return;
+    }
+    snapshots->clear();
+    for (auto snapshot : res.snapshots()) {
+        SnapshotContext ctx;
+        ctx.snapshot_id = snapshot.snapshot_id();
+        ctx.image_url = snapshot.image_url();
+        ctx.label = snapshot.snapshot_label();
+        ctx.derived_instance_size = snapshot.derived_instance_ids_size();
+        snapshots->emplace_back(ctx);
+    }
+}
+
+void list_snapshot(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
+                   const std::string& required_snapshot_id, int expected_num,
+                   bool include_aborted = false) {
+    list_snapshot(meta_service, cloud_unique_id, nullptr, required_snapshot_id, expected_num,
+                  include_aborted);
+}
+
+void drop_snapshot(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
+                   const std::string& snapshot_id) {
+    brpc::Controller cntl;
+    DropSnapshotRequest req;
+    req.set_cloud_unique_id(cloud_unique_id);
+    req.set_snapshot_id(snapshot_id);
+    DropSnapshotResponse res;
+    meta_service->drop_snapshot(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+}
+
+void clone_instance(
+        MetaServiceProxy* meta_service, const std::string& from_instance_id,
+        const std::string& snapshot_id, const std::string& clone_instance_id,
+        CloneInstanceRequest::CloneType clone_type = CloneInstanceRequest_CloneType_READ_ONLY) {
+    CloneInstanceRequest req;
+    req.set_clone_type(clone_type);
+    if (clone_type == CloneInstanceRequest_CloneType_WRITABLE) {
+        auto* obj_info = req.mutable_obj_info();
+        obj_info->set_id("2");
+        obj_info->set_ak("mock_ak");
+        obj_info->set_sk("mock_sk");
+        obj_info->set_endpoint("e");
+        obj_info->set_region("r");
+        obj_info->set_bucket("b");
+        obj_info->set_prefix("");
+    }
+    req.set_from_instance_id(from_instance_id);
+    req.set_from_snapshot_id(snapshot_id);
+    req.set_new_instance_id(clone_instance_id);
+
+    brpc::Controller cntl;
+    CloneInstanceResponse res;
+    meta_service->clone_instance(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
+}
+
+void get_rowsets(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
+                 int64_t tablet_id, int64_t start_version, int64_t end_version,
+                 std::vector<doris::RowsetMetaCloudPB>& rowsets) {
+    TabletStatsPB stats;
+    ASSERT_NO_FATAL_FAILURE(get_tablet_stats(meta_service, cloud_unique_id, tablet_id, stats));
+
+    brpc::Controller cntl;
+    GetRowsetRequest req;
+    GetRowsetResponse res;
+    req.set_cloud_unique_id(cloud_unique_id);
+    req.set_base_compaction_cnt(stats.base_compaction_cnt());
+    req.set_cumulative_compaction_cnt(stats.cumulative_compaction_cnt());
+    if (stats.has_full_compaction_cnt()) {
+        req.set_full_compaction_cnt(stats.full_compaction_cnt());
+    }
+    req.set_cumulative_point(stats.cumulative_point());
+    req.set_start_version(start_version);
+    req.set_end_version(end_version);
+    req.mutable_idx()->set_tablet_id(tablet_id);
+    meta_service->get_rowset(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
+    for (int i = 0; i < res.rowset_meta_size(); i++) {
+        rowsets.push_back(res.rowset_meta(i));
+    }
+}
+
+void update_snapshot_properties(MetaServiceProxy* meta_service, const std::string& instance_id,
+                                bool enable_snapshot, int64_t max_reserved_snapshots,
+                                int64_t snapshot_interval_seconds) {
+    AlterInstanceRequest req;
+    req.set_instance_id(instance_id);
+    req.set_op(AlterInstanceRequest::SET_SNAPSHOT_PROPERTY);
+    std::string status = enable_snapshot ? "true" : "false";
+    req.mutable_properties()->insert(
+            {AlterInstanceRequest_SnapshotProperty_Name(
+                     AlterInstanceRequest_SnapshotProperty::
+                             AlterInstanceRequest_SnapshotProperty_ENABLE_SNAPSHOT),
+             status});
+    req.mutable_properties()->insert(
+            {AlterInstanceRequest_SnapshotProperty_Name(
+                     AlterInstanceRequest_SnapshotProperty::
+                             AlterInstanceRequest_SnapshotProperty_SNAPSHOT_INTERVAL_SECONDS),
+             std::to_string(snapshot_interval_seconds)});
+    req.mutable_properties()->insert(
+            {AlterInstanceRequest_SnapshotProperty_Name(
+                     AlterInstanceRequest_SnapshotProperty::
+                             AlterInstanceRequest_SnapshotProperty_MAX_RESERVED_SNAPSHOTS),
+             std::to_string(max_reserved_snapshots)});
+    req.set_request_ip("127.0.0.1");
+
+    brpc::Controller cntl;
+    AlterInstanceResponse res;
+    meta_service->alter_instance(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
+}
+
+void get_instance(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
+                  InstanceInfoPB& instance_info) {
+    brpc::Controller cntl;
+    GetInstanceRequest req;
+    GetInstanceResponse res;
+    req.set_cloud_unique_id(cloud_unique_id);
+    meta_service->get_instance(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
+    ASSERT_TRUE(res.has_instance()) << res.ShortDebugString();
+    instance_info.CopyFrom(res.instance());
+}
+
+void clone_and_refresh_instance(
+        MetaServiceProxy* meta_service, ResourceManager* resource_manager,
+        const std::string& from_instance_id, const std::string& from_snapshot_id,
+        const std::string& to_instance_id, InstanceInfoPB& to_instance,
+        CloneInstanceRequest::CloneType clone_type = CloneInstanceRequest_CloneType_READ_ONLY) {
+    clone_instance(meta_service, from_instance_id, from_snapshot_id, to_instance_id, clone_type);
+    update_snapshot_properties(meta_service, to_instance_id, true, 0, 3660);
+    std::string cloud_unique_id = fmt::format("1:{}:0", to_instance_id);
+    get_instance(meta_service, cloud_unique_id, to_instance);
+    resource_manager->refresh_instance(to_instance_id, to_instance);
+}
+
+void begin_and_commit_snapshot(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
+                               SnapshotContext& ctx, const std::string& snapshot_label = "") {
+    begin_snapshot(meta_service, cloud_unique_id,
+                   snapshot_label.empty() ? "test_label" : snapshot_label, &ctx, false);
+    commit_snapshot(meta_service, cloud_unique_id, ctx.snapshot_id, ctx.image_url, 1000);
+}
+
+void begin_and_abort_snapshot(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
+                              SnapshotContext& ctx, const std::string& snapshot_label = "") {
+    begin_snapshot(meta_service, cloud_unique_id,
+                   snapshot_label.empty() ? "test_label" : snapshot_label, &ctx, false);
+    // Abort the snapshot
+    brpc::Controller cntl;
+    AbortSnapshotRequest req;
+    req.set_cloud_unique_id(cloud_unique_id);
+    req.set_snapshot_id(ctx.snapshot_id);
+    req.set_reason("Test abort snapshot");
+    AbortSnapshotResponse res;
+    meta_service->abort_snapshot(&cntl, &req, &res, nullptr);
+    ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+}
+
 TEST(MetaServiceSnapshotTest, BeginSnapshotTest) {
     auto meta_service = get_meta_service(true);
     const char* const cloud_unique_id = "test_cloud_unique_id";
@@ -2081,6 +2545,7 @@ TEST(MetaServiceSnapshotTest, CloneInstanceReadOnlyTest) {
         CloneInstanceResponse res;
         meta_service->clone_instance(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
                                      &req, &res, nullptr);
+        std::cout << "clone: " << res.DebugString() << std::endl;
         ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
     }
 
@@ -3042,6 +3507,254 @@ TEST(MetaServiceHttpTest, DropInstanceTest) {
         meta_service->alter_instance(&cntl, &req, &res, nullptr);
         ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
         ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
+    }
+}
+
+TEST(MetaServiceHttpTest, RollbackListSnapshotTest) {
+    auto meta_service = get_meta_service(false);
+    auto resource_mgr = meta_service->resource_mgr();
+
+    // Step1: create instance1
+    std::string instance_id1 = "rollback_list_snapshot_test_instance1";
+    std::string cloud_unique_id1 = fmt::format("1:{}:0", instance_id1);
+    create_and_refresh_instance(meta_service.get(), instance_id1);
+    InstanceInfoPB instance_info1;
+    get_instance(meta_service.get(), cloud_unique_id1, instance_info1);
+
+    // create partition/index/tablet
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id1, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id1, db_id, table_id,
+                                 partition_id, index_id);
+    create_tablet(meta_service.get(), cloud_unique_id1, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+
+    // insert 5 rowsets (version 2-6); create snapshot_1_1 for instance1
+    for (int i = 2; i <= 6; i++) {
+        insert_rowset(meta_service.get(), cloud_unique_id1, db_id, fmt::format("label_{}", i),
+                      table_id, partition_id, tablet_id, nullptr);
+    }
+    SnapshotContext snapshot_1_1;
+    begin_and_commit_snapshot(meta_service.get(), cloud_unique_id1, snapshot_1_1, "snapshot_1_1");
+
+    // insert 5 rowsets (version 7-11); abort snapshot_1_2 for instance1
+    for (int i = 7; i <= 11; i++) {
+        insert_rowset(meta_service.get(), cloud_unique_id1, db_id, fmt::format("label_{}", i),
+                      table_id, partition_id, tablet_id, nullptr);
+    }
+    SnapshotContext snapshot_1_2;
+    begin_and_abort_snapshot(meta_service.get(), cloud_unique_id1, snapshot_1_2, "snapshot_1_2");
+
+    // insert 2 rowsets (version 12-13); create snapshot_1_3 for instance1
+    for (int i = 12; i <= 13; i++) {
+        insert_rowset(meta_service.get(), cloud_unique_id1, db_id, fmt::format("label_{}", i),
+                      table_id, partition_id, tablet_id, nullptr);
+    }
+    SnapshotContext snapshot_1_3;
+    begin_and_commit_snapshot(meta_service.get(), cloud_unique_id1, snapshot_1_3, "snapshot_1_3");
+
+    // insert 4 rowsets (version 14-17); create snapshot_1_4 for instance1
+    for (int i = 14; i <= 17; i++) {
+        insert_rowset(meta_service.get(), cloud_unique_id1, db_id, fmt::format("label_{}", i),
+                      table_id, partition_id, tablet_id, nullptr);
+    }
+    SnapshotContext snapshot_1_4;
+    begin_and_commit_snapshot(meta_service.get(), cloud_unique_id1, snapshot_1_4, "snapshot_1_4");
+    {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id1, tablet_id, 0, 17, rowsets);
+        ASSERT_EQ(rowsets.size(), 17);
+    }
+
+    // Step2: instance1 rollback to instance2
+    std::string instance_id2 = "rollback_list_snapshot_test_instance2";
+    std::string cloud_unique_id2 = fmt::format("1:{}:0", instance_id2);
+    InstanceInfoPB instance_info2;
+    clone_and_refresh_instance(meta_service.get(), resource_mgr.get(), instance_id1,
+                               snapshot_1_1.snapshot_id, instance_id2, instance_info2,
+                               CloneInstanceRequest_CloneType_ROLLBACK);
+    get_instance(meta_service.get(), cloud_unique_id1, instance_info1);
+    {
+        ASSERT_EQ(instance_info1.successor_instance_id(), instance_id2);
+        ASSERT_EQ(instance_info1.original_instance_id(), "");
+        ASSERT_EQ(instance_info1.source_instance_id(), "");
+
+        ASSERT_EQ(instance_info2.successor_instance_id(), "");
+        ASSERT_EQ(instance_info2.original_instance_id(), instance_id1);
+        ASSERT_EQ(instance_info2.source_instance_id(), instance_id1);
+    }
+    // get rowsets for instance2
+    {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id2, tablet_id, 0, 6, rowsets);
+        ASSERT_EQ(rowsets.size(), 6);
+    }
+
+    // list snapshot
+    for (auto& cloud_unique_id : {cloud_unique_id1, cloud_unique_id2}) {
+        list_snapshot(meta_service.get(), cloud_unique_id, "", 3);
+        list_snapshot(meta_service.get(), cloud_unique_id, "", 4, true);
+        list_snapshot(meta_service.get(), cloud_unique_id, snapshot_1_1.snapshot_id, 1);
+        list_snapshot(meta_service.get(), cloud_unique_id, snapshot_1_2.snapshot_id, 0);
+        list_snapshot(meta_service.get(), cloud_unique_id, snapshot_1_2.snapshot_id, 1, true);
+    }
+
+    // instance2 drop snapshot_1_4
+    drop_snapshot(meta_service.get(), cloud_unique_id2, snapshot_1_4.snapshot_id);
+    for (auto& cloud_unique_id : {cloud_unique_id1, cloud_unique_id2}) {
+        list_snapshot(meta_service.get(), cloud_unique_id, "", 2);
+        list_snapshot(meta_service.get(), cloud_unique_id, "", 3, true);
+    }
+
+    // insert 2 rowsets (version 7-8); create snapshot_2_1 for instance2
+    for (int i = 7; i <= 8; i++) {
+        insert_rowset(meta_service.get(), cloud_unique_id2, db_id, fmt::format("label_{}", i),
+                      table_id, partition_id, tablet_id, nullptr);
+    }
+    SnapshotContext snapshot_2_1;
+    begin_and_commit_snapshot(meta_service.get(), cloud_unique_id2, snapshot_2_1, "snapshot_2_1");
+
+    // insert 3 rowsets (version 9-11); create snapshot_2_2 for instance2
+    for (int i = 9; i <= 11; i++) {
+        insert_rowset(meta_service.get(), cloud_unique_id2, db_id, fmt::format("label_{}", i),
+                      table_id, partition_id, tablet_id, nullptr);
+    }
+    SnapshotContext snapshot_2_2;
+    begin_and_abort_snapshot(meta_service.get(), cloud_unique_id2, snapshot_2_2);
+
+    // get rowsets for instance2
+    {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id2, tablet_id, 0, 11, rowsets);
+        ASSERT_EQ(rowsets.size(), 11);
+    }
+
+    // list snapshot
+    // all
+    list_snapshot(meta_service.get(), cloud_unique_id1, "", 2);
+    list_snapshot(meta_service.get(), cloud_unique_id2, "", 3);
+    list_snapshot(meta_service.get(), cloud_unique_id2, "", 5, true);
+    // normal
+    list_snapshot(meta_service.get(), cloud_unique_id2, snapshot_1_1.snapshot_id, 1);
+    list_snapshot(meta_service.get(), cloud_unique_id2, snapshot_2_1.snapshot_id, 1);
+    // dropped
+    list_snapshot(meta_service.get(), cloud_unique_id2, snapshot_1_4.snapshot_id, 0, true);
+    // aborted
+    list_snapshot(meta_service.get(), cloud_unique_id2, snapshot_1_2.snapshot_id, 0);
+    list_snapshot(meta_service.get(), cloud_unique_id2, snapshot_2_2.snapshot_id, 0);
+    list_snapshot(meta_service.get(), cloud_unique_id2, snapshot_1_2.snapshot_id, 1, true);
+    list_snapshot(meta_service.get(), cloud_unique_id2, snapshot_2_2.snapshot_id, 1, true);
+    // invalid
+    {
+        brpc::Controller cntl;
+        ListSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id2);
+        req.set_required_snapshot_id("test");
+        ListSnapshotResponse res;
+        meta_service->list_snapshot(&cntl, &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+    }
+
+    // Step3: rollback instance2 to instance3: using snapshot_1_3 from instance1
+    std::string instance_id3 = "rollback_list_snapshot_test_instance3";
+    std::string cloud_unique_id3 = fmt::format("1:{}:0", instance_id3);
+    InstanceInfoPB instance_info3;
+    clone_and_refresh_instance(meta_service.get(), resource_mgr.get(), instance_id2,
+                               snapshot_1_3.snapshot_id, instance_id3, instance_info3,
+                               CloneInstanceRequest_CloneType_ROLLBACK);
+    get_instance(meta_service.get(), cloud_unique_id1, instance_info1);
+    get_instance(meta_service.get(), cloud_unique_id2, instance_info2);
+    {
+        ASSERT_EQ(instance_info1.successor_instance_id(), instance_id2);
+        ASSERT_EQ(instance_info1.original_instance_id(), "");
+        ASSERT_EQ(instance_info1.source_instance_id(), "");
+
+        ASSERT_EQ(instance_info2.successor_instance_id(), instance_id3);
+        ASSERT_EQ(instance_info2.original_instance_id(), instance_id1);
+        ASSERT_EQ(instance_info2.source_instance_id(), instance_id1);
+
+        ASSERT_EQ(instance_info3.successor_instance_id(), "");
+        ASSERT_EQ(instance_info3.original_instance_id(), instance_id1);
+        // NOTE:
+        ASSERT_EQ(instance_info3.source_instance_id(), instance_id1);
+    }
+    // get rowsets for instance3
+    {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id3, tablet_id, 0, 13, rowsets);
+        ASSERT_EQ(rowsets.size(), 13);
+    }
+
+    // list snapshot
+    // all
+    std::vector<SnapshotContext> snapshots;
+    list_snapshot(meta_service.get(), cloud_unique_id3, &snapshots, "", 3);
+    list_snapshot(meta_service.get(), cloud_unique_id3, "", 5, true);
+    // normal
+    list_snapshot(meta_service.get(), cloud_unique_id3, snapshot_1_1.snapshot_id, 1);
+    list_snapshot(meta_service.get(), cloud_unique_id3, snapshot_2_1.snapshot_id, 1);
+    // dropped
+    list_snapshot(meta_service.get(), cloud_unique_id3, snapshot_1_4.snapshot_id, 0, true);
+    // aborted
+    list_snapshot(meta_service.get(), cloud_unique_id3, snapshot_1_2.snapshot_id, 0);
+    list_snapshot(meta_service.get(), cloud_unique_id3, snapshot_2_2.snapshot_id, 0);
+    list_snapshot(meta_service.get(), cloud_unique_id3, snapshot_1_2.snapshot_id, 1, true);
+    list_snapshot(meta_service.get(), cloud_unique_id3, snapshot_2_2.snapshot_id, 1, true);
+    // check derived instance size
+    for (auto& snapshot : snapshots) {
+        if (snapshot.snapshot_id == snapshot_1_1.snapshot_id ||
+            snapshot.snapshot_id == snapshot_1_3.snapshot_id) {
+            ASSERT_EQ(1, snapshot.derived_instance_size);
+        } else {
+            ASSERT_EQ(0, snapshot.derived_instance_size) << ", label=" << snapshot.label;
+        }
+    }
+
+    // Step4: clone instance2 to instance4: using snapshot_1_3 from instance1
+    std::string instance_id4 = "snapshot_chain_compactor_test_instance4";
+    std::string cloud_unique_id4 = fmt::format("1:{}:0", instance_id4);
+    InstanceInfoPB instance_info4;
+    clone_and_refresh_instance(meta_service.get(), resource_mgr.get(), instance_id2,
+                               snapshot_1_3.snapshot_id, instance_id4, instance_info4,
+                               CloneInstanceRequest_CloneType_READ_ONLY);
+    get_instance(meta_service.get(), cloud_unique_id2, instance_info2);
+    {
+        ASSERT_EQ(instance_info2.successor_instance_id(), instance_id3);
+        ASSERT_EQ(instance_info2.original_instance_id(), instance_id1);
+        ASSERT_EQ(instance_info2.source_instance_id(), instance_id1);
+
+        ASSERT_EQ(instance_info4.successor_instance_id(), "");
+        ASSERT_EQ(instance_info4.original_instance_id(), "");
+        // NOTE:
+        ASSERT_EQ(instance_info4.source_instance_id(), instance_id1);
+    }
+    {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id4, tablet_id, 0, 13, rowsets);
+        ASSERT_EQ(rowsets.size(), 13);
+    }
+
+    // Step5: clone instance2 to instance5: using snapshot_2_1 from instance2
+    std::string instance_id5 = "snapshot_chain_compactor_test_instance5";
+    std::string cloud_unique_id5 = fmt::format("1:{}:0", instance_id5);
+    InstanceInfoPB instance_info5;
+    clone_and_refresh_instance(meta_service.get(), resource_mgr.get(), instance_id2,
+                               snapshot_2_1.snapshot_id, instance_id5, instance_info5,
+                               CloneInstanceRequest_CloneType_WRITABLE);
+    get_instance(meta_service.get(), cloud_unique_id2, instance_info2);
+    {
+        ASSERT_EQ(instance_info2.successor_instance_id(), instance_id3);
+        ASSERT_EQ(instance_info2.original_instance_id(), instance_id1);
+        ASSERT_EQ(instance_info2.source_instance_id(), instance_id1);
+
+        ASSERT_EQ(instance_info5.successor_instance_id(), "");
+        ASSERT_EQ(instance_info5.original_instance_id(), "");
+        ASSERT_EQ(instance_info5.source_instance_id(), instance_id2);
+    }
+    {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id5, tablet_id, 0, 8, rowsets);
+        ASSERT_EQ(rowsets.size(), 8);
     }
 }
 
