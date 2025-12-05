@@ -551,6 +551,19 @@ TEST(MetaServiceHttpTest, ListSnapshotHttpTest) {
         ASSERT_EQ(resp.status().code(), MetaServiceCode::OK);
         snapshot_id = resp.snapshot_id();
     }
+    {
+        CommitSnapshotRequest req;
+        req.set_cloud_unique_id(fmt::format("1:{}:1", instance_id));
+        req.set_snapshot_id(snapshot_id);
+        req.set_image_url("snapshot/xxxx");
+        req.set_last_journal_id(0);
+        req.set_image_file_size(100);
+        req.set_snapshot_data_size(1000);
+        brpc::Controller ctrl;
+        CommitSnapshotResponse resp;
+        ctx.meta_service()->commit_snapshot(&ctrl, &req, &resp, nullptr);
+        ASSERT_EQ(resp.status().code(), MetaServiceCode::OK);
+    }
 
     // Test list all snapshots
     {
@@ -570,6 +583,8 @@ TEST(MetaServiceHttpTest, ListSnapshotHttpTest) {
         EXPECT_EQ(direct_resp.snapshots_size(), 1);
         EXPECT_EQ(direct_resp.snapshots(0).snapshot_label(), "test_list_snapshot");
         EXPECT_EQ(direct_resp.snapshots(0).snapshot_id(), snapshot_id);
+        EXPECT_EQ(direct_resp.snapshots(0).image_file_size(), 100);
+        EXPECT_EQ(direct_resp.snapshots(0).snapshot_data_size(), 1000);
     }
 
     // Test list specific snapshot by ID
@@ -879,6 +894,8 @@ TEST(MetaServiceHttpTest, SetMultiVersionStatusClonedInstanceTest) {
         req.set_snapshot_id(snapshot_id);
         req.set_image_url("snapshot/xxxx");
         req.set_last_journal_id(0);
+        req.set_image_file_size(100);
+        req.set_snapshot_data_size(1000);
         brpc::Controller ctrl;
         CommitSnapshotResponse resp;
         ctx.meta_service()->commit_snapshot(&ctrl, &req, &resp, nullptr);
@@ -1027,6 +1044,8 @@ TEST(MetaServiceHttpTest, SetMultiVersionStatusDisableWithSnapshotsTest) {
         req.set_snapshot_id(snapshot_id);
         req.set_image_url("snapshot/xxxx");
         req.set_last_journal_id(0);
+        req.set_image_file_size(100);
+        req.set_snapshot_data_size(1000);
         brpc::Controller ctrl;
         CommitSnapshotResponse resp;
         ctx.meta_service()->commit_snapshot(&ctrl, &req, &resp, nullptr);

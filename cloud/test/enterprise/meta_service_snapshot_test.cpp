@@ -390,6 +390,8 @@ void commit_snapshot(MetaServiceProxy* meta_service, const std::string& cloud_un
     req.set_image_url(image_url);
     req.set_last_journal_id(last_journal_id);
     req.set_request_ip("127.0.0.1");
+    req.set_image_file_size(100);
+    req.set_snapshot_data_size(1000);
 
     brpc::Controller cntl;
     CommitSnapshotResponse res;
@@ -1052,6 +1054,8 @@ TEST(MetaServiceSnapshotTest, CommitSnapshotTest) {
         req.set_snapshot_id(snapshot_id);
         req.set_image_url(image_url);
         req.set_last_journal_id(12345);
+        req.set_image_file_size(100);
+        req.set_snapshot_data_size(1000);
         CommitSnapshotResponse res;
         meta_service->commit_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
                                       &req, &res, nullptr);
@@ -1065,6 +1069,8 @@ TEST(MetaServiceSnapshotTest, CommitSnapshotTest) {
         req.set_cloud_unique_id(cloud_unique_id);
         req.set_image_url(image_url);
         req.set_last_journal_id(12345);
+        req.set_image_file_size(100);
+        req.set_snapshot_data_size(1000);
         CommitSnapshotResponse res;
         meta_service->commit_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
                                       &req, &res, nullptr);
@@ -1078,6 +1084,8 @@ TEST(MetaServiceSnapshotTest, CommitSnapshotTest) {
         req.set_cloud_unique_id(cloud_unique_id);
         req.set_snapshot_id(snapshot_id);
         req.set_last_journal_id(12345);
+        req.set_image_file_size(100);
+        req.set_snapshot_data_size(1000);
         CommitSnapshotResponse res;
         meta_service->commit_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
                                       &req, &res, nullptr);
@@ -1091,9 +1099,39 @@ TEST(MetaServiceSnapshotTest, CommitSnapshotTest) {
         req.set_cloud_unique_id(cloud_unique_id);
         req.set_snapshot_id(snapshot_id);
         req.set_image_url(image_url);
+        req.set_image_file_size(100);
+        req.set_snapshot_data_size(1000);
         CommitSnapshotResponse res;
         meta_service->commit_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
                                       &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+    }
+
+    // Test missing image_file_size
+    {
+        brpc::Controller cntl;
+        CommitSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_snapshot_id(snapshot_id);
+        req.set_image_url(image_url);
+        req.set_last_journal_id(12345);
+        req.set_snapshot_data_size(1000);
+        CommitSnapshotResponse res;
+        meta_service->commit_snapshot(&cntl, &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+    }
+
+    // Test missing snapshot_data_size
+    {
+        brpc::Controller cntl;
+        CommitSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_snapshot_id(snapshot_id);
+        req.set_image_url(image_url);
+        req.set_last_journal_id(12345);
+        req.set_image_file_size(100);
+        CommitSnapshotResponse res;
+        meta_service->commit_snapshot(&cntl, &req, &res, nullptr);
         ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
     }
 
@@ -1118,17 +1156,7 @@ TEST(MetaServiceSnapshotTest, CommitSnapshotTest) {
 
     // Test successful commit
     {
-        brpc::Controller cntl;
-        CommitSnapshotRequest req;
-        req.set_cloud_unique_id(cloud_unique_id);
-        req.set_snapshot_id(snapshot_id);
-        req.set_image_url(image_url);
-        req.set_last_journal_id(12345);
-        CommitSnapshotResponse res;
-        meta_service->commit_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
-                                      &req, &res, nullptr);
-        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
-
+        commit_snapshot(meta_service.get(), cloud_unique_id, snapshot_id, image_url, 12345);
         SnapshotPB snapshot_pb;
         ASSERT_EQ(get_snapshot(meta_service, snapshot_id, snapshot_pb), 0);
         ASSERT_EQ(snapshot_pb.upload_file(), "");
@@ -1143,6 +1171,8 @@ TEST(MetaServiceSnapshotTest, CommitSnapshotTest) {
         req.set_snapshot_id("non_existent_snapshot_id_12345");
         req.set_image_url("/snapshot/non_existent/");
         req.set_last_journal_id(12345);
+        req.set_image_file_size(100);
+        req.set_snapshot_data_size(1000);
         CommitSnapshotResponse res;
         meta_service->commit_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
                                       &req, &res, nullptr);
@@ -1163,16 +1193,8 @@ TEST(MetaServiceSnapshotTest, CommitSnapshotTest) {
                                      &begin_req, &begin_res, nullptr);
         ASSERT_EQ(begin_res.status().code(), MetaServiceCode::OK);
 
-        CommitSnapshotRequest commit_req;
-        commit_req.set_cloud_unique_id(cloud_unique_id);
-        commit_req.set_snapshot_id(begin_res.snapshot_id());
-        commit_req.set_image_url(begin_res.image_url());
-        commit_req.set_last_journal_id(67890);
-        commit_req.set_request_ip("192.168.1.100");
-        CommitSnapshotResponse commit_res;
-        meta_service->commit_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
-                                      &commit_req, &commit_res, nullptr);
-        ASSERT_EQ(commit_res.status().code(), MetaServiceCode::OK);
+        commit_snapshot(meta_service.get(), cloud_unique_id, begin_res.snapshot_id(),
+                        begin_res.image_url(), 67890);
     }
 
     // Test commit idempotency - committing the same snapshot multiple times should succeed
@@ -1206,6 +1228,8 @@ TEST(MetaServiceSnapshotTest, CommitSnapshotTest) {
             req.set_snapshot_id(new_snapshot_id);
             req.set_image_url(new_image_url);
             req.set_last_journal_id(54321);
+            req.set_image_file_size(100);
+            req.set_snapshot_data_size(1000);
             meta_service->commit_snapshot(
                     reinterpret_cast<::google::protobuf::RpcController*>(&cntl), &req, &first_res,
                     nullptr);
@@ -1221,6 +1245,8 @@ TEST(MetaServiceSnapshotTest, CommitSnapshotTest) {
             req.set_snapshot_id(new_snapshot_id);
             req.set_image_url(new_image_url);
             req.set_last_journal_id(54321);
+            req.set_image_file_size(100);
+            req.set_snapshot_data_size(1000);
             meta_service->commit_snapshot(
                     reinterpret_cast<::google::protobuf::RpcController*>(&cntl), &req, &second_res,
                     nullptr);
@@ -1236,6 +1262,8 @@ TEST(MetaServiceSnapshotTest, CommitSnapshotTest) {
             req.set_snapshot_id(new_snapshot_id);
             req.set_image_url(new_image_url);
             req.set_last_journal_id(54321);
+            req.set_image_file_size(100);
+            req.set_snapshot_data_size(1000);
             meta_service->commit_snapshot(
                     reinterpret_cast<::google::protobuf::RpcController*>(&cntl), &req, &third_res,
                     nullptr);
@@ -1297,6 +1325,8 @@ TEST(MetaServiceSnapshotTest, CommitSnapshotTest) {
             req.set_snapshot_id(aborted_snapshot_id);
             req.set_image_url(aborted_image_url);
             req.set_last_journal_id(99999);
+            req.set_image_file_size(100);
+            req.set_snapshot_data_size(1000);
             CommitSnapshotResponse res;
             meta_service->commit_snapshot(
                     reinterpret_cast<::google::protobuf::RpcController*>(&cntl), &req, &res,
@@ -1514,19 +1544,8 @@ TEST(MetaServiceSnapshotTest, AbortSnapshotTest) {
         }
 
         // Commit it
-        {
-            brpc::Controller cntl;
-            CommitSnapshotRequest req;
-            req.set_cloud_unique_id(cloud_unique_id);
-            req.set_snapshot_id(committed_snapshot_id);
-            req.set_image_url("s3://bucket/path/image");
-            req.set_last_journal_id(12345);
-            CommitSnapshotResponse res;
-            meta_service->commit_snapshot(
-                    reinterpret_cast<::google::protobuf::RpcController*>(&cntl), &req, &res,
-                    nullptr);
-            ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
-        }
+        commit_snapshot(meta_service.get(), cloud_unique_id, committed_snapshot_id,
+                        "/snapshot/" + committed_snapshot_id + "/", 12345);
 
         // Try to abort it (should fail)
         {
@@ -1696,18 +1715,7 @@ TEST(MetaServiceSnapshotTest, ListSnapshotTest) {
     }
 
     // Commit the first snapshot
-    {
-        brpc::Controller cntl;
-        CommitSnapshotRequest req;
-        req.set_cloud_unique_id(cloud_unique_id);
-        req.set_snapshot_id(snapshot_ids[0]);
-        req.set_image_url(image_urls[0]);
-        req.set_last_journal_id(12345);
-        CommitSnapshotResponse res;
-        meta_service->commit_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
-                                      &req, &res, nullptr);
-        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
-    }
+    commit_snapshot(meta_service.get(), cloud_unique_id, snapshot_ids[0], image_urls[0], 12345);
 
     // Abort the second snapshot
     {
@@ -1744,6 +1752,8 @@ TEST(MetaServiceSnapshotTest, ListSnapshotTest) {
                 ASSERT_EQ(snapshot.snapshot_label(), "first_snapshot");
                 ASSERT_EQ(snapshot.journal_id(), 12345);
                 ASSERT_TRUE(snapshot.has_image_url());
+                ASSERT_EQ(snapshot.image_file_size(), 100);
+                ASSERT_EQ(snapshot.snapshot_data_size(), 1000);
             } else if (snapshot.snapshot_id() == snapshot_ids[1]) {
                 found_aborted = true; // This should NOT happen in default behavior
             } else if (snapshot.snapshot_id() == snapshot_ids[2]) {
@@ -2032,15 +2042,8 @@ TEST(MetaServiceSnapshotTest, DropSnapshotTest) {
         committed_snapshot_id = res.snapshot_id();
 
         // Commit it
-        CommitSnapshotRequest commit_req;
-        commit_req.set_cloud_unique_id(cloud_unique_id);
-        commit_req.set_snapshot_id(committed_snapshot_id);
-        commit_req.set_image_url(res.image_url());
-        commit_req.set_last_journal_id(12345);
-        CommitSnapshotResponse commit_res;
-        meta_service->commit_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
-                                      &commit_req, &commit_res, nullptr);
-        ASSERT_EQ(commit_res.status().code(), MetaServiceCode::OK);
+        commit_snapshot(meta_service.get(), cloud_unique_id, committed_snapshot_id, res.image_url(),
+                        12345);
     }
 
     // Create and abort a snapshot
@@ -2180,15 +2183,8 @@ TEST(MetaServiceSnapshotTest, DropSnapshotTest) {
         referenced_snapshot_id = res.snapshot_id();
 
         // Commit it
-        CommitSnapshotRequest commit_req;
-        commit_req.set_cloud_unique_id(cloud_unique_id);
-        commit_req.set_snapshot_id(referenced_snapshot_id);
-        commit_req.set_image_url(res.image_url());
-        commit_req.set_last_journal_id(12345);
-        CommitSnapshotResponse commit_res;
-        meta_service->commit_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
-                                      &commit_req, &commit_res, nullptr);
-        ASSERT_EQ(commit_res.status().code(), MetaServiceCode::OK);
+        commit_snapshot(meta_service.get(), cloud_unique_id, referenced_snapshot_id,
+                        res.image_url(), 12345);
     }
     // Clone it
     {
@@ -2459,18 +2455,8 @@ TEST(MetaServiceSnapshotTest, CloneInstanceReadOnlyTest) {
         snapshot_id = res.snapshot_id();
 
         // Commit the snapshot
-        CommitSnapshotRequest commit_req;
-        commit_req.set_cloud_unique_id(cloud_unique_id);
-        commit_req.set_snapshot_id(snapshot_id);
         image_url = "/snapshot/" + snapshot_id + "/";
-        commit_req.set_image_url(image_url);
-        commit_req.set_last_journal_id(100);
-        CommitSnapshotResponse commit_res;
-        brpc::Controller commit_cntl;
-        meta_service->commit_snapshot(
-                reinterpret_cast<::google::protobuf::RpcController*>(&commit_cntl), &commit_req,
-                &commit_res, nullptr);
-        ASSERT_EQ(commit_res.status().code(), MetaServiceCode::OK);
+        commit_snapshot(meta_service.get(), cloud_unique_id, snapshot_id, image_url, 100);
     }
 
     // Test missing clone_type
@@ -2668,17 +2654,8 @@ TEST(MetaServiceSnapshotTest, CloneInstanceReadOnlyTest) {
         std::string snapshot_id2 = res.snapshot_id();
 
         // Commit the second snapshot
-        CommitSnapshotRequest commit_req;
-        commit_req.set_cloud_unique_id(cloud_unique_id);
-        commit_req.set_snapshot_id(snapshot_id2);
-        commit_req.set_image_url("/snapshot/" + snapshot_id2 + "/");
-        commit_req.set_last_journal_id(200);
-        CommitSnapshotResponse commit_res;
-        brpc::Controller commit_cntl;
-        meta_service->commit_snapshot(
-                reinterpret_cast<::google::protobuf::RpcController*>(&commit_cntl), &commit_req,
-                &commit_res, nullptr);
-        ASSERT_EQ(commit_res.status().code(), MetaServiceCode::OK);
+        commit_snapshot(meta_service.get(), cloud_unique_id, snapshot_id2,
+                        "/snapshot/" + snapshot_id2 + "/", 200);
 
         // Try to clone with different snapshot to existing instance
         brpc::Controller clone_cntl;
@@ -2778,15 +2755,8 @@ TEST(MetaServiceSnapshotTest, CloneInstanceWritableTest) {
         snapshot_id = res.snapshot_id();
 
         // Commit the snapshot
-        CommitSnapshotRequest commit_req;
-        commit_req.set_cloud_unique_id(cloud_unique_id);
-        commit_req.set_snapshot_id(snapshot_id);
-        commit_req.set_image_url("/snapshot/" + snapshot_id + "/");
-        commit_req.set_last_journal_id(200);
-        CommitSnapshotResponse commit_res;
-        meta_service->commit_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
-                                      &commit_req, &commit_res, nullptr);
-        ASSERT_EQ(commit_res.status().code(), MetaServiceCode::OK);
+        commit_snapshot(meta_service.get(), cloud_unique_id, snapshot_id,
+                        "/snapshot/" + snapshot_id + "/", 200);
     }
 
     // Test WRITABLE clone
@@ -2917,15 +2887,8 @@ TEST(MetaServiceSnapshotTest, CloneInstanceRollbackTest) {
         snapshot_id = res.snapshot_id();
 
         // Commit the snapshot
-        CommitSnapshotRequest commit_req;
-        commit_req.set_cloud_unique_id(cloud_unique_id);
-        commit_req.set_snapshot_id(snapshot_id);
-        commit_req.set_image_url("/snapshot/" + snapshot_id + "/");
-        commit_req.set_last_journal_id(300);
-        CommitSnapshotResponse commit_res;
-        meta_service->commit_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
-                                      &commit_req, &commit_res, nullptr);
-        ASSERT_EQ(commit_res.status().code(), MetaServiceCode::OK);
+        commit_snapshot(meta_service.get(), cloud_unique_id, snapshot_id,
+                        "/snapshot/" + snapshot_id + "/", 300);
     }
 
     // Test ROLLBACK clone
@@ -3264,15 +3227,8 @@ TEST(MetaServiceSnapshotTest, CloneInstanceExistingTargetTest) {
         snapshot_id = res.snapshot_id();
 
         // Commit the snapshot
-        CommitSnapshotRequest commit_req;
-        commit_req.set_cloud_unique_id(cloud_unique_id);
-        commit_req.set_snapshot_id(snapshot_id);
-        commit_req.set_image_url("/snapshot/" + snapshot_id + "/");
-        commit_req.set_last_journal_id(400);
-        CommitSnapshotResponse commit_res;
-        meta_service->commit_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
-                                      &commit_req, &commit_res, nullptr);
-        ASSERT_EQ(commit_res.status().code(), MetaServiceCode::OK);
+        commit_snapshot(meta_service.get(), cloud_unique_id, snapshot_id,
+                        "/snapshot/" + snapshot_id + "/", 400);
     }
 
     // Test clone to existing target instance (should fail)
@@ -3457,20 +3413,7 @@ TEST(MetaServiceHttpTest, DropInstanceTest) {
     }
 
     // Commit snapshot
-    {
-        CommitSnapshotRequest req;
-        req.set_cloud_unique_id(cloud_unique_id);
-        req.set_snapshot_id(snapshot_id);
-        req.set_image_url("/test/snapshot/url");
-        req.set_last_journal_id(100);
-        req.set_request_ip("127.0.0.1");
-
-        brpc::Controller cntl;
-        CommitSnapshotResponse res;
-        meta_service->commit_snapshot(&cntl, &req, &res, nullptr);
-        ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
-        ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
-    }
+    commit_snapshot(meta_service.get(), cloud_unique_id, snapshot_id, "/test/snapshot/url", 100);
 
     // Cannot drop instance because it has snapshots
     {

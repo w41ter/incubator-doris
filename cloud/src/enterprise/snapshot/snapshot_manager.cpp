@@ -489,6 +489,18 @@ void SnapshotManager::commit_snapshot(std::string_view instance_id,
         return;
     }
 
+    if (!request.has_image_file_size()) {
+        status->set_code(MetaServiceCode::INVALID_ARGUMENT);
+        status->set_msg("image_file_size not set");
+        return;
+    }
+
+    if (!request.has_snapshot_data_size()) {
+        status->set_code(MetaServiceCode::INVALID_ARGUMENT);
+        status->set_msg("snapshot_data_size not set");
+        return;
+    }
+
     std::string snapshot_id = request.snapshot_id();
     std::string image_url = request.image_url();
     int64_t last_journal_id = request.last_journal_id();
@@ -561,6 +573,8 @@ void SnapshotManager::commit_snapshot(std::string_view instance_id,
     // the image is already uploaded, so clear upload_file and upload_id
     snapshot_pb.set_upload_file("");
     snapshot_pb.set_upload_id("");
+    snapshot_pb.set_image_file_size(request.image_file_size());
+    snapshot_pb.set_snapshot_data_size(request.snapshot_data_size());
 
     std::string updated_snapshot_val;
     if (!snapshot_pb.SerializeToString(&updated_snapshot_val)) {
@@ -973,6 +987,12 @@ void SnapshotManager::list_snapshot(std::string_view instance_id,
         }
         if (snapshot_pb.has_reason()) {
             snapshot_info.set_reason(snapshot_pb.reason());
+        }
+        if (snapshot_pb.has_image_file_size()) {
+            snapshot_info.set_image_file_size(snapshot_pb.image_file_size());
+        }
+        if (snapshot_pb.has_snapshot_data_size()) {
+            snapshot_info.set_snapshot_data_size(snapshot_pb.snapshot_data_size());
         }
 
         MetaReader reader(snapshot_info.instance_id(), txn_kv_.get());

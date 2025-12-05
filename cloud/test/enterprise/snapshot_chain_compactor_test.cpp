@@ -704,6 +704,8 @@ void commit_snapshot(MetaServiceProxy* meta_service, const std::string& cloud_un
     req.set_image_url(image_url);
     req.set_last_journal_id(last_journal_id);
     req.set_request_ip("127.0.0.1");
+    req.set_image_file_size(100);
+    req.set_snapshot_data_size(1000);
 
     brpc::Controller cntl;
     CommitSnapshotResponse res;

@@ -17,6 +17,8 @@
 
 package org.apache.doris.cloud.snapshot;
 
+import org.apache.doris.catalog.Database;
+import org.apache.doris.catalog.DatabaseIf;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.cloud.proto.Cloud;
 import org.apache.doris.cloud.rpc.MetaServiceProxy;
@@ -56,6 +58,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.function.Function;
 import java.util.zip.ZipEntry;
@@ -183,6 +186,7 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
             long logId = Env.getCurrentEnv().getEditLog().logBeginSnapshot(snapshotState);
             job.setLogId(logId);
         }
+        job.setSnapshotDataSize(getSnapshotDataSize());
     }
 
     private void executeJob(CloudSnapshotJob job) {
@@ -207,17 +211,18 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
             logId = job.getLogId();
             // 2. upload image
             Checkpoint checkpoint = Env.getCurrentEnv().getCheckpointer();
+            long imageFileSize;
             checkpoint.getLock().readLock().lock();
             try {
                 if (DebugPointUtil.isEnable("CloudSnapshotHandler.uploadImage.fail")) {
                     throw new Exception("inject CloudSnapshotHandler.uploadImage.fail");
                 }
-                uploadImage(snapshotId, imageUrl, objInfo, logId);
+                imageFileSize = uploadImage(snapshotId, imageUrl, objInfo, logId);
             } finally {
                 checkpoint.getLock().readLock().unlock();
             }
             // 3. commit snapshot
-            commitSnapshot(snapshotId, imageUrl, logId);
+            commitSnapshot(snapshotId, imageUrl, logId, imageFileSize, job.getSnapshotDataSize());
             if (job.isAuto()) {
                 lastFinishedAutoSnapshotTime = System.currentTimeMillis() / 1000;
             }
@@ -263,11 +268,13 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
         }
     }
 
-    private void commitSnapshot(String snapshotId, String imageUrl, long logId) throws Exception {
+    private void commitSnapshot(String snapshotId, String imageUrl, long logId, long imageFileSize,
+            long snapshotDataSize) throws Exception {
         try {
             Cloud.CommitSnapshotRequest request = Cloud.CommitSnapshotRequest.newBuilder()
                     .setCloudUniqueId(Config.cloud_unique_id).setSnapshotId(snapshotId).setImageUrl(imageUrl)
-                    .setLastJournalId(logId).build();
+                    .setLastJournalId(logId).setImageFileSize(imageFileSize).setSnapshotDataSize(snapshotDataSize)
+                    .build();
             Cloud.CommitSnapshotResponse response = MetaServiceProxy.getInstance().commitSnapshot(request);
             if (response.getStatus().getCode() != Cloud.MetaServiceCode.OK) {
                 LOG.warn("commitSnapshot response: {} ", response);
@@ -296,7 +303,7 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
         }
     }
 
-    private void uploadImage(String snapshotId, String imageUrl, Cloud.ObjectStoreInfoPB objInfo,
+    private long uploadImage(String snapshotId, String imageUrl, Cloud.ObjectStoreInfoPB objInfo,
             long logId) throws Exception {
         LOG.info("start to snapshot for id: {}, imageUrl: {}, logId: {}", snapshotId, imageUrl, logId);
         List<File> files = new ArrayList<>();
@@ -342,7 +349,9 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
         }
 
         // 5. delete edit log file and zip file
+        long imageFileSize = zipFile.length();
         deleteFiles(snapshotEditLogFile, zipFile);
+        return imageFileSize;
     }
 
     private File getEditLogFile(long logId) {
@@ -744,5 +753,25 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
                 bos.write(buffer, 0, read);
             }
         }
+    }
+
+    private long getSnapshotDataSize() {
+        long snapshotDataSize = 0;
+        List<String> dbNames = Env.getCurrentInternalCatalog().getDbNames();
+        Preconditions.checkNotNull(dbNames);
+        Map<Long, Pair<Long, Long>> dbToRecycleSize = Env.getCurrentRecycleBin().getDbToRecycleSize();
+        for (String dbName : dbNames) {
+            DatabaseIf db = Env.getCurrentInternalCatalog().getDbNullable(dbName);
+            if (db == null) {
+                continue;
+            }
+            // Size, RemoteSize
+            Pair<Long, Long> usedSize = ((Database) db).getUsedDataSize();
+            snapshotDataSize += usedSize.first + usedSize.second;
+            // RecycleSize, RecycleRemoteSize
+            Pair<Long, Long> recycleSize = dbToRecycleSize.getOrDefault(db.getId(), Pair.of(0L, 0L));
+            snapshotDataSize += recycleSize.first + recycleSize.second;
+        }
+        return snapshotDataSize;
     }
 }

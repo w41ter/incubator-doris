@@ -26,6 +26,7 @@ public class CloudSnapshotJob  {
     private String label;
     private Cloud.BeginSnapshotResponse beginSnapshotResponse;
     private long logId;
+    private long snapshotDataSize;
 
     public CloudSnapshotJob(boolean auto, long ttl, String label) {
         this.auto = auto;
@@ -67,6 +68,14 @@ public class CloudSnapshotJob  {
 
     public long getLogId() {
         return logId;
+    }
+
+    public void setSnapshotDataSize(long snapshotDataSize) {
+        this.snapshotDataSize = snapshotDataSize;
+    }
+
+    public long getSnapshotDataSize() {
+        return snapshotDataSize;
     }
 
     @Override
