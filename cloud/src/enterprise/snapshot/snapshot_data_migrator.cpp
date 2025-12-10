@@ -21,6 +21,7 @@
 #include "meta-store/txn_kv.h"
 #include "meta-store/txn_kv_error.h"
 #include "meta-store/versioned_value.h"
+#include "recycler/sync_executor.h"
 #include "snapshot_manager.h"
 
 using namespace doris::cloud;
@@ -34,28 +35,19 @@ static constexpr int RETRY_INTERVAL_MS = 100;
 struct SnapshotDataMigrateContext {
     std::mutex mutex;
 
-    // The indexes that have been migrated.
+    // The indexes that have been migrated (best-effort cache).
     std::unordered_set<int64_t> migrated_indexes;
-    // The partitions that have been migrated.
+    // The partitions that have been migrated (best-effort cache).
     std::unordered_set<int64_t> migrated_partitions;
 };
 
-static inline bool is_partition_migrated(SnapshotDataMigrateContext& migrate_context,
-                                         int64_t partition_id) {
-    std::unique_lock lock(migrate_context.mutex);
-    return migrate_context.migrated_partitions.contains(partition_id);
-}
-
-static inline bool is_index_migrated(SnapshotDataMigrateContext& migrate_context,
-                                     int64_t index_id) {
-    std::unique_lock lock(migrate_context.mutex);
-    return migrate_context.migrated_indexes.contains(index_id);
-}
-
 class MigrateExecutor {
 public:
-    MigrateExecutor(const std::string& instance_id, std::shared_ptr<TxnKv> txn_kv)
-            : instance_id_(instance_id), txn_kv_(std::move(txn_kv)) {}
+    MigrateExecutor(const std::string& instance_id, std::shared_ptr<TxnKv> txn_kv,
+                    std::shared_ptr<SimpleThreadPool> migration_pool)
+            : instance_id_(instance_id),
+              txn_kv_(std::move(txn_kv)),
+              migration_pool_(std::move(migration_pool)) {}
     ~MigrateExecutor() = default;
 
     // Migrate table version keys to versioned keys
@@ -211,6 +203,7 @@ private:
 
     const std::string instance_id_;
     std::shared_ptr<TxnKv> txn_kv_;
+    std::shared_ptr<SimpleThreadPool> migration_pool_;
     SnapshotDataMigrateContext migrate_context_;
 };
 
@@ -364,6 +357,24 @@ int MigrateExecutor::migrate_table_version_key(int64_t db_id, int64_t table_id) 
 int MigrateExecutor::migrate_table_version_keys() {
     LOG_INFO("begin to migrate table version keys");
 
+    std::atomic<int> total_keys {0};
+    std::atomic<int> migrated_keys {0};
+    std::atomic<int> skipped_keys {0};
+    StopWatch stop_watch;
+
+    DORIS_CLOUD_DEFER {
+        LOG_INFO("migrate tablet version keys finished")
+                .tag("total", total_keys.load())
+                .tag("migrated", migrated_keys.load())
+                .tag("skipped", skipped_keys.load())
+                .tag("cost(s)", stop_watch.elapsed_seconds());
+    };
+
+    SyncExecutor<int> executor(migration_pool_,
+                               fmt::format("migrate_table_version_keys instance {}", instance_id_),
+                               [](int r) { return r < 0; });
+
+    // Scan and submit tasks directly without intermediate vector
     std::string begin_key = table_version_key({instance_id_, 0, 0});
     std::string end_key = table_version_key({instance_id_, INT64_MAX, INT64_MAX});
 
@@ -373,48 +384,61 @@ int MigrateExecutor::migrate_table_version_keys() {
     opts.txn_kv = txn_kv_;
     auto iter = txn_kv_->full_range_get(begin_key, end_key, opts);
 
-    int total_keys = 0;
-    int migrated_keys = 0;
-    int skipped_keys = 0;
-    StopWatch stop_watch;
-
-    DORIS_CLOUD_DEFER {
-        LOG_INFO("migrate tablet version keys finished")
-                .tag("total", total_keys)
-                .tag("migrated", migrated_keys)
-                .tag("skipped", skipped_keys)
-                .tag("cost(s)", stop_watch.elapsed_seconds());
-    };
-
+    bool scan_error = false;
     for (auto kvp = iter->next(); kvp.has_value(); kvp = iter->next()) {
         auto&& [key, value] = *kvp;
-        total_keys++;
 
         int64_t db_id = -1;
         int64_t table_id = -1;
         std::string_view key_view(key);
         if (!decode_table_version_key(&key_view, &db_id, &table_id)) {
             LOG_WARNING("failed to decode table version key").tag("key", hex(key));
-            return -1;
+            scan_error = true;
+            break; // Stop submitting new tasks, but wait for already submitted ones
         }
 
-        int result =
-                retry_if_txn_conflict(&MigrateExecutor::migrate_table_version_key, db_id, table_id);
-        if (result == 0) {
-            migrated_keys++;
-        } else if (result == 1) {
-            skipped_keys++;
-        } else {
-            LOG_WARNING("failed to migrate table version key")
-                    .tag("db_id", db_id)
-                    .tag("table_id", table_id);
-            return -1;
-        }
+        executor.add([this, db_id, table_id, &total_keys, &migrated_keys, &skipped_keys]() -> int {
+            total_keys.fetch_add(1);
+            int result = retry_if_txn_conflict(&MigrateExecutor::migrate_table_version_key, db_id,
+                                               table_id);
+            if (result == 0) {
+                migrated_keys.fetch_add(1);
+            } else if (result == 1) {
+                skipped_keys.fetch_add(1);
+            } else {
+                LOG_WARNING("failed to migrate table version key")
+                        .tag("db_id", db_id)
+                        .tag("table_id", table_id);
+            }
+            return result;
+        });
     }
 
     if (!iter->is_valid()) {
         LOG_WARNING("failed to iterate table version keys").tag("error", iter->error_code());
+        scan_error = true;
+    }
+
+    // Wait for all submitted tasks to complete before returning
+    // This is critical to avoid dangling references to stack variables
+
+    bool finished = true;
+    auto results = executor.when_all(&finished);
+    if (!finished) {
+        LOG_WARNING("migrate table version keys failed: executor did not finish");
         return -1;
+    }
+
+    if (scan_error) {
+        LOG_WARNING("migrate table version keys failed due to scan error");
+        return -1;
+    }
+
+    for (int ret : results) {
+        if (ret < 0) {
+            LOG_WARNING("migrate table version keys failed with error").tag("error", ret);
+            return -1;
+        }
     }
 
     return 0;
@@ -487,7 +511,24 @@ int MigrateExecutor::migrate_tablet_schema_key(int64_t index_id, int64_t schema_
 int MigrateExecutor::migrate_tablet_schema_keys() {
     LOG_INFO("begin to migrate tablet schema keys");
 
-    // Construct the range for tablet schema keys in 0x01 space
+    std::atomic<int> total_keys {0};
+    std::atomic<int> migrated_keys {0};
+    std::atomic<int> skipped_keys {0};
+    StopWatch stop_watch;
+
+    DORIS_CLOUD_DEFER {
+        LOG_INFO("migrate tablet schema keys finished")
+                .tag("total", total_keys.load())
+                .tag("migrated", migrated_keys.load())
+                .tag("skipped", skipped_keys.load())
+                .tag("cost(s)", stop_watch.elapsed_seconds());
+    };
+
+    SyncExecutor<int> executor(migration_pool_,
+                               fmt::format("migrate_tablet_schema_keys instance {}", instance_id_),
+                               [](int r) { return r < 0; });
+
+    // Scan and submit tasks directly without intermediate vector
     std::string begin_key = meta_schema_key({instance_id_, 0, 0});
     std::string end_key = meta_schema_key({instance_id_, INT64_MAX, INT64_MAX});
 
@@ -497,20 +538,8 @@ int MigrateExecutor::migrate_tablet_schema_keys() {
     opts.txn_kv = txn_kv_;
     auto iter = txn_kv_->full_range_get(begin_key, end_key, opts);
 
-    int total_keys = 0;
-    int migrated_keys = 0;
-    int skipped_keys = 0;
-    StopWatch stop_watch;
-
-    DORIS_CLOUD_DEFER {
-        LOG_INFO("migrate tablet schema keys finished")
-                .tag("total", total_keys)
-                .tag("migrated", migrated_keys)
-                .tag("skipped", skipped_keys)
-                .tag("cost(s)", stop_watch.elapsed_seconds());
-    };
-
     std::string last_key = "";
+    bool scan_error = false;
     for (auto kvp = iter->next(); kvp.has_value(); kvp = iter->next()) {
         auto&& [key, value] = *kvp;
         if (!last_key.empty() && key.starts_with(last_key)) {
@@ -518,14 +547,13 @@ int MigrateExecutor::migrate_tablet_schema_keys() {
             continue;
         }
 
-        total_keys++;
-
         std::string_view key_view(key);
         if (key_view.size() != begin_key.size()) {
             // compatible with old version, see blob_message.h for details
             if (key_view.size() < 9) {
                 LOG_WARNING("failed to decode tablet schema key").tag("key", hex(key));
-                return -1;
+                scan_error = true;
+                break;
             }
             key_view.remove_suffix(9);
         }
@@ -536,26 +564,50 @@ int MigrateExecutor::migrate_tablet_schema_keys() {
         int64_t schema_version = -1;
         if (!decode_tablet_schema_key(&key_view, &index_id, &schema_version)) {
             LOG_WARNING("failed to decode tablet schema key").tag("key", hex(key));
-            return -1;
+            scan_error = true;
+            break;
         }
 
-        int result = retry_if_txn_conflict(&MigrateExecutor::migrate_tablet_schema_key, index_id,
-                                           schema_version);
-        if (result == 0) {
-            migrated_keys++;
-        } else if (result == 1) {
-            skipped_keys++;
-        } else {
-            LOG_WARNING("failed to migrate tablet schema key")
-                    .tag("index_id", index_id)
-                    .tag("schema_version", schema_version);
-            return -1;
-        }
+        executor.add([this, index_id, schema_version, &total_keys, &migrated_keys,
+                      &skipped_keys]() -> int {
+            total_keys.fetch_add(1);
+            int result = retry_if_txn_conflict(&MigrateExecutor::migrate_tablet_schema_key,
+                                               index_id, schema_version);
+            if (result == 0) {
+                migrated_keys.fetch_add(1);
+            } else if (result == 1) {
+                skipped_keys.fetch_add(1);
+            } else {
+                LOG_WARNING("failed to migrate tablet schema key")
+                        .tag("index_id", index_id)
+                        .tag("schema_version", schema_version);
+            }
+            return result;
+        });
     }
 
     if (!iter->is_valid()) {
         LOG_WARNING("failed to iterate tablet schema keys").tag("error", iter->error_code());
+        scan_error = true;
+    }
+
+    bool finished = true;
+    auto results = executor.when_all(&finished);
+    if (!finished) {
+        LOG_WARNING("migrate tablet schema keys failed: executor did not finish");
         return -1;
+    }
+
+    if (scan_error) {
+        LOG_WARNING("migrate tablet schema keys failed due to scan error");
+        return -1;
+    }
+
+    for (int ret : results) {
+        if (ret < 0) {
+            LOG_WARNING("migrate tablet schema keys failed with error").tag("error", ret);
+            return -1;
+        }
     }
 
     return 0;
@@ -603,38 +655,35 @@ int MigrateExecutor::migrate_partition_version_key(int64_t db_id, int64_t table_
 
     versioned_put(txn.get(), versioned_key, old_value);
 
-    bool migrate_partition_meta_keys = false;
-    if (!is_partition_migrated(migrate_context_, partition_id)) {
-        std::string partition_index_key =
-                versioned::partition_index_key({instance_id_, partition_id});
-        std::string value;
-        err = txn->get(partition_index_key, &value);
-        if (err == TxnErrorCode::TXN_OK) {
-            migrate_partition_meta_keys = true;
-        } else if (err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
-            LOG_WARNING("failed to read partition meta for migrating partition version key")
-                    .tag("error", err);
-            return -1;
-        } else {
-            std::string partition_meta_key =
-                    versioned::meta_partition_key({instance_id_, partition_id});
-            std::string partition_inverted_index_key = versioned::partition_inverted_index_key(
-                    {instance_id_, db_id, table_id, partition_id});
-            PartitionIndexPB partition_index_pb;
-            partition_index_pb.set_db_id(db_id);
-            partition_index_pb.set_table_id(table_id);
-            txn->put(partition_index_key, partition_index_pb.SerializeAsString());
-            txn->put(partition_inverted_index_key, "");
-            versioned_put(txn.get(), partition_meta_key, "");
-            migrate_partition_meta_keys = true;
-            VLOG_DEBUG << "migrate partition meta keys for partition " << partition_id << ", db "
-                       << db_id << ", table " << table_id;
-        }
+    bool migrated_partition_meta_keys = false;
+    std::string partition_index_key = versioned::partition_index_key({instance_id_, partition_id});
+    std::string value;
+    err = txn->get(partition_index_key, &value);
+    if (err == TxnErrorCode::TXN_OK) {
+        migrated_partition_meta_keys = true; // already exists
+    } else if (err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        LOG_WARNING("failed to read partition meta for migrating partition version key")
+                .tag("error", err);
+        return -1;
+    } else {
+        std::string partition_meta_key =
+                versioned::meta_partition_key({instance_id_, partition_id});
+        std::string partition_inverted_index_key = versioned::partition_inverted_index_key(
+                {instance_id_, db_id, table_id, partition_id});
+        PartitionIndexPB partition_index_pb;
+        partition_index_pb.set_db_id(db_id);
+        partition_index_pb.set_table_id(table_id);
+        txn->put(partition_index_key, partition_index_pb.SerializeAsString());
+        txn->put(partition_inverted_index_key, "");
+        versioned_put(txn.get(), partition_meta_key, "");
+        migrated_partition_meta_keys = true;
+        VLOG_DEBUG << "migrate partition meta keys for partition " << partition_id << ", db "
+                   << db_id << ", table " << table_id;
     }
 
     err = txn->commit();
     if (err == TxnErrorCode::TXN_OK) {
-        if (migrate_partition_meta_keys) {
+        if (migrated_partition_meta_keys) {
             std::unique_lock lock(migrate_context_.mutex);
             migrate_context_.migrated_partitions.insert(partition_id);
         }
@@ -653,7 +702,25 @@ int MigrateExecutor::migrate_partition_version_key(int64_t db_id, int64_t table_
 int MigrateExecutor::migrate_partition_version_keys() {
     LOG_INFO("begin to migrate partition version keys");
 
-    // Construct the range for partition version keys in 0x01 space
+    std::atomic<int> total_keys {0};
+    std::atomic<int> migrated_keys {0};
+    std::atomic<int> skipped_keys {0};
+    StopWatch stop_watch;
+
+    DORIS_CLOUD_DEFER {
+        LOG_INFO("migrating partition version keys finished")
+                .tag("total", total_keys.load())
+                .tag("migrated", migrated_keys.load())
+                .tag("skipped", skipped_keys.load())
+                .tag("cost(s)", stop_watch.elapsed_seconds());
+    };
+
+    SyncExecutor<int> executor(
+            migration_pool_,
+            fmt::format("migrate_partition_version_keys instance {}", instance_id_),
+            [](int r) { return r < 0; });
+
+    // Scan and submit tasks directly without intermediate vector
     std::string begin_key = partition_version_key({instance_id_, 0, 0, 0});
     std::string end_key = partition_version_key({instance_id_, INT64_MAX, INT64_MAX, INT64_MAX});
 
@@ -663,22 +730,9 @@ int MigrateExecutor::migrate_partition_version_keys() {
     opts.txn_kv = txn_kv_;
     auto iter = txn_kv_->full_range_get(begin_key, end_key, opts);
 
-    int total_keys = 0;
-    int migrated_keys = 0;
-    int skipped_keys = 0;
-    StopWatch stop_watch;
-
-    DORIS_CLOUD_DEFER {
-        LOG_INFO("migrating partition version keys finished")
-                .tag("total", total_keys)
-                .tag("migrated", migrated_keys)
-                .tag("skipped", skipped_keys)
-                .tag("cost(s)", stop_watch.elapsed_seconds());
-    };
-
+    bool scan_error = false;
     for (auto kvp = iter->next(); kvp.has_value(); kvp = iter->next()) {
         auto&& [key, value] = *kvp;
-        total_keys++;
 
         int64_t db_id = -1;
         int64_t tbl_id = -1;
@@ -686,27 +740,51 @@ int MigrateExecutor::migrate_partition_version_keys() {
         std::string_view key_view(key);
         if (!decode_partition_version_key(&key_view, &db_id, &tbl_id, &partition_id)) {
             LOG_WARNING("failed to decode partition version key").tag("key", hex(key));
-            return -1;
+            scan_error = true;
+            break;
         }
 
-        int result = retry_if_txn_conflict(&MigrateExecutor::migrate_partition_version_key, db_id,
-                                           tbl_id, partition_id);
-        if (result == 0) {
-            migrated_keys++;
-        } else if (result == 1) {
-            skipped_keys++;
-        } else {
-            LOG_WARNING("failed to migrate partition version key")
-                    .tag("db_id", db_id)
-                    .tag("table_id", tbl_id)
-                    .tag("partition_id", partition_id);
-            return -1;
-        }
+        executor.add([this, db_id, tbl_id, partition_id, &total_keys, &migrated_keys,
+                      &skipped_keys]() -> int {
+            total_keys.fetch_add(1);
+            int result = retry_if_txn_conflict(&MigrateExecutor::migrate_partition_version_key,
+                                               db_id, tbl_id, partition_id);
+            if (result == 0) {
+                migrated_keys.fetch_add(1);
+            } else if (result == 1) {
+                skipped_keys.fetch_add(1);
+            } else {
+                LOG_WARNING("failed to migrate partition version key")
+                        .tag("db_id", db_id)
+                        .tag("table_id", tbl_id)
+                        .tag("partition_id", partition_id);
+            }
+            return result;
+        });
     }
 
     if (!iter->is_valid()) {
         LOG_WARNING("failed to iterate partition version keys").tag("error", iter->error_code());
+        scan_error = true;
+    }
+
+    bool finished = true;
+    auto results = executor.when_all(&finished);
+    if (!finished) {
+        LOG_WARNING("migrate partition version keys failed: executor did not finish");
         return -1;
+    }
+
+    if (scan_error) {
+        LOG_WARNING("migrate partition version keys failed due to scan error");
+        return -1;
+    }
+
+    for (int ret : results) {
+        if (ret < 0) {
+            LOG_WARNING("migrate partition version keys failed with error").tag("error", ret);
+            return -1;
+        }
     }
 
     return 0;
@@ -836,37 +914,43 @@ int MigrateExecutor::migrate_meta_tablet_idx_key(int64_t tablet_id) {
         txn->put(tablet_inverted_index_key, "");
     }
 
-    bool is_index_meta_keys_migrated = false, is_partition_meta_keys_migrated = false;
-    if (!is_index_migrated(migrate_context_, index_id)) {
-        if (int res = migrate_index_meta_keys(txn.get(), db_id, table_id, index_id); res < 0) {
-            return res;
-        } else if (res == 0) {
-            any_key_migrated = true;
-        }
-        is_index_meta_keys_migrated = true;
+    // Use versioned key existence as idempotency sentinel; concurrent writes rely on FDB conflict
+    auto ensure_index_once = [&](int64_t idx) -> int {
+        std::string key = versioned::meta_index_key({instance_id_, idx});
+        std::string v;
+        TxnErrorCode e = txn->get(key, &v);
+        if (e == TxnErrorCode::TXN_OK) return 1;             // already exists
+        if (e != TxnErrorCode::TXN_KEY_NOT_FOUND) return -1; // error
+        return migrate_index_meta_keys(txn.get(), db_id, table_id, idx);
+    };
+    auto ensure_partition_once = [&](int64_t pid) -> int {
+        std::string key = versioned::meta_partition_key({instance_id_, pid});
+        std::string v;
+        TxnErrorCode e = txn->get(key, &v);
+        if (e == TxnErrorCode::TXN_OK) return 1;             // already exists
+        if (e != TxnErrorCode::TXN_KEY_NOT_FOUND) return -1; // error
+        return migrate_partition_meta_keys(txn.get(), db_id, table_id, pid);
+    };
+
+    if (int res = ensure_index_once(index_id); res < 0) {
+        return res;
+    } else if (res == 0) {
+        any_key_migrated = true;
     }
-    if (!is_partition_migrated(migrate_context_, partition_id)) {
-        if (int res = migrate_partition_meta_keys(txn.get(), db_id, table_id, partition_id);
-            res < 0) {
-            return res;
-        } else if (res == 0) {
-            any_key_migrated = true;
-        }
-        is_partition_meta_keys_migrated = true;
+
+    if (int res = ensure_partition_once(partition_id); res < 0) {
+        return res;
+    } else if (res == 0) {
+        any_key_migrated = true;
     }
 
     err = txn->commit();
     if (err == TxnErrorCode::TXN_OK) {
-        if (is_index_meta_keys_migrated || is_partition_meta_keys_migrated) {
-            std::unique_lock lock(migrate_context_.mutex);
-            if (is_index_meta_keys_migrated) {
-                migrate_context_.migrated_indexes.insert(index_id);
-            }
-            if (is_partition_meta_keys_migrated) {
-                migrate_context_.migrated_partitions.insert(partition_id);
-            }
-        }
         if (any_key_migrated) {
+            std::unique_lock lock(migrate_context_.mutex);
+            migrate_context_.migrated_indexes.insert(index_id);
+            migrate_context_.migrated_partitions.insert(partition_id);
+
             VLOG_DEBUG << "migrate tablet index key for tablet " << tablet_id << ", db " << db_id
                        << ", table " << table_id << ", index " << index_id << ", partition "
                        << partition_id;
@@ -884,6 +968,24 @@ int MigrateExecutor::migrate_meta_tablet_idx_key(int64_t tablet_id) {
 int MigrateExecutor::migrate_tablet_index_keys() {
     LOG_INFO("begin to migrate tablet index keys");
 
+    std::atomic<int> total_keys {0};
+    std::atomic<int> migrated_keys {0};
+    std::atomic<int> skipped_keys {0};
+    StopWatch stop_watch;
+
+    DORIS_CLOUD_DEFER {
+        LOG_INFO("migrating tablet index keys finished")
+                .tag("total", total_keys.load())
+                .tag("migrated", migrated_keys.load())
+                .tag("skipped", skipped_keys.load())
+                .tag("cost(s)", stop_watch.elapsed_seconds());
+    };
+
+    SyncExecutor<int> executor(migration_pool_,
+                               fmt::format("migrate_tablet_index_keys instance {}", instance_id_),
+                               [](int r) { return r < 0; });
+
+    // Scan and submit tasks directly without intermediate vector
     std::string begin_key = meta_tablet_idx_key({instance_id_, 0});
     std::string end_key = meta_tablet_idx_key({instance_id_, INT64_MAX});
 
@@ -893,45 +995,55 @@ int MigrateExecutor::migrate_tablet_index_keys() {
     opts.txn_kv = txn_kv_;
     auto iter = txn_kv_->full_range_get(begin_key, end_key, opts);
 
-    int total_keys = 0;
-    int migrated_keys = 0;
-    int skipped_keys = 0;
-    StopWatch stop_watch;
-
-    DORIS_CLOUD_DEFER {
-        LOG_INFO("migrating tablet index keys finished")
-                .tag("total", total_keys)
-                .tag("migrated", migrated_keys)
-                .tag("skipped", skipped_keys)
-                .tag("cost(s)", stop_watch.elapsed_seconds());
-    };
-
+    bool scan_error = false;
     for (auto kvp = iter->next(); kvp.has_value(); kvp = iter->next()) {
         auto&& [key, value] = *kvp;
-        total_keys++;
 
         int64_t tablet_id = -1;
         std::string_view key_view(key);
         if (!decode_meta_tablet_idx_key(&key_view, &tablet_id)) {
             LOG_WARNING("failed to decode meta tablet index key").tag("key", hex(key));
-            return -1;
+            scan_error = true;
+            break;
         }
 
-        int result =
-                retry_if_txn_conflict(&MigrateExecutor::migrate_meta_tablet_idx_key, tablet_id);
-        if (result == 0) {
-            migrated_keys++;
-        } else if (result == 1) {
-            skipped_keys++;
-        } else {
-            LOG_WARNING("failed to migrate tablet idx key").tag("tablet_id", tablet_id);
-            return -1;
-        }
+        executor.add([this, tablet_id, &total_keys, &migrated_keys, &skipped_keys]() -> int {
+            total_keys.fetch_add(1);
+            int result =
+                    retry_if_txn_conflict(&MigrateExecutor::migrate_meta_tablet_idx_key, tablet_id);
+            if (result == 0) {
+                migrated_keys.fetch_add(1);
+            } else if (result == 1) {
+                skipped_keys.fetch_add(1);
+            } else {
+                LOG_WARNING("failed to migrate tablet idx key").tag("tablet_id", tablet_id);
+            }
+            return result;
+        });
     }
 
     if (!iter->is_valid()) {
         LOG_WARNING("failed to iterate tablet index keys").tag("error", iter->error_code());
+        scan_error = true;
+    }
+
+    bool finished = true;
+    auto results = executor.when_all(&finished);
+    if (!finished) {
+        LOG_WARNING("migrate tablet index keys failed: executor did not finish");
         return -1;
+    }
+
+    if (scan_error) {
+        LOG_WARNING("migrate tablet index keys failed due to scan error");
+        return -1;
+    }
+
+    for (int ret : results) {
+        if (ret < 0) {
+            LOG_WARNING("migrate tablet index keys failed with error").tag("error", ret);
+            return -1;
+        }
     }
 
     return 0;
@@ -993,6 +1105,24 @@ int MigrateExecutor::migrate_meta_tablet_key(int64_t table_id, int64_t index_id,
 int MigrateExecutor::migrate_meta_tablet_keys() {
     LOG_INFO("begin to migrate meta tablet keys");
 
+    std::atomic<int> total_keys {0};
+    std::atomic<int> migrated_keys {0};
+    std::atomic<int> skipped_keys {0};
+    StopWatch stop_watch;
+
+    DORIS_CLOUD_DEFER {
+        LOG_INFO("migrating meta tablet keys finished")
+                .tag("total", total_keys.load())
+                .tag("migrated", migrated_keys.load())
+                .tag("skipped", skipped_keys.load())
+                .tag("cost(s)", stop_watch.elapsed_seconds());
+    };
+
+    SyncExecutor<int> executor(migration_pool_,
+                               fmt::format("migrate_meta_tablet_keys instance {}", instance_id_),
+                               [](int r) { return r < 0; });
+
+    // Scan and submit tasks directly without intermediate vector
     std::string begin_key = meta_tablet_key({instance_id_, 0, 0, 0, 0});
     std::string end_key =
             meta_tablet_key({instance_id_, INT64_MAX, INT64_MAX, INT64_MAX, INT64_MAX});
@@ -1003,22 +1133,9 @@ int MigrateExecutor::migrate_meta_tablet_keys() {
     opts.txn_kv = txn_kv_;
     auto iter = txn_kv_->full_range_get(begin_key, end_key, opts);
 
-    int total_keys = 0;
-    int migrated_keys = 0;
-    int skipped_keys = 0;
-    StopWatch stop_watch;
-
-    DORIS_CLOUD_DEFER {
-        LOG_INFO("migrating meta tablet keys finished")
-                .tag("total", total_keys)
-                .tag("migrated", migrated_keys)
-                .tag("skipped", skipped_keys)
-                .tag("cost(s)", stop_watch.elapsed_seconds());
-    };
-
+    bool scan_error = false;
     for (auto kvp = iter->next(); kvp.has_value(); kvp = iter->next()) {
         auto&& [key, value] = *kvp;
-        total_keys++;
 
         int64_t table_id = -1;
         int64_t index_id = -1;
@@ -1027,28 +1144,52 @@ int MigrateExecutor::migrate_meta_tablet_keys() {
         std::string_view key_view(key);
         if (!decode_meta_tablet_key(&key_view, &table_id, &index_id, &partition_id, &tablet_id)) {
             LOG_WARNING("failed to decode meta tablet key").tag("key", hex(key));
-            return -1;
+            scan_error = true;
+            break;
         }
 
-        int result = retry_if_txn_conflict(&MigrateExecutor::migrate_meta_tablet_key, table_id,
-                                           index_id, partition_id, tablet_id);
-        if (result == 0) {
-            migrated_keys++;
-        } else if (result == 1) {
-            skipped_keys++;
-        } else {
-            LOG_WARNING("failed to migrate meta tablet key")
-                    .tag("table_id", table_id)
-                    .tag("index_id", index_id)
-                    .tag("partition_id", partition_id)
-                    .tag("tablet_id", tablet_id);
-            return -1;
-        }
+        executor.add([this, table_id, index_id, partition_id, tablet_id, &total_keys,
+                      &migrated_keys, &skipped_keys]() -> int {
+            total_keys.fetch_add(1);
+            int result = retry_if_txn_conflict(&MigrateExecutor::migrate_meta_tablet_key, table_id,
+                                               index_id, partition_id, tablet_id);
+            if (result == 0) {
+                migrated_keys.fetch_add(1);
+            } else if (result == 1) {
+                skipped_keys.fetch_add(1);
+            } else {
+                LOG_WARNING("failed to migrate meta tablet key")
+                        .tag("table_id", table_id)
+                        .tag("index_id", index_id)
+                        .tag("partition_id", partition_id)
+                        .tag("tablet_id", tablet_id);
+            }
+            return result;
+        });
     }
 
     if (!iter->is_valid()) {
         LOG_WARNING("failed to iterate meta tablet keys").tag("error", iter->error_code());
+        scan_error = true;
+    }
+
+    bool finished = true;
+    auto results = executor.when_all(&finished);
+    if (!finished) {
+        LOG_WARNING("migrate meta tablet keys failed: executor did not finish");
         return -1;
+    }
+
+    if (scan_error) {
+        LOG_WARNING("migrate meta tablet keys failed due to scan error");
+        return -1;
+    }
+
+    for (int ret : results) {
+        if (ret < 0) {
+            LOG_WARNING("migrate meta tablet keys failed with error").tag("error", ret);
+            return -1;
+        }
     }
 
     return 0;
@@ -1253,122 +1394,145 @@ int MigrateExecutor::migrate_meta_rowset_keys() {
         return -1;
     }
 
-    int total_keys = 0;
-    int migrated_keys = 0;
-    int skipped_keys = 0;
-    int total_delete_bitmap_keys = 0;
-    int migrated_delete_bitmap_keys = 0;
-    int skipped_delete_bitmap_keys = 0;
+    std::atomic<int> total_keys {0};
+    std::atomic<int> migrated_keys {0};
+    std::atomic<int> skipped_keys {0};
+    std::atomic<int> total_delete_bitmap_keys {0};
+    std::atomic<int> migrated_delete_bitmap_keys {0};
+    std::atomic<int> skipped_delete_bitmap_keys {0};
     StopWatch stop_watch;
 
     DORIS_CLOUD_DEFER {
         LOG_INFO("migrating meta rowset keys finished")
-                .tag("total", total_keys)
-                .tag("migrated", migrated_keys)
-                .tag("skipped", skipped_keys)
-                .tag("total_delete_bitmap", total_delete_bitmap_keys)
-                .tag("migrated_delete_bitmap", migrated_delete_bitmap_keys)
-                .tag("skipped_delete_bitmap", skipped_delete_bitmap_keys)
+                .tag("total", total_keys.load())
+                .tag("migrated", migrated_keys.load())
+                .tag("skipped", skipped_keys.load())
+                .tag("total_delete_bitmap", total_delete_bitmap_keys.load())
+                .tag("migrated_delete_bitmap", migrated_delete_bitmap_keys.load())
+                .tag("skipped_delete_bitmap", skipped_delete_bitmap_keys.load())
                 .tag("cost(s)", stop_watch.elapsed_seconds());
     };
 
+    SyncExecutor<int> executor(migration_pool_,
+                               fmt::format("migrate_meta_rowset_keys instance {}", instance_id_),
+                               [](int r) { return r < 0; });
+
     for (int64_t tablet_id : tablet_ids) {
-        std::unique_ptr<Transaction> txn;
-        TxnErrorCode err = txn_kv_->create_txn(&txn);
-        if (err != TxnErrorCode::TXN_OK) {
-            LOG_WARNING("failed to create txn for migrate meta rowset keys").tag("error", err);
-            return -1;
-        }
-
-        std::map<int64_t, doris::RowsetMetaCloudPB> rowset_meta_map;
-        res = get_tablet_version_graph(tablet_id, &rowset_meta_map);
-        if (res != 0) {
-            LOG_WARNING("failed to get version graph for migrate meta rowset keys")
-                    .tag("tablet_id", tablet_id);
-            return -1;
-        }
-
-        MetaReader meta_reader(instance_id_, txn_kv_.get());
-        std::vector<doris::RowsetMetaCloudPB> versioned_rowset_metas;
-        err = meta_reader.get_rowset_metas(tablet_id, 0, std::numeric_limits<int64_t>::max(),
-                                           &versioned_rowset_metas);
-        if (err != TxnErrorCode::TXN_OK) {
-            LOG_WARNING("failed to get versioned rowset metas for migrate meta rowset keys")
-                    .tag("tablet_id", tablet_id)
-                    .tag("error", err);
-            return -1;
-        }
-
-        std::map<int64_t, doris::RowsetMetaCloudPB> versioned_rowset_meta_map;
-        for (auto&& rowset_meta : versioned_rowset_metas) {
-            versioned_rowset_meta_map[rowset_meta.end_version()] = rowset_meta;
-        }
-
-        int64_t read_version = -1;
-        err = txn->get_read_version(&read_version);
-        if (err != TxnErrorCode::TXN_OK) {
-            LOG_WARNING("failed to get read version for migrate meta rowset keys")
-                    .tag("tablet_id", tablet_id)
-                    .tag("error", err);
-            return -1;
-        }
-
-        doris::TabletMetaCloudPB tablet_meta;
-        err = meta_reader.get_tablet_meta(tablet_id, &tablet_meta, nullptr);
-        if (err != TxnErrorCode::TXN_OK) {
-            LOG_WARNING("failed to get tablet meta for migrate meta rowset keys")
-                    .tag("tablet_id", tablet_id)
-                    .tag("error", err);
-            return -1;
-        }
-        bool is_mow = tablet_meta.has_enable_unique_key_merge_on_write() &&
-                      tablet_meta.enable_unique_key_merge_on_write();
-
-        // The migrate versionstamp is used to determine the versionstamp of the migrated rowset meta.
-        // It should ensure that the migrated rowset meta has a versionstamp smaller than the read version of
-        // the current transaction, so that the migrated rowset meta is visible to the current transaction,
-        // but does not affect the visibility of other data written after current transaction.
-        Versionstamp migrate_versionstamp(read_version - 1, 0);
-        for (auto&& [_, rowset_meta] : rowset_meta_map) {
-            total_keys++;
-
-            auto it = versioned_rowset_meta_map.lower_bound(rowset_meta.end_version());
-            if (it != versioned_rowset_meta_map.end() &&
-                it->second.start_version() <= rowset_meta.start_version()) {
-                // This rowset_meta is already covered by a versioned rowset meta
-                skipped_keys++;
-                continue;
-            }
-
-            int result = retry_if_txn_conflict(&MigrateExecutor::migrate_rowset_meta, tablet_id,
-                                               rowset_meta, migrate_versionstamp);
-            if (result == 0) {
-                migrated_keys++;
-            } else if (result == 1) {
-                skipped_keys++;
-            } else {
-                LOG_WARNING("failed to migrate rowset meta")
-                        .tag("tablet_id", tablet_id)
-                        .tag("version", rowset_meta.end_version())
-                        .tag("rowset_id", rowset_meta.rowset_id_v2());
+        executor.add([this, tablet_id, &total_keys, &migrated_keys, &skipped_keys,
+                      &total_delete_bitmap_keys, &migrated_delete_bitmap_keys,
+                      &skipped_delete_bitmap_keys]() -> int {
+            std::unique_ptr<Transaction> txn;
+            TxnErrorCode err = txn_kv_->create_txn(&txn);
+            if (err != TxnErrorCode::TXN_OK) {
+                LOG_WARNING("failed to create txn for migrate meta rowset keys").tag("error", err);
                 return -1;
             }
 
-            if (is_mow) {
-                total_delete_bitmap_keys++;
-                result = retry_if_txn_conflict(&MigrateExecutor::migrate_delete_bitmap, tablet_id,
-                                               rowset_meta.rowset_id_v2());
+            std::map<int64_t, doris::RowsetMetaCloudPB> rowset_meta_map;
+            int local_res = get_tablet_version_graph(tablet_id, &rowset_meta_map);
+            if (local_res != 0) {
+                LOG_WARNING("failed to get version graph for migrate meta rowset keys")
+                        .tag("tablet_id", tablet_id);
+                return -1;
+            }
+
+            MetaReader meta_reader(instance_id_, txn_kv_.get());
+            std::vector<doris::RowsetMetaCloudPB> versioned_rowset_metas;
+            err = meta_reader.get_rowset_metas(tablet_id, 0, std::numeric_limits<int64_t>::max(),
+                                               &versioned_rowset_metas);
+            if (err != TxnErrorCode::TXN_OK) {
+                LOG_WARNING("failed to get versioned rowset metas for migrate meta rowset keys")
+                        .tag("tablet_id", tablet_id)
+                        .tag("error", err);
+                return -1;
+            }
+
+            std::map<int64_t, doris::RowsetMetaCloudPB> versioned_rowset_meta_map;
+            for (auto&& rowset_meta : versioned_rowset_metas) {
+                versioned_rowset_meta_map[rowset_meta.end_version()] = rowset_meta;
+            }
+
+            int64_t read_version = -1;
+            err = txn->get_read_version(&read_version);
+            if (err != TxnErrorCode::TXN_OK) {
+                LOG_WARNING("failed to get read version for migrate meta rowset keys")
+                        .tag("tablet_id", tablet_id)
+                        .tag("error", err);
+                return -1;
+            }
+
+            doris::TabletMetaCloudPB tablet_meta;
+            err = meta_reader.get_tablet_meta(tablet_id, &tablet_meta, nullptr);
+            if (err != TxnErrorCode::TXN_OK) {
+                LOG_WARNING("failed to get tablet meta for migrate meta rowset keys")
+                        .tag("tablet_id", tablet_id)
+                        .tag("error", err);
+                return -1;
+            }
+            bool is_mow = tablet_meta.has_enable_unique_key_merge_on_write() &&
+                          tablet_meta.enable_unique_key_merge_on_write();
+
+            // The migrate versionstamp is used to determine the versionstamp of the migrated rowset meta.
+            // It should ensure that the migrated rowset meta has a versionstamp smaller than the read version of
+            // the current transaction, so that the migrated rowset meta is visible to the current transaction,
+            // but does not affect the visibility of other data written after current transaction.
+            Versionstamp migrate_versionstamp(read_version - 1, 0);
+            for (auto&& [_, rowset_meta] : rowset_meta_map) {
+                total_keys.fetch_add(1);
+
+                auto it = versioned_rowset_meta_map.lower_bound(rowset_meta.end_version());
+                if (it != versioned_rowset_meta_map.end() &&
+                    it->second.start_version() <= rowset_meta.start_version()) {
+                    // This rowset_meta is already covered by a versioned rowset meta
+                    skipped_keys.fetch_add(1);
+                    continue;
+                }
+
+                int result = retry_if_txn_conflict(&MigrateExecutor::migrate_rowset_meta, tablet_id,
+                                                   rowset_meta, migrate_versionstamp);
                 if (result == 0) {
-                    migrated_delete_bitmap_keys++;
+                    migrated_keys.fetch_add(1);
                 } else if (result == 1) {
-                    skipped_delete_bitmap_keys++;
+                    skipped_keys.fetch_add(1);
                 } else {
-                    LOG_WARNING("failed to migrate delete bitmap")
+                    LOG_WARNING("failed to migrate rowset meta")
                             .tag("tablet_id", tablet_id)
+                            .tag("version", rowset_meta.end_version())
                             .tag("rowset_id", rowset_meta.rowset_id_v2());
                     return -1;
                 }
+
+                if (is_mow) {
+                    total_delete_bitmap_keys.fetch_add(1);
+                    result = retry_if_txn_conflict(&MigrateExecutor::migrate_delete_bitmap,
+                                                   tablet_id, rowset_meta.rowset_id_v2());
+                    if (result == 0) {
+                        migrated_delete_bitmap_keys.fetch_add(1);
+                    } else if (result == 1) {
+                        skipped_delete_bitmap_keys.fetch_add(1);
+                    } else {
+                        LOG_WARNING("failed to migrate delete bitmap")
+                                .tag("tablet_id", tablet_id)
+                                .tag("rowset_id", rowset_meta.rowset_id_v2());
+                        return -1;
+                    }
+                }
             }
+            return 0;
+        });
+    }
+
+    bool finished = true;
+    auto results = executor.when_all(&finished);
+    if (!finished) {
+        LOG_WARNING("migrate meta rowset keys failed: executor did not finish");
+        return -1;
+    }
+
+    for (int ret : results) {
+        if (ret < 0) {
+            LOG_WARNING("migrate meta rowset keys failed with error").tag("error", ret);
+            return -1;
         }
     }
 
@@ -1497,32 +1661,53 @@ int MigrateExecutor::migrate_tablet_stats_keys() {
         return -1;
     }
 
-    int total_keys = 0;
-    int migrated_keys = 0;
-    int skipped_keys = 0;
+    std::atomic<int> total_keys {0};
+    std::atomic<int> migrated_keys {0};
+    std::atomic<int> skipped_keys {0};
     StopWatch stop_watch;
 
     DORIS_CLOUD_DEFER {
         LOG_INFO("migrate tablet stats keys finished")
-                .tag("total", total_keys)
-                .tag("migrated", migrated_keys)
-                .tag("skipped", skipped_keys)
+                .tag("total", total_keys.load())
+                .tag("migrated", migrated_keys.load())
+                .tag("skipped", skipped_keys.load())
                 .tag("cost(s)", stop_watch.elapsed_seconds());
     };
 
-    for (int64_t tablet_id : tablet_ids) {
-        total_keys++;
+    SyncExecutor<int> executor(migration_pool_,
+                               fmt::format("migrate_tablet_stats_keys instance {}", instance_id_),
+                               [](int r) { return r < 0; });
 
-        int result = retry_if_txn_conflict(&MigrateExecutor::migrate_tablet_stats_key, tablet_id);
-        if (result == 0) {
-            migrated_keys++;
-        } else if (result == 1) {
-            skipped_keys++;
-        } else {
-            LOG_WARNING("failed to migrate tablet stats").tag("tablet_id", tablet_id);
+    for (int64_t tablet_id : tablet_ids) {
+        executor.add([this, tablet_id, &total_keys, &migrated_keys, &skipped_keys]() -> int {
+            total_keys.fetch_add(1);
+            int result =
+                    retry_if_txn_conflict(&MigrateExecutor::migrate_tablet_stats_key, tablet_id);
+            if (result == 0) {
+                migrated_keys.fetch_add(1);
+            } else if (result == 1) {
+                skipped_keys.fetch_add(1);
+            } else {
+                LOG_WARNING("failed to migrate tablet stats").tag("tablet_id", tablet_id);
+            }
+            return result;
+        });
+    }
+
+    bool finished = true;
+    auto results = executor.when_all(&finished);
+    if (!finished) {
+        LOG_WARNING("migrate tablet stats keys failed: executor did not finish");
+        return -1;
+    }
+
+    for (int ret : results) {
+        if (ret < 0) {
+            LOG_WARNING("migrate tablet stats keys failed with error").tag("error", ret);
             return -1;
         }
     }
+
     return 0;
 }
 
@@ -1669,7 +1854,7 @@ int SnapshotManager::migrate_to_versioned_keys(InstanceDataMigrator* migrator) {
     std::string instance_id(migrator->instance_id());
     const InstanceInfoPB& instance = migrator->instance_info();
     AnnotateTag instance_tag("instance", instance_id);
-    MigrateExecutor executor(instance_id, txn_kv_);
+    MigrateExecutor executor(instance_id, txn_kv_, migrate_pool_);
 
     // ATTN: Order matters, some key sets depend on others being migrated first.
     //

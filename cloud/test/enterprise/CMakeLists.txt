@@ -23,3 +23,6 @@ target_link_libraries(enterprise_snapshot_chain_compactor_test ${TEST_LINK_LIBS}
 
 add_executable(enterprise_recycle_snapshot_test recycle_snapshot_test.cpp)
 target_link_libraries(enterprise_recycle_snapshot_test ${TEST_LINK_LIBS})
+
+add_executable(enterprise_snapshot_parallelization_test snapshot_parallelization_test.cpp)
+target_link_libraries(enterprise_snapshot_parallelization_test ${TEST_LINK_LIBS})

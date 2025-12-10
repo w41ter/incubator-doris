@@ -7,6 +7,7 @@
 #include <string_view>
 #include <thread>
 
+#include "common/config.h"
 #include "common/defer.h"
 #include "common/logging.h"
 #include "common/stopwatch.h"
@@ -21,6 +22,7 @@
 #include "meta-store/txn_kv.h"
 #include "meta-store/txn_kv_error.h"
 #include "meta-store/versioned_value.h"
+#include "recycler/sync_executor.h"
 #include "snapshot_manager.h"
 
 using namespace doris::cloud;
@@ -35,12 +37,14 @@ class CompactExecutor {
 public:
     CompactExecutor(const std::string& instance_id, const std::string& source_instance_id,
                     const std::string& source_snapshot_id, const Versionstamp snapshot_versionstamp,
-                    std::shared_ptr<TxnKv> txn_kv)
+                    std::shared_ptr<TxnKv> txn_kv,
+                    std::shared_ptr<SimpleThreadPool> compaction_pool)
             : instance_id_(instance_id),
               source_instance_id_(source_instance_id),
               source_snapshot_id_(source_snapshot_id),
               snapshot_versionstamp_(snapshot_versionstamp),
-              txn_kv_(std::move(txn_kv)) {}
+              txn_kv_(std::move(txn_kv)),
+              compaction_pool_(std::move(compaction_pool)) {}
     ~CompactExecutor() = default;
 
     // Compact table version keys
@@ -202,6 +206,7 @@ private:
     const std::string source_snapshot_id_;
     const Versionstamp snapshot_versionstamp_;
     std::shared_ptr<TxnKv> txn_kv_;
+    std::shared_ptr<SimpleThreadPool> compaction_pool_;
 };
 
 int CompactExecutor::compact_table_version_keys() {
@@ -213,32 +218,54 @@ int CompactExecutor::compact_table_version_keys() {
         return -1;
     }
 
-    int total_keys = 0;
-    int compacted_keys = 0;
-    int skipped_keys = 0;
+    std::atomic<int> total_keys {0};
+    std::atomic<int> compacted_keys {0};
+    std::atomic<int> skipped_keys {0};
     StopWatch stop_watch;
 
     DORIS_CLOUD_DEFER {
         LOG_INFO("compact table version keys finished")
-                .tag("total", total_keys)
-                .tag("compacted", compacted_keys)
-                .tag("skipped", skipped_keys)
+                .tag("total", total_keys.load())
+                .tag("compacted", compacted_keys.load())
+                .tag("skipped", skipped_keys.load())
                 .tag("cost(s)", stop_watch.elapsed_seconds());
     };
 
-    for (int64_t table_id : table_ids) {
-        total_keys++;
+    SyncExecutor<int> executor(compaction_pool_,
+                               fmt::format("compact_table_version_keys instance {}", instance_id_),
+                               [](int r) { return r < 0; } // Cancel on error
+    );
 
-        int result = retry_if_txn_conflict(&CompactExecutor::compact_table_version_key, table_id);
-        if (result == 0) {
-            compacted_keys++;
-        } else if (result == 1) {
-            skipped_keys++;
-        } else {
-            LOG_WARNING("failed to compact table version key").tag("table_id", table_id);
+    for (int64_t table_id : table_ids) {
+        executor.add([this, table_id, &total_keys, &compacted_keys, &skipped_keys]() -> int {
+            total_keys.fetch_add(1);
+            int result =
+                    retry_if_txn_conflict(&CompactExecutor::compact_table_version_key, table_id);
+            if (result == 0) {
+                compacted_keys.fetch_add(1);
+            } else if (result == 1) {
+                skipped_keys.fetch_add(1);
+            } else {
+                LOG_WARNING("failed to compact table version key").tag("table_id", table_id);
+            }
+            return result;
+        });
+    }
+
+    bool finished = true;
+    auto results = executor.when_all(&finished);
+    if (!finished) {
+        LOG_WARNING("compact table version keys failed: executor did not finish");
+        return -1;
+    }
+
+    for (int ret : results) {
+        if (ret < 0) {
+            LOG_WARNING("compact table version keys failed with error").tag("error", ret);
             return -1;
         }
     }
+
     return 0;
 }
 
@@ -251,32 +278,53 @@ int CompactExecutor::compact_partition_keys() {
         return -1;
     }
 
-    int total_keys = 0;
-    int compacted_keys = 0;
-    int skipped_keys = 0;
+    std::atomic<int> total_keys {0};
+    std::atomic<int> compacted_keys {0};
+    std::atomic<int> skipped_keys {0};
     StopWatch stop_watch;
 
     DORIS_CLOUD_DEFER {
         LOG_INFO("compact partition keys finished")
-                .tag("total", total_keys)
-                .tag("compacted", compacted_keys)
-                .tag("skipped", skipped_keys)
+                .tag("total", total_keys.load())
+                .tag("compacted", compacted_keys.load())
+                .tag("skipped", skipped_keys.load())
                 .tag("cost(s)", stop_watch.elapsed_seconds());
     };
 
-    for (int64_t partition_id : partition_ids) {
-        total_keys++;
+    SyncExecutor<int> executor(compaction_pool_,
+                               fmt::format("compact_partition_keys instance {}", instance_id_),
+                               [](int r) { return r < 0; });
 
-        int result = retry_if_txn_conflict(&CompactExecutor::compact_partition_key, partition_id);
-        if (result == 0) {
-            compacted_keys++;
-        } else if (result == 1) {
-            skipped_keys++;
-        } else {
-            LOG_WARNING("failed to compact partition key").tag("partition_id", partition_id);
+    for (int64_t partition_id : partition_ids) {
+        executor.add([this, partition_id, &total_keys, &compacted_keys, &skipped_keys]() -> int {
+            total_keys.fetch_add(1);
+            int result =
+                    retry_if_txn_conflict(&CompactExecutor::compact_partition_key, partition_id);
+            if (result == 0) {
+                compacted_keys.fetch_add(1);
+            } else if (result == 1) {
+                skipped_keys.fetch_add(1);
+            } else {
+                LOG_WARNING("failed to compact partition key").tag("partition_id", partition_id);
+            }
+            return result;
+        });
+    }
+
+    bool finished = true;
+    auto results = executor.when_all(&finished);
+    if (!finished) {
+        LOG_WARNING("compact partition keys failed: executor did not finish");
+        return -1;
+    }
+
+    for (int ret : results) {
+        if (ret < 0) {
+            LOG_WARNING("compact partition keys failed with error").tag("error", ret);
             return -1;
         }
     }
+
     return 0;
 }
 
@@ -289,32 +337,52 @@ int CompactExecutor::compact_index_keys() {
         return -1;
     }
 
-    int total_keys = 0;
-    int compacted_keys = 0;
-    int skipped_keys = 0;
+    std::atomic<int> total_keys {0};
+    std::atomic<int> compacted_keys {0};
+    std::atomic<int> skipped_keys {0};
     StopWatch stop_watch;
 
     DORIS_CLOUD_DEFER {
         LOG_INFO("compact index keys finished")
-                .tag("total", total_keys)
-                .tag("compacted", compacted_keys)
-                .tag("skipped", skipped_keys)
+                .tag("total", total_keys.load())
+                .tag("compacted", compacted_keys.load())
+                .tag("skipped", skipped_keys.load())
                 .tag("cost(s)", stop_watch.elapsed_seconds());
     };
 
-    for (int64_t index_id : index_ids) {
-        total_keys++;
+    SyncExecutor<int> executor(compaction_pool_,
+                               fmt::format("compact_index_keys instance {}", instance_id_),
+                               [](int r) { return r < 0; });
 
-        int result = retry_if_txn_conflict(&CompactExecutor::compact_index_key, index_id);
-        if (result == 0) {
-            compacted_keys++;
-        } else if (result == 1) {
-            skipped_keys++;
-        } else {
-            LOG_WARNING("failed to compact index key").tag("index_id", index_id);
+    for (int64_t index_id : index_ids) {
+        executor.add([this, index_id, &total_keys, &compacted_keys, &skipped_keys]() -> int {
+            total_keys.fetch_add(1);
+            int result = retry_if_txn_conflict(&CompactExecutor::compact_index_key, index_id);
+            if (result == 0) {
+                compacted_keys.fetch_add(1);
+            } else if (result == 1) {
+                skipped_keys.fetch_add(1);
+            } else {
+                LOG_WARNING("failed to compact index key").tag("index_id", index_id);
+            }
+            return result;
+        });
+    }
+
+    bool finished = true;
+    auto results = executor.when_all(&finished);
+    if (!finished) {
+        LOG_WARNING("compact index keys failed: executor did not finish");
+        return -1;
+    }
+
+    for (int ret : results) {
+        if (ret < 0) {
+            LOG_WARNING("compact index keys failed with error").tag("error", ret);
             return -1;
         }
     }
+
     return 0;
 }
 
@@ -327,32 +395,52 @@ int CompactExecutor::compact_tablet_keys() {
         return -1;
     }
 
-    int total_keys = 0;
-    int compacted_keys = 0;
-    int skipped_keys = 0;
+    std::atomic<int> total_keys {0};
+    std::atomic<int> compacted_keys {0};
+    std::atomic<int> skipped_keys {0};
     StopWatch stop_watch;
 
     DORIS_CLOUD_DEFER {
         LOG_INFO("compact tablet keys finished")
-                .tag("total", total_keys)
-                .tag("compacted", compacted_keys)
-                .tag("skipped", skipped_keys)
+                .tag("total", total_keys.load())
+                .tag("compacted", compacted_keys.load())
+                .tag("skipped", skipped_keys.load())
                 .tag("cost(s)", stop_watch.elapsed_seconds());
     };
 
-    for (int64_t tablet_id : tablet_ids) {
-        total_keys++;
+    SyncExecutor<int> executor(compaction_pool_,
+                               fmt::format("compact_tablet_keys instance {}", instance_id_),
+                               [](int r) { return r < 0; });
 
-        int result = retry_if_txn_conflict(&CompactExecutor::compact_tablet_key, tablet_id);
-        if (result == 0) {
-            compacted_keys++;
-        } else if (result == 1) {
-            skipped_keys++;
-        } else {
-            LOG_WARNING("failed to compact tablet key").tag("tablet_id", tablet_id);
+    for (int64_t tablet_id : tablet_ids) {
+        executor.add([this, tablet_id, &total_keys, &compacted_keys, &skipped_keys]() -> int {
+            total_keys.fetch_add(1);
+            int result = retry_if_txn_conflict(&CompactExecutor::compact_tablet_key, tablet_id);
+            if (result == 0) {
+                compacted_keys.fetch_add(1);
+            } else if (result == 1) {
+                skipped_keys.fetch_add(1);
+            } else {
+                LOG_WARNING("failed to compact tablet key").tag("tablet_id", tablet_id);
+            }
+            return result;
+        });
+    }
+
+    bool finished = true;
+    auto results = executor.when_all(&finished);
+    if (!finished) {
+        LOG_WARNING("compact tablet keys failed: executor did not finish");
+        return -1;
+    }
+
+    for (int ret : results) {
+        if (ret < 0) {
+            LOG_WARNING("compact tablet keys failed with error").tag("error", ret);
             return -1;
         }
     }
+
     return 0;
 }
 
@@ -366,12 +454,34 @@ int CompactExecutor::compact_rowset_keys() {
         return -1;
     }
 
+    SyncExecutor<int> executor(compaction_pool_,
+                               fmt::format("compact_rowset_keys instance {}", instance_id_),
+                               [](int r) { return r < 0; });
+
     for (int64_t tablet_id : tablet_ids) {
-        int result = retry_if_txn_conflict(&CompactExecutor::compact_rowset_key, tablet_id);
-        if (result != 0 && result != 1) {
+        executor.add([this, tablet_id]() -> int {
+            int result = retry_if_txn_conflict(&CompactExecutor::compact_rowset_key, tablet_id);
+            if (result != 0 && result != 1) {
+                LOG_WARNING("failed to compact rowset key").tag("tablet_id", tablet_id);
+            }
+            return result;
+        });
+    }
+
+    bool finished = true;
+    auto results = executor.when_all(&finished);
+    if (!finished) {
+        LOG_WARNING("compact rowset keys failed: executor did not finish");
+        return -1;
+    }
+
+    for (int ret : results) {
+        if (ret < 0) {
+            LOG_WARNING("compact rowset keys failed with error").tag("error", ret);
             return -1;
         }
     }
+
     return 0;
 }
 
@@ -1528,7 +1638,8 @@ int SnapshotManager::compact_snapshot_chains(InstanceChainCompactor* compactor) 
 
     AnnotateTag instance_tag("instance", instance_id);
     CompactExecutor executor(instance_id, instance.source_instance_id(),
-                             instance.source_snapshot_id(), snapshot_versionstamp, txn_kv_);
+                             instance.source_snapshot_id(), snapshot_versionstamp, txn_kv_,
+                             compact_pool_);
     KeySetType key_sets_to_compact[] = {
             MULTI_VERSION_TABLE_VERSION,
             MULTI_VERSION_PARTITION_VERSION /*MULTI_VERSION_META_PARTITION, MULTI_VERSION_INDEX_PARTITION*/

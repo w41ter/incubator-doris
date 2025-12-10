@@ -13,7 +13,7 @@ class SnapshotManager : public doris::cloud::SnapshotManager {
     using TxnKv = doris::cloud::TxnKv;
 
 public:
-    using doris::cloud::SnapshotManager::SnapshotManager;
+    SnapshotManager(std::shared_ptr<TxnKv> txn_kv);
     ~SnapshotManager() override = default;
 
     void begin_snapshot(std::string_view instance_id,
@@ -64,6 +64,10 @@ public:
     int migrate_to_versioned_keys(doris::cloud::InstanceDataMigrator* migrator) override;
 
     int compact_snapshot_chains(doris::cloud::InstanceChainCompactor* compactor) override;
+
+#ifdef BE_TEST
+    void start_pools_for_test();
+#endif
 
 private:
     // Validation functions
@@ -141,6 +145,10 @@ private:
             doris::cloud::Transaction* txn, const std::string& from_instance_key,
             doris::cloud::InstanceInfoPB* from_instance_info, const std::string& new_instance_id,
             std::string* error_msg);
+
+    // Thread pools for snapshot operations (shared across all instances)
+    std::shared_ptr<doris::cloud::SimpleThreadPool> compact_pool_;
+    std::shared_ptr<doris::cloud::SimpleThreadPool> migrate_pool_;
 };
 
 } // namespace selectdb

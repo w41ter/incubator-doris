@@ -8,7 +8,9 @@
 #include <numeric>
 #include <string_view>
 
+#include "common/config.h"
 #include "common/encryption_util.h"
+#include "common/simple_thread_pool.h"
 #include "common/util.h"
 #include "meta-service/meta_service_helper.h"
 #include "meta-store/keys.h"
@@ -21,6 +23,19 @@ using namespace doris::cloud;
 namespace versioned = doris::cloud::versioned;
 
 namespace selectdb {
+
+SnapshotManager::SnapshotManager(std::shared_ptr<TxnKv> txn_kv)
+        : doris::cloud::SnapshotManager(std::move(txn_kv)) {
+    compact_pool_ = std::make_shared<SimpleThreadPool>(config::snapshot_compact_parallelism);
+    migrate_pool_ = std::make_shared<SimpleThreadPool>(config::snapshot_migrate_parallelism);
+}
+
+#ifdef BE_TEST
+void SnapshotManager::start_pools_for_test() {
+    compact_pool_->start();
+    migrate_pool_->start();
+}
+#endif
 
 static constexpr std::string_view SNAPSHOT_PREFIX = "snapshot";
 
