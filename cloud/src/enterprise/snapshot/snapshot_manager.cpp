@@ -28,14 +28,15 @@ SnapshotManager::SnapshotManager(std::shared_ptr<TxnKv> txn_kv)
         : doris::cloud::SnapshotManager(std::move(txn_kv)) {
     compact_pool_ = std::make_shared<SimpleThreadPool>(config::snapshot_compact_parallelism);
     migrate_pool_ = std::make_shared<SimpleThreadPool>(config::snapshot_migrate_parallelism);
+    start_pools();
 }
 
-#ifdef BE_TEST
-void SnapshotManager::start_pools_for_test() {
-    compact_pool_->start();
-    migrate_pool_->start();
+void SnapshotManager::start_pools() {
+    std::call_once(pools_start_flag_, [this]() {
+        compact_pool_->start();
+        migrate_pool_->start();
+    });
 }
-#endif
 
 static constexpr std::string_view SNAPSHOT_PREFIX = "snapshot";
 

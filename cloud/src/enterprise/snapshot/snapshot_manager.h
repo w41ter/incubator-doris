@@ -2,6 +2,8 @@
 
 #include <gen_cpp/cloud.pb.h>
 
+#include <mutex>
+
 #include "meta-store/txn_kv.h"
 #include "recycler/recycler.h"
 #include "recycler/storage_vault_accessor.h"
@@ -65,11 +67,9 @@ public:
 
     int compact_snapshot_chains(doris::cloud::InstanceChainCompactor* compactor) override;
 
-#ifdef BE_TEST
-    void start_pools_for_test();
-#endif
-
 private:
+    void start_pools();
+
     // Validation functions
     doris::cloud::MetaServiceCode validate_clone_request(
             const doris::cloud::CloneInstanceRequest& request, std::string* error_msg);
@@ -149,6 +149,7 @@ private:
     // Thread pools for snapshot operations (shared across all instances)
     std::shared_ptr<doris::cloud::SimpleThreadPool> compact_pool_;
     std::shared_ptr<doris::cloud::SimpleThreadPool> migrate_pool_;
+    std::once_flag pools_start_flag_;
 };
 
 } // namespace selectdb

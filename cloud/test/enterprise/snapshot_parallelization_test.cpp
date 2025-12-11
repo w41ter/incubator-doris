@@ -418,8 +418,6 @@ protected:
         return info;
     }
 
-    void start_pools(selectdb::SnapshotManager* manager) { manager->start_pools_for_test(); }
-
     void persist_instance_info(const InstanceInfoPB& info) {
         std::unique_ptr<Transaction> txn;
         ASSERT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
@@ -724,7 +722,6 @@ void validate_migration_output(Transaction* txn, const std::string& instance_id,
 
 TEST_F(SnapshotParallelizationTest, CompactExecutorCorrectnessAndPerformance) {
     selectdb::SnapshotManager manager(txn_kv);
-    start_pools(&manager);
 
     InstanceInfoPB instance_info = make_compact_instance();
     InstanceChainCompactor compactor(txn_kv, instance_info);
@@ -745,7 +742,6 @@ TEST_F(SnapshotParallelizationTest, CompactExecutorCorrectnessAndPerformance) {
 
 TEST_F(SnapshotParallelizationTest, MigrateExecutorCorrectnessAndPerformance) {
     selectdb::SnapshotManager manager(txn_kv);
-    start_pools(&manager);
 
     InstanceInfoPB instance_info = make_migrate_instance();
     InstanceDataMigrator migrator(txn_kv, instance_info);
@@ -857,7 +853,6 @@ TEST_F(SnapshotParallelizationStressTest, MigrateKeySetsStress) {
             InstanceInfoPB instance = make_stress_migrate_instance(instance_id, target_set);
             persist_instance_info(kv, instance);
             selectdb::SnapshotManager manager(kv);
-            manager.start_pools_for_test();
             InstanceDataMigrator migrator(kv, instance);
 
             auto start = std::chrono::steady_clock::now();
@@ -924,7 +919,6 @@ TEST_F(SnapshotParallelizationStressTest, CompactKeySetsStress) {
                         TxnErrorCode::TXN_OK);
             }
             selectdb::SnapshotManager manager(kv);
-            manager.start_pools_for_test();
             InstanceChainCompactor compactor(kv, instance);
 
             auto start = std::chrono::steady_clock::now();
