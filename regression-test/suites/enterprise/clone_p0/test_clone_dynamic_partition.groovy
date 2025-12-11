@@ -66,7 +66,7 @@ suite("test_clone_dynamic_partition", "snapshot,docker") {
 
     def drop_catalog_recycle_bin = {
         def res = sql_return_maparray "show catalog recycle bin"
-        for (int i = 0; i < res.size; i++) {
+        for (int i = 0; i < res.size(); i++) {
             if (res[i]['PartitionId'] != '') {
                 sql "drop catalog recycle bin where 'partitionId' = ${res[i]['PartitionId']} "
             }
@@ -88,6 +88,10 @@ suite("test_clone_dynamic_partition", "snapshot,docker") {
                     "dynamic_partition_check_interval_seconds=2",
                     "catalog_trash_expire_second=1"
             ],
+            beConfigs: [
+                "delete_bitmap_store_write_version=3",
+                "delete_bitmap_store_read_version=3",
+            ],
             msConfigs: [
                     "enable_split_rowset_meta=true",
                     "enable_split_tablet_schema_pb=true",
@@ -103,6 +107,10 @@ suite("test_clone_dynamic_partition", "snapshot,docker") {
             cloudMode: true, feNum: 1, beNum: 1, msNum: 0,
             instanceId: "derived_instance_id",
             externalMsCluster: base_name,
+            beConfigs: [
+                "delete_bitmap_store_write_version=3",
+                "delete_bitmap_store_read_version=3",
+            ],
             feConfigs: [
                     "enable_debug_points=true",
                     "dynamic_partition_check_interval_seconds=2",

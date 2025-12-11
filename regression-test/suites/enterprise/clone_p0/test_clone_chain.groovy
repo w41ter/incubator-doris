@@ -122,6 +122,10 @@ suite("test_clone_chain", "snapshot,docker") {
     def cluster_1_opt = new ClusterOptions(
         cloudMode: true, feNum: 1, beNum: 1, msNum: 1,
         instanceId: "cluster_1_instance_id",
+        beConfigs: [
+            "delete_bitmap_store_write_version=3",
+            "delete_bitmap_store_read_version=3",
+        ],
         msConfigs: [
             "enable_split_rowset_meta=true",
             "enable_split_tablet_schema_pb=true",
@@ -139,6 +143,10 @@ suite("test_clone_chain", "snapshot,docker") {
         cloudMode: true, feNum: 1, beNum: 1, msNum: 0,
         instanceId: "cluster_2_instance_id",
         externalMsCluster: cluster_1,
+        beConfigs: [
+            "delete_bitmap_store_write_version=3",
+            "delete_bitmap_store_read_version=3",
+        ],
         msConfigs: [
             "enable_split_rowset_meta=true",
             "enable_split_tablet_schema_pb=true",
@@ -150,6 +158,10 @@ suite("test_clone_chain", "snapshot,docker") {
         cloudMode: true, feNum: 1, beNum: 1, msNum: 0,
         instanceId: "cluster_3_instance_id",
         externalMsCluster: cluster_1,
+        beConfigs: [
+            "delete_bitmap_store_write_version=3",
+            "delete_bitmap_store_read_version=3",
+        ],
         msConfigs: [
             "enable_split_rowset_meta=true",
             "enable_split_tablet_schema_pb=true",

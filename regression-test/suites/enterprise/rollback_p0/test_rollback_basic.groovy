@@ -46,6 +46,10 @@ suite("test_rollback_basic", "snapshot,docker") {
     def opt = new ClusterOptions(
         cloudMode: true, feNum: 1, beNum: 1, msNum: 1,
         instanceId: "old_instance_id",
+        beConfigs: [
+            "delete_bitmap_store_write_version=3",
+            "delete_bitmap_store_read_version=3",
+        ],
         msConfigs: [
             "enable_split_rowset_meta=true",
             "enable_split_tablet_schema_pb=true",

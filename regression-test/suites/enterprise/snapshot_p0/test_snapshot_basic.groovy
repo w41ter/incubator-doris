@@ -63,6 +63,10 @@ suite("test_snapshot_basic", "snapshot,docker") {
         feConfigs: [
             "cloud_auto_snapshot_min_interval_seconds=5",
         ],
+        beConfigs: [
+            "delete_bitmap_store_write_version=3",
+            "delete_bitmap_store_read_version=3",
+        ],
         msConfigs: [
             "enable_split_rowset_meta=true",
             "enable_split_tablet_schema_pb=true",

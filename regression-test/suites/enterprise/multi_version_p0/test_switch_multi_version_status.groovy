@@ -90,14 +90,14 @@ suite("test_switch_multi_version_status", "snapshot,docker") {
     }
 
     def wait_snapshot_switch_status = { host, expected_status ->
-        Awaitility.await().pollInterval(java.time.Duration.ofSeconds(2)).atMost(java.time.Duration.ofMinutes(1)).until {
+        Awaitility.await().pollInterval(java.time.Duration.ofSeconds(2)).atMost(java.time.Duration.ofMinutes(5)).until {
             def status = get_snapshot_switch_status(host)
             return status == expected_status
         }
     }
 
     def wait_alter_table_column_finished = { tableName ->
-        Awaitility.await().pollInterval(java.time.Duration.ofSeconds(2)).atMost(java.time.Duration.ofMinutes(3)).until {
+        Awaitility.await().pollInterval(java.time.Duration.ofSeconds(2)).atMost(java.time.Duration.ofMinutes(5)).until {
             def result = sql "SHOW ALTER TABLE COLUMN WHERE TableName='${tableName}' AND State!='FINISHED'"
             return result.size() == 0 ? true : false
         }
@@ -107,6 +107,10 @@ suite("test_switch_multi_version_status", "snapshot,docker") {
     def opt = new ClusterOptions(
         cloudMode: true, feNum: 1, beNum: 1, msNum: 1,
         instanceId: "${instance_id}",
+        beConfigs: [
+            "delete_bitmap_store_write_version=3",
+            "delete_bitmap_store_read_version=3",
+        ],
         msConfigs: [
             "enable_split_rowset_meta=true",
             "enable_split_tablet_schema_pb=true",

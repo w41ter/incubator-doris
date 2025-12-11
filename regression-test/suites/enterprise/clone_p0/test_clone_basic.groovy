@@ -57,6 +57,10 @@ suite("test_clone_basic", "snapshot,docker") {
     def base_opt = new ClusterOptions(
         cloudMode: true, feNum: 1, beNum: 1, msNum: 1,
         instanceId: "base_instance_id",
+        beConfigs: [
+            "delete_bitmap_store_write_version=3",
+            "delete_bitmap_store_read_version=3",
+        ],
         msConfigs: [
             "enable_split_rowset_meta=true",
             "enable_split_tablet_schema_pb=true",
@@ -73,6 +77,10 @@ suite("test_clone_basic", "snapshot,docker") {
         cloudMode: true, feNum: 1, beNum: 1, msNum: 0,
         instanceId: "derived_instance_id",
         externalMsCluster: base_name,
+        beConfigs: [
+            "delete_bitmap_store_write_version=3",
+            "delete_bitmap_store_read_version=3",
+        ],
         msConfigs: [
             "enable_split_rowset_meta=true",
             "enable_split_tablet_schema_pb=true",

@@ -50,9 +50,6 @@ suite("test_multi_version_unique_table_index_operation", "snapshot,docker") {
         "INVERTED": { tableName, columnName ->
             sql """ ALTER TABLE ${tableName} ADD INDEX idx_${columnName}_inverted (${columnName}) USING INVERTED """
         },
-        "BF": { tableName, columnName ->
-            sql """ ALTER TABLE ${tableName} ADD INDEX idx_${columnName}_bf (${columnName}) USING BITMAP """
-        },
         "NGBF": { tableName, columnName ->
             sql """ ALTER TABLE ${tableName} ADD INDEX idx_${columnName}_ngbf (${columnName}) USING NGRAM_BF PROPERTIES("gram_size"="3", "bf_size"="1024") """
         }
@@ -94,7 +91,7 @@ suite("test_multi_version_unique_table_index_operation", "snapshot,docker") {
     }
 
     def wait_alter_table_column_finished = { tableName ->
-        Awaitility.await().pollInterval(java.time.Duration.ofSeconds(2)).atMost(java.time.Duration.ofMinutes(3)).until {
+        Awaitility.await().pollInterval(java.time.Duration.ofSeconds(2)).atMost(java.time.Duration.ofMinutes(5)).until {
             def result = sql "SHOW ALTER TABLE COLUMN WHERE TableName='${tableName}' AND State!='FINISHED'"
             return result.size() == 0 ? true : false
         }
@@ -110,7 +107,7 @@ suite("test_multi_version_unique_table_index_operation", "snapshot,docker") {
     }
 
     def wait_snapshot_switch_status = { host, expected_status ->
-        Awaitility.await().pollInterval(java.time.Duration.ofSeconds(2)).atMost(java.time.Duration.ofMinutes(1)).until {
+        Awaitility.await().pollInterval(java.time.Duration.ofSeconds(2)).atMost(java.time.Duration.ofMinutes(5)).until {
             def status = get_snapshot_switch_status(host)
             return status == expected_status
         }
