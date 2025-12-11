@@ -203,7 +203,8 @@ public class DemoMultiBackendsTest {
                 result.getRows().get(0).get(BackendsProcDir.TITLE_NAMES.size() - 8));
         Assert.assertEquals(
                 "{\"lastSuccessReportTabletsTime\":\"N/A\",\"lastStreamLoadTime\":-1,\"isQueryDisabled\":false,"
-                        + "\"isLoadDisabled\":false,\"isActive\":true,\"currentFragmentNum\":0,\"lastFragmentUpdateTime\":0}",
+                        + "\"isLoadDisabled\":false,\"isActive\":true,\"isShutdown\":false,\"currentFragmentNum\":0,"
+                        + "\"lastFragmentUpdateTime\":0}",
                 result.getRows().get(0).get(BackendsProcDir.TITLE_NAMES.size() - 5));
         Assert.assertEquals("0", result.getRows().get(0).get(BackendsProcDir.TITLE_NAMES.size() - 4));
         Assert.assertEquals(Tag.VALUE_MIX, result.getRows().get(0).get(BackendsProcDir.TITLE_NAMES.size() - 3));
