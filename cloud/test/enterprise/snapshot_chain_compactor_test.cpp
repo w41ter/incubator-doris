@@ -746,9 +746,20 @@ void drop_snapshot(MetaServiceProxy* meta_service, const std::string& cloud_uniq
 }
 
 void clone_instance(MetaServiceProxy* meta_service, const std::string& from_instance_id,
-                    const std::string& snapshot_id, const std::string& clone_instance_id) {
+                    const std::string& snapshot_id, const std::string& clone_instance_id,
+                    CloneInstanceRequest::CloneType clone_type = CloneInstanceRequest::READ_ONLY) {
     CloneInstanceRequest req;
-    req.set_clone_type(CloneInstanceRequest::READ_ONLY);
+    req.set_clone_type(clone_type);
+    if (clone_type == CloneInstanceRequest::WRITABLE) {
+        auto* obj_info = req.mutable_obj_info();
+        obj_info->set_id(next_rowset_id());
+        obj_info->set_ak("mock_ak");
+        obj_info->set_sk("mock_sk");
+        obj_info->set_endpoint("e");
+        obj_info->set_region("r");
+        obj_info->set_bucket("b");
+        obj_info->set_prefix("");
+    }
     req.set_from_instance_id(from_instance_id);
     req.set_from_snapshot_id(snapshot_id);
     req.set_new_instance_id(clone_instance_id);
@@ -842,11 +853,12 @@ void drop_instance(MetaServiceProxy* meta_service, const std::string& instance_i
     ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
 }
 
-void clone_and_refresh_instance(MetaServiceProxy* meta_service, ResourceManager* resource_manager,
-                                const std::string& from_instance_id,
-                                const std::string& from_snapshot_id,
-                                const std::string& to_instance_id, InstanceInfoPB& to_instance) {
-    clone_instance(meta_service, from_instance_id, from_snapshot_id, to_instance_id);
+void clone_and_refresh_instance(
+        MetaServiceProxy* meta_service, ResourceManager* resource_manager,
+        const std::string& from_instance_id, const std::string& from_snapshot_id,
+        const std::string& to_instance_id, InstanceInfoPB& to_instance,
+        CloneInstanceRequest::CloneType clone_type = CloneInstanceRequest::READ_ONLY) {
+    clone_instance(meta_service, from_instance_id, from_snapshot_id, to_instance_id, clone_type);
     update_snapshot_properties(meta_service, to_instance_id, true, 0, 3660);
     std::string cloud_unique_id = fmt::format("1:{}:0", to_instance_id);
     get_instance(meta_service, cloud_unique_id, to_instance);
@@ -1970,7 +1982,9 @@ private:
     brpc::Server server;
 };
 
-TEST(SnapshotChainCompactorTest, CompactMultiChain) {
+void test_compact_multi_chain(CloneInstanceRequest::CloneType instance2_clone_type,
+                              CloneInstanceRequest::CloneType instance3_clone_type,
+                              CloneInstanceRequest::CloneType instance4_clone_type) {
     config::force_immediate_recycle = true;
     auto meta_service = get_meta_service();
     auto resource_mgr = meta_service->resource_mgr();
@@ -2039,7 +2053,8 @@ TEST(SnapshotChainCompactorTest, CompactMultiChain) {
     InstanceInfoPB instance_info2;
     {
         clone_and_refresh_instance(meta_service.get(), resource_mgr.get(), instance_id,
-                                   ctx1.snapshot_id, instance_id2, instance_info2);
+                                   ctx1.snapshot_id, instance_id2, instance_info2,
+                                   instance2_clone_type);
         // Phase 2.1: snapshot2
         begin_and_commit_snapshot(meta_service.get(), cloud_unique_id2, ctx2);
         // Phase 2.2: compact version 2-6
@@ -2053,7 +2068,8 @@ TEST(SnapshotChainCompactorTest, CompactMultiChain) {
     InstanceInfoPB instance_info3;
     {
         clone_and_refresh_instance(meta_service.get(), resource_mgr.get(), instance_id2,
-                                   ctx2.snapshot_id, instance_id3, instance_info3);
+                                   ctx2.snapshot_id, instance_id3, instance_info3,
+                                   instance3_clone_type);
 
         std::vector<doris::RowsetMetaCloudPB> rowsets;
         get_rowsets(meta_service.get(), cloud_unique_id3, tablet_id, 0, 6, rowsets);
@@ -2071,7 +2087,8 @@ TEST(SnapshotChainCompactorTest, CompactMultiChain) {
     InstanceInfoPB instance_info4;
     {
         clone_and_refresh_instance(meta_service.get(), resource_mgr.get(), instance_id3,
-                                   ctx3.snapshot_id, instance_id4, instance_info4);
+                                   ctx3.snapshot_id, instance_id4, instance_info4,
+                                   instance4_clone_type);
 
         std::vector<doris::RowsetMetaCloudPB> rowsets;
         get_rowsets(meta_service.get(), cloud_unique_id4, tablet_id, 0, 6, rowsets);
@@ -2214,4 +2231,15 @@ TEST(SnapshotChainCompactorTest, CompactMultiChain) {
             ASSERT_FALSE(list_iter->has_next());
         }
     }
+}
+
+TEST(SnapshotChainCompactorTest, CompactMultiChain) {
+    test_compact_multi_chain(CloneInstanceRequest::READ_ONLY, CloneInstanceRequest::READ_ONLY,
+                             CloneInstanceRequest::READ_ONLY);
+    test_compact_multi_chain(CloneInstanceRequest::ROLLBACK, CloneInstanceRequest::ROLLBACK,
+                             CloneInstanceRequest::ROLLBACK);
+    test_compact_multi_chain(CloneInstanceRequest::ROLLBACK, CloneInstanceRequest::READ_ONLY,
+                             CloneInstanceRequest::ROLLBACK);
+    test_compact_multi_chain(CloneInstanceRequest::READ_ONLY, CloneInstanceRequest::ROLLBACK,
+                             CloneInstanceRequest::READ_ONLY);
 }
