@@ -51,17 +51,17 @@ suite("test_lease_compaction") {
     def updateBeConf = { backend_ip, backend_http_port, key, value ->
         String command = "curl -X POST http://${backend_ip}:${backend_http_port}/api/update_config?${key}=${value}"
         logger.info(command)
-        process = command.execute()
-        code = process.waitFor()
+        def process = command.execute()
+        def code = process.waitFor()
         assertEquals(code, 0)
     }
     def injectionPoint = { backend_ip, backend_http_port, args ->
         String command = "curl -X GET http://${backend_ip}:${backend_http_port}/api/injection_point/${args}"
         logger.info(command)
-        process = command.execute()
-        code = process.waitFor()
+        def process = command.execute()
+        def code = process.waitFor()
         assertEquals(0, code)
-        out = process.getText()
+        def out = process.getText()
         assertEquals("OK", out)
     }
 
@@ -95,10 +95,10 @@ suite("test_lease_compaction") {
 
             String command = sb.toString()
             logger.info(command)
-            process = command.execute()
-            code = process.waitFor()
-            err = IOGroovyMethods.getText(new BufferedReader(new InputStreamReader(process.getErrorStream())));
-            out = process.getText()
+            def process = command.execute()
+            def code = process.waitFor()
+            def err = IOGroovyMethods.getText(new BufferedReader(new InputStreamReader(process.getErrorStream())));
+            def out = process.getText()
             logger.info("Run compaction: code=" + code + ", out=" + out + ", err=" + err)
             assertEquals(code, 0)
             return out
@@ -116,9 +116,9 @@ suite("test_lease_compaction") {
 
                 String command = sb.toString()
                 logger.info(command)
-                process = command.execute()
-                code = process.waitFor()
-                out = process.getText()
+                def process = command.execute()
+                def code = process.waitFor()
+                def out = process.getText()
                 logger.info("Get compaction status: code=" + code + ", out=" + out)
                 assertEquals(code, 0)
                 def compactionStatus = parseJson(out.trim())
