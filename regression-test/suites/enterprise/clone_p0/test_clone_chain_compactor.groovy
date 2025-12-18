@@ -19,6 +19,7 @@ import groovy.json.JsonOutput
 import org.apache.doris.regression.suite.ClusterOptions
 import org.apache.doris.regression.suite.SuiteCluster
 import org.awaitility.Awaitility
+import org.codehaus.groovy.runtime.IOGroovyMethods
 
 suite("test_clone_chain_compactor", "snapshot,docker") {
     // ATTN: This test only runs in cloud mode.
@@ -114,6 +115,41 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
         }
     }
 
+    def triggerCompaction = { be_host, be_http_port, compact_type, tablet_id ->
+        StringBuilder sb = new StringBuilder();
+        sb.append("curl -X POST http://${be_host}:${be_http_port}")
+        sb.append("/api/compaction/run?tablet_id=")
+        sb.append(tablet_id)
+        sb.append("&compact_type=${compact_type}")
+
+        String command = sb.toString()
+        logger.info(command)
+        def process = command.execute()
+        def code = process.waitFor()
+        def err = IOGroovyMethods.getText(new BufferedReader(new InputStreamReader(process.getErrorStream())));
+        def out = process.getText()
+        logger.info("Run compaction: code=" + code + ", out=" + out + ", err=" + err)
+        assertEquals(code, 0)
+        return out
+    }
+
+    def getTabletStatus = { ip, port, tablet_id ->
+        StringBuilder sb = new StringBuilder();
+        sb.append("curl -X GET http://${ip}:${port}")
+        sb.append("/api/compaction/show?tablet_id=")
+        sb.append(tablet_id)
+
+        String command = sb.toString()
+        logger.info(command)
+        def process = command.execute()
+        def code = process.waitFor()
+        def out = process.getText()
+        logger.info("Get tablet status:  =" + code + ", out=" + out)
+        assertEquals(code, 0)
+        def tabletStatus = parseJson(out.trim())
+        return tabletStatus
+    }
+
     def cluster_prefix = "regression_test_clone_chain_compactor_"
     def cluster_1 = cluster_prefix + "cluster_1"
     def cluster_2 = cluster_prefix + "cluster_2"
@@ -125,7 +161,10 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
         beConfigs: [
             "delete_bitmap_store_write_version=2",
             "delete_bitmap_store_read_version=2",
-            "delete_bitmap_store_v2_max_bytes_in_fdb=0"
+            "delete_bitmap_store_v2_max_bytes_in_fdb=0",
+            "vacuum_stale_rowsets_interval_s=1",
+            "tablet_rowset_stale_sweep_time_sec=0",
+            "compaction_promotion_version_count=3"
         ],
         msConfigs: [
             "enable_split_rowset_meta=true",
@@ -139,6 +178,8 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
             "recycler_sleep_before_scheduling_seconds=1",
             "enable_snapshot_data_migrator=true",
             "enable_snapshot_chain_compactor=true",
+            "retention_seconds=1",
+            "compacted_rowset_retention_seconds=1",
         ])
 
     def cluster_2_opt = new ClusterOptions(
@@ -148,7 +189,10 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
         beConfigs: [
             "delete_bitmap_store_write_version=2",
             "delete_bitmap_store_read_version=2",
-            "delete_bitmap_store_v2_max_bytes_in_fdb=0"
+            "delete_bitmap_store_v2_max_bytes_in_fdb=0",
+            "vacuum_stale_rowsets_interval_s=1",
+            "tablet_rowset_stale_sweep_time_sec=0",
+            "compaction_promotion_version_count=3"
         ],
         msConfigs: [
             "enable_split_rowset_meta=true",
@@ -164,7 +208,10 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
         beConfigs: [
             "delete_bitmap_store_write_version=2",
             "delete_bitmap_store_read_version=2",
-            "delete_bitmap_store_v2_max_bytes_in_fdb=0"
+            "delete_bitmap_store_v2_max_bytes_in_fdb=0",
+            "vacuum_stale_rowsets_interval_s=1",
+            "tablet_rowset_stale_sweep_time_sec=0",
+            "compaction_promotion_version_count=3"
         ],
         msConfigs: [
             "enable_split_rowset_meta=true",
@@ -175,6 +222,7 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
 
     def manual_init_clusters = [cluster_2, cluster_3].toSet()
     def cluster1_snapshot_id = ""
+    def cluster2_snapshot_id = ""
     dockers(["${cluster_1}": cluster_1_opt, "${cluster_2}": cluster_2_opt, "${cluster_3}": cluster_3_opt], manual_init_clusters) { clusters ->
         // Step 1: Create a snapshot in the base cluster
         String snapshot_id = ""
@@ -187,7 +235,7 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
                     name VARCHAR(100)
                 ) DUPLICATE KEY(id)
                 DISTRIBUTED BY HASH(id) BUCKETS 3
-                PROPERTIES ("replication_num" = "1")
+                PROPERTIES ("replication_num" = "1", "disable_auto_compaction" = "true")
             """
             for (int i = 0; i < 10; i++) {
                 sql "INSERT INTO test_table VALUES (${i}, 'cluster1_data_${i}')"
@@ -200,7 +248,7 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
                     name VARCHAR(100)
                 ) DUPLICATE KEY(id)
                 DISTRIBUTED BY HASH(id) BUCKETS 3
-                PROPERTIES ("replication_num" = "1")
+                PROPERTIES ("replication_num" = "1", "disable_auto_compaction" = "true")
             """
 
             // mow table
@@ -210,7 +258,7 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
                     name VARCHAR(100)
                 ) UNIQUE KEY(id)
                 DISTRIBUTED BY HASH(id) BUCKETS 3
-                PROPERTIES ("replication_num" = "1")
+                PROPERTIES ("replication_num" = "1", "disable_auto_compaction" = "true")
             """
             sql "INSERT INTO test_mow_table VALUES (1, 'cluster0_data')"
             sql "INSERT INTO test_mow_table VALUES (1, 'cluster1_data_1')"
@@ -248,6 +296,7 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
         clusters[cluster_2].init(cluster_2_opt, true)
 
         connectWithDockerCluster(clusters[cluster_2]) {
+            sql "set global enable_sql_cache = false"
             sql "USE test_db"
             def res = sql_return_maparray "SELECT * FROM test_table ORDER BY id"
             logger.info("Data in derived cluster after clone: " + res.toString())
@@ -271,11 +320,12 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
             sql "ADMIN CREATE CLUSTER SNAPSHOT PROPERTIES('ttl' = '3600', 'label' = 'snapshot_label')"
             wait_snapshot_completed(clusters[cluster_2], "snapshot_label")
             snapshot_id = get_snapshot_id("snapshot_label")
+            cluster2_snapshot_id = snapshot_id
 
             sql "INSERT INTO test_table VALUES (3, 'cluster2_new_data')"
         }
 
-        // Step 3: Restore the snapshot in the second derived cluster
+        // Step 3: Restore the snapshot in the cluster3
         cluster_snapshot_content = """
         {
             "from_snapshot_id": "${snapshot_id}",
@@ -295,11 +345,12 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
             }
         }
         """
-        logger.info("Setup derived cluster with snapshot: " + cluster_snapshot_content)
+        logger.info("Setup cluster3 with snapshot: " + cluster_snapshot_content)
         cluster_3_opt.clusterSnapshot = cluster_snapshot_content
         clusters[cluster_3].init(cluster_3_opt, true)
 
         connectWithDockerCluster(clusters[cluster_3]) {
+            sql "set global enable_sql_cache = false"
             sql "USE test_db"
             def res = sql_return_maparray "SELECT * FROM test_table ORDER BY id"
             logger.info("Data in derived cluster after clone: " + res.toString())
@@ -318,7 +369,7 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
             assertEquals(res[1]['name'], 'cluster1_data_2')
         }
 
-        // drop snapshot in instance1
+        // Step 4: drop snapshot in instance1 (means instance2 snapshot chain is compacted)
         connectWithDockerCluster(clusters[cluster_1]) {
             for (int i = 1; i <= 20; i++) {
                 try {
@@ -370,29 +421,16 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
             assertEquals(res[1]['name'], 'cluster1_data_2')
         }
 
-        // drop instance1
+        // Step 5: drop instance1
         drop_instance(msHttpPort, "cluster_1_instance_id")
 
-        // check instance1 is recycled
-        def recycled = false
-        for (int i = 1; i <= 20; i++) {
-            get_instance_api(msHttpPort, "cluster_1_instance_id") {
-                respCode, body ->
-                    log.info("get instance1 resp: ${body} ${respCode}".toString())
-                    def json = parseJson(body)
-                    if (json.code.equalsIgnoreCase("INTERNAL_ERROR")) {
-                        if (json.msg.contains("KeyNotFound")) {
-                            recycled = true
-                        }
-                    }
-            }
-            if (recycled) {
-                break
-            } else {
-                sleep(5000)
-            }
+        // check instance1 is not recycled
+        get_instance_api(msHttpPort, "cluster_1_instance_id") {
+            respCode, body ->
+                log.info("get instance1 resp: ${body} ${respCode}".toString())
+                def json = parseJson(body)
+                assertTrue(json.code.equalsIgnoreCase("OK"))
         }
-        assertTrue(recycled)
 
         // check data in instance2
         connectWithDockerCluster(clusters[cluster_2]) {
@@ -413,6 +451,134 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
             assertEquals(res[1]['id'], 2)
             assertEquals(res[1]['name'], 'cluster1_data_2')
         }
+
+        // show instance1 tablet status
+        connectWithDockerCluster(clusters[cluster_1]) {
+            def backendId_to_backendIP = [:]
+            def backendId_to_backendHttpPort = [:]
+            getBackendIpHttpPort(backendId_to_backendIP, backendId_to_backendHttpPort)
+            def backend_id = backendId_to_backendIP.keySet()[0]
+
+            sql "USE test_db"
+            def res = sql_return_maparray "show tablets from test_table"
+            logger.info("instance1 test_table tablets: " + res.toString())
+            for (final def tablet in res) {
+                getTabletStatus(backendId_to_backendIP[backend_id], backendId_to_backendHttpPort[backend_id], tablet.TabletId)
+            }
+
+            res = sql_return_maparray "show tablets from test_empty_table"
+            logger.info("instance1 test_empty_table tablets: " + res.toString())
+            for (final def tablet in res) {
+                getTabletStatus(backendId_to_backendIP[backend_id], backendId_to_backendHttpPort[backend_id], tablet.TabletId)
+            }
+
+            res = sql_return_maparray "show tablets from test_mow_table"
+            logger.info("instance1 test_mow_table tablets: " + res.toString())
+            for (final def tablet in res) {
+                getTabletStatus(backendId_to_backendIP[backend_id], backendId_to_backendHttpPort[backend_id], tablet.TabletId)
+            }
+        }
+
+        // Step 6: compaction all tablets in instance2 (not reference instance1 rowsets)
+        connectWithDockerCluster(clusters[cluster_2]) {
+            def backendId_to_backendIP = [:]
+            def backendId_to_backendHttpPort = [:]
+            getBackendIpHttpPort(backendId_to_backendIP, backendId_to_backendHttpPort)
+            def backend_id = backendId_to_backendIP.keySet()[0]
+
+            sql "USE test_db"
+            def res = sql_return_maparray "show tablets from test_table"
+            logger.info("test_table tablets: " + res.toString())
+            for (final def tablet in res) {
+                getTabletStatus(backendId_to_backendIP[backend_id], backendId_to_backendHttpPort[backend_id], tablet.TabletId)
+                triggerCompaction(backendId_to_backendIP[backend_id], backendId_to_backendHttpPort[backend_id], "full", tablet.TabletId)
+                sleep(2000)
+                getTabletStatus(backendId_to_backendIP[backend_id], backendId_to_backendHttpPort[backend_id], tablet.TabletId)
+            }
+
+            res = sql_return_maparray "show tablets from test_empty_table"
+            logger.info("test_empty_table tablets: " + res.toString())
+            for (final def tablet in res) {
+                getTabletStatus(backendId_to_backendIP[backend_id], backendId_to_backendHttpPort[backend_id], tablet.TabletId)
+                triggerCompaction(backendId_to_backendIP[backend_id], backendId_to_backendHttpPort[backend_id], "full", tablet.TabletId)
+                sleep(2000)
+                getTabletStatus(backendId_to_backendIP[backend_id], backendId_to_backendHttpPort[backend_id], tablet.TabletId)
+            }
+
+            res = sql_return_maparray "show tablets from test_mow_table"
+            logger.info("test_mow_table tablets: " + res.toString())
+            for (final def tablet in res) {
+                getTabletStatus(backendId_to_backendIP[backend_id], backendId_to_backendHttpPort[backend_id], tablet.TabletId)
+                triggerCompaction(backendId_to_backendIP[backend_id], backendId_to_backendHttpPort[backend_id], "full", tablet.TabletId)
+                sleep(2000)
+                getTabletStatus(backendId_to_backendIP[backend_id], backendId_to_backendHttpPort[backend_id], tablet.TabletId)
+            }
+        }
+
+        // Step 7: drop instance3 (not reference instance1 rowsets)
+        drop_instance(msHttpPort, "cluster_3_instance_id")
+
+        // Step 8: drop instance2 snapshot (not reference instance1 rowsets)
+        connectWithDockerCluster(clusters[cluster_2]) {
+            for (int i = 1; i <= 20; i++) {
+                try {
+                    sql "ADMIN DROP CLUSTER SNAPSHOT WHERE snapshot_id = '${cluster2_snapshot_id}'"
+                    def res = sql_return_maparray "SELECT * FROM information_schema.cluster_snapshots"
+                    logger.info("Cluster snapshots after dropping: " + res.toString())
+                    break
+                } catch (Exception e) {
+                    assertTrue(e.getMessage().contains("cannot drop snapshot that is referenced by other instance"))
+                    def res = sql_return_maparray "SELECT * FROM information_schema.cluster_snapshots"
+                    logger.info("Cluster snapshots after dropping " + i + " times: " + res.toString())
+                    sleep(3000)
+                }
+            }
+            def res = sql_return_maparray "SELECT * FROM information_schema.cluster_snapshots"
+            logger.info("Cluster snapshots after dropping: " + res.toString())
+            assertEquals(res.size(), 0)
+        }
+
+        // Step 9: check instance3 is recycled
+        def recycled = false
+        for (int i = 1; i <= 20; i++) {
+            get_instance_api(msHttpPort, "cluster_3_instance_id") {
+                respCode, body ->
+                    log.info("get instance3 resp: ${body} ${respCode}".toString())
+                    def json = parseJson(body)
+                    if (json.code.equalsIgnoreCase("INTERNAL_ERROR")) {
+                        if (json.msg.contains("KeyNotFound")) {
+                            recycled = true
+                        }
+                    }
+            }
+            if (recycled) {
+                break
+            } else {
+                sleep(3000)
+            }
+        }
+        assertTrue(recycled)
+
+        // Step 9: check instance1 is recycled
+        recycled = false
+        for (int i = 1; i <= 20; i++) {
+            get_instance_api(msHttpPort, "cluster_1_instance_id") {
+                respCode, body ->
+                    log.info("get instance1 resp: ${body} ${respCode}".toString())
+                    def json = parseJson(body)
+                    if (json.code.equalsIgnoreCase("INTERNAL_ERROR")) {
+                        if (json.msg.contains("KeyNotFound")) {
+                            recycled = true
+                        }
+                    }
+            }
+            if (recycled) {
+                break
+            } else {
+                sleep(3000)
+            }
+        }
+        assertTrue(recycled)
     }
 }
 

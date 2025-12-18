@@ -1263,14 +1263,16 @@ int CompactExecutor::compact_rowset_load_key(Transaction* txn, int64_t tablet_id
         return -1;
     }
 
-    auto reference_instance_id = rowset_meta.reference_instance_id();
-    std::string rowset_ref_count_key = versioned::data_rowset_ref_count_key(
-            {reference_instance_id, tablet_id, rowset_meta.rowset_id_v2()});
-    LOG_INFO("add rowset ref count key")
-            .tag("reference_instance_id", reference_instance_id)
-            .tag("rowset_id", rowset_meta.rowset_id_v2())
-            .tag("key", hex(rowset_ref_count_key));
-    txn->atomic_add(rowset_ref_count_key, 1);
+    if (rowset_meta.end_version() != 1) {
+        auto reference_instance_id = rowset_meta.reference_instance_id();
+        std::string rowset_ref_count_key = versioned::data_rowset_ref_count_key(
+                {reference_instance_id, tablet_id, rowset_meta.rowset_id_v2()});
+        LOG_INFO("add rowset ref count key")
+                .tag("reference_instance_id", reference_instance_id)
+                .tag("rowset_id", rowset_meta.rowset_id_v2())
+                .tag("key", hex(rowset_ref_count_key));
+        txn->atomic_add(rowset_ref_count_key, 1);
+    }
     return 0;
 }
 

@@ -238,6 +238,7 @@ void add_tablet(CreateTabletsRequest& req, int64_t table_id, int64_t index_id, i
     auto schema = tablet->mutable_schema();
     schema->set_schema_version(0);
     auto first_rowset = tablet->add_rs_metas();
+    first_rowset->set_tablet_id(tablet_id);
     first_rowset->set_rowset_id(0); // required
     first_rowset->set_rowset_id_v2(next_rowset_id());
     first_rowset->set_start_version(0);
@@ -578,7 +579,8 @@ void finish_compaction_job(MetaService* meta_service, const std::string& cloud_u
 void compact_rowsets_cumulative(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
                                 int64_t db_id, const std::string& label, int64_t table_id,
                                 int64_t partition_id, int64_t tablet_id, int64_t start_version,
-                                int64_t end_version, int num_rows) {
+                                int64_t end_version, int num_rows,
+                                StorageVaultAccessor* accessor = nullptr) {
     TabletStatsPB stats;
     ASSERT_NO_FATAL_FAILURE(get_tablet_stats(meta_service, cloud_unique_id, tablet_id, stats));
     int base_compaction_cnt = stats.base_compaction_cnt();
@@ -598,6 +600,12 @@ void compact_rowsets_cumulative(MetaServiceProxy* meta_service, const std::strin
             meta_service, cloud_unique_id, tablet_id, job_id, "test_case", base_compaction_cnt,
             cumu_compaction_cnt, TabletCompactionJobPB::CUMULATIVE, output_rowset_id,
             {start_version, end_version}, txn_id));
+    if (accessor) {
+        for (int i = 0; i < 1; ++i) {
+            auto path = doris::cloud::segment_path(tablet_id, output_rowset_id, i);
+            accessor->put_file(path, "");
+        }
+    }
 }
 
 void start_schema_change_job(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
@@ -1986,6 +1994,9 @@ void test_compact_multi_chain(CloneInstanceRequest::CloneType instance2_clone_ty
                               CloneInstanceRequest::CloneType instance3_clone_type,
                               CloneInstanceRequest::CloneType instance4_clone_type) {
     config::force_immediate_recycle = true;
+    DORIS_CLOUD_DEFER {
+        config::force_immediate_recycle = false;
+    };
     auto meta_service = get_meta_service();
     auto resource_mgr = meta_service->resource_mgr();
     auto txn_kv = meta_service->txn_kv();
@@ -2242,4 +2253,500 @@ TEST(SnapshotChainCompactorTest, CompactMultiChain) {
                              CloneInstanceRequest::ROLLBACK);
     test_compact_multi_chain(CloneInstanceRequest::READ_ONLY, CloneInstanceRequest::ROLLBACK,
                              CloneInstanceRequest::READ_ONLY);
+}
+
+TEST(SnapshotChainCompactorTest, RecycleDeletedInstance) {
+    config::force_immediate_recycle = true;
+    DORIS_CLOUD_DEFER {
+        config::force_immediate_recycle = false;
+    };
+    auto meta_service = get_meta_service();
+    auto resource_mgr = meta_service->resource_mgr();
+    auto txn_kv = meta_service->txn_kv();
+
+    // Phase 1: create instance1
+    std::string instance_id = "recycle_deleted_instance1";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+    InstanceInfoPB instance_info1;
+    get_instance(meta_service.get(), cloud_unique_id, instance_info1);
+
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+
+    std::shared_ptr<StorageVaultAccessor> accessor = nullptr;
+    {
+        InstanceRecycler recycler(txn_kv, instance_info1, thread_group,
+                                  std::make_shared<TxnLazyCommitter>(txn_kv));
+        ASSERT_EQ(recycler.init(), 0);
+        ASSERT_EQ(recycler.accessor_map_.size(), 1);
+        accessor = recycler.accessor_map_.begin()->second;
+        ASSERT_TRUE(accessor != nullptr);
+    }
+    auto compact_rowsets = [&](const std::string& cloud_unique_id, int64_t max_version,
+                               int64_t start_version, int64_t end_version, int64_t before_rowsets,
+                               int64_t after_rowsets) {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, max_version, rowsets);
+        ASSERT_EQ(rowsets.size(), before_rowsets);
+
+        compact_rowsets_cumulative(meta_service.get(), cloud_unique_id, db_id, "compaction_label_1",
+                                   table_id, partition_id, tablet_id, start_version, end_version,
+                                   300, accessor.get());
+
+        rowsets.clear();
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, max_version, rowsets);
+        ASSERT_EQ(rowsets.size(), after_rowsets);
+    };
+
+    auto check_rowset_file = [&](const std::string& rowset_id, bool exist,
+                                 const std::string version = "") {
+        std::unique_ptr<ListIterator> list_iter;
+        ASSERT_EQ(0,
+                  accessor->list_directory(rowset_path_prefix(tablet_id, rowset_id), &list_iter));
+        std::stringstream ss;
+        ss << ", rowset_id=" << rowset_id;
+        if (!version.empty()) {
+            ss << ", version=" << version;
+        }
+        ASSERT_EQ(list_iter->has_next(), exist) << ss.str();
+    };
+
+    // Phase 1.1: insert 5 rowsets (version 2-6)
+    for (int i = 2; i <= 6; i++) {
+        insert_rowset(meta_service.get(), cloud_unique_id, db_id, fmt::format("label_{}", i),
+                      table_id, partition_id, tablet_id, nullptr, accessor.get());
+    }
+
+    // Phase 1.2: snapshot1
+    SnapshotContext ctx1;
+    begin_and_commit_snapshot(meta_service.get(), cloud_unique_id, ctx1);
+    std::vector<SnapshotContext> snapshots;
+    list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
+    ASSERT_EQ(snapshots.size(), 1);
+
+    // Phase 1.3: insert 4 rowsets (version 7-10)
+    for (int i = 7; i <= 10; i++) {
+        insert_rowset(meta_service.get(), cloud_unique_id, db_id, fmt::format("label_{}", i),
+                      table_id, partition_id, tablet_id, nullptr, accessor.get());
+    }
+    std::map<std::string, std::string> version_to_rowsets;
+    {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, 10, rowsets);
+        ASSERT_EQ(rowsets.size(), 10);
+        for (size_t i = 1; i < rowsets.size(); ++i) {
+            auto& rowset = rowsets[i];
+            std::string version =
+                    fmt::format("{}-{}", rowset.start_version(), rowset.end_version());
+            version_to_rowsets[version] = rowset.rowset_id_v2();
+        }
+    }
+
+    // Phase 1.4: compact version 5-8
+    compact_rowsets(cloud_unique_id, 10, 5, 8, 10, 7);
+
+    // Phase 1.5: check rowsets
+    {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, 10, rowsets);
+        ASSERT_EQ(rowsets.size(), 7);
+        for (size_t i = 1; i < rowsets.size(); ++i) {
+            auto& rowset = rowsets[i];
+            ASSERT_NO_FATAL_FAILURE(check_rowset_file(rowset.rowset_id_v2(), true));
+            std::string version =
+                    fmt::format("{}-{}", rowset.start_version(), rowset.end_version());
+            version_to_rowsets[version] = rowset.rowset_id_v2();
+        }
+    }
+
+    // Phase 2: clone instance2 from snapshot1
+    std::string instance_id2 = "recycle_deleted_instance2";
+    std::string cloud_unique_id2 = fmt::format("1:{}:0", instance_id2);
+    // SnapshotContext ctx2;
+    InstanceInfoPB instance_info2;
+    {
+        clone_and_refresh_instance(meta_service.get(), resource_mgr.get(), instance_id,
+                                   ctx1.snapshot_id, instance_id2, instance_info2,
+                                   CloneInstanceRequest::READ_ONLY);
+        // Phase 2.1: snapshot2
+        // begin_and_commit_snapshot(meta_service.get(), cloud_unique_id2, ctx2);
+        // Phase 2.2: compact version 2-6
+        // compact_rowsets(cloud_unique_id2, 6, 2, 6, 6, 2);
+    }
+
+    // Phase 3: compact snapshot chain for instance2
+    {
+        SnapshotChainCompactor snapshot_chain_compactor(txn_kv);
+        ASSERT_FALSE(snapshot_chain_compactor.is_snapshot_chain_need_compact(instance_info2));
+        InstanceChainCompactor compactor(txn_kv, instance_info2);
+        ASSERT_EQ(compactor.do_compact(), 0);
+        get_instance(meta_service.get(), cloud_unique_id2, instance_info2);
+        resource_mgr->refresh_instance(instance_id2, instance_info2);
+        drop_snapshot(meta_service.get(), cloud_unique_id, ctx1.snapshot_id);
+    }
+
+    // Phase 4: recycle instance2/instance1
+    auto recycle_instance = [&](const InstanceInfoPB& instance_info) {
+        // recycle snapshots
+        {
+            auto recycler = get_instance_recycler(meta_service.get(), instance_info, accessor);
+            ASSERT_EQ(recycler->init(), 0);
+            ASSERT_EQ(recycler->do_recycle(), 0);
+        }
+        // recycle operation logs and generate RecycleRowset keys
+        {
+            auto recycler = get_instance_recycler(meta_service.get(), instance_info, accessor);
+            ASSERT_EQ(recycler->init(), 0);
+            ASSERT_EQ(recycler->do_recycle(), 0);
+        }
+        // recycle rowsets
+        {
+            auto recycler = get_instance_recycler(meta_service.get(), instance_info, accessor);
+            ASSERT_EQ(recycler->init(), 0);
+            ASSERT_EQ(recycler->do_recycle(), 0);
+        }
+    };
+    recycle_instance(instance_info2);
+    recycle_instance(instance_info1);
+    // 4.1: check instance2 rowsets exists
+    {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id2, tablet_id, 0, 6, rowsets);
+        ASSERT_EQ(rowsets.size(), 6);
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(TxnErrorCode::TXN_OK, txn_kv->create_txn(&txn));
+        for (size_t i = 1; i < rowsets.size(); ++i) {
+            auto& rowset = rowsets[i];
+            auto& rowset_id = rowset.rowset_id_v2();
+            auto version = fmt::format("{}-{}", rowset.start_version(), rowset.end_version());
+            ASSERT_NO_FATAL_FAILURE(check_rowset_file(rowset_id, true));
+            std::string key =
+                    versioned::data_rowset_ref_count_key({instance_id, tablet_id, rowset_id});
+            std::string val;
+            ASSERT_EQ(TxnErrorCode::TXN_OK, txn->get(key, &val));
+            int64_t ref_count;
+            ASSERT_TRUE(txn->decode_atomic_int(val, &ref_count));
+            ASSERT_EQ(ref_count, rowset.end_version() <= 4 ? 2 : 1);
+        }
+    }
+
+    compact_rowsets(cloud_unique_id, 10, 4, 8, 7, 6);
+    {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, 10, rowsets);
+        ASSERT_EQ(rowsets.size(), 6);
+        for (size_t i = 1; i < rowsets.size(); ++i) {
+            auto& rowset = rowsets[i];
+            ASSERT_NO_FATAL_FAILURE(check_rowset_file(rowset.rowset_id_v2(), true));
+            std::string version =
+                    fmt::format("{}-{}", rowset.start_version(), rowset.end_version());
+            version_to_rowsets[version] = rowset.rowset_id_v2();
+        }
+    }
+    compact_rowsets(cloud_unique_id, 10, 2, 8, 6, 4);
+    {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, 10, rowsets);
+        ASSERT_EQ(rowsets.size(), 4);
+        for (size_t i = 1; i < rowsets.size(); ++i) {
+            auto& rowset = rowsets[i];
+            ASSERT_NO_FATAL_FAILURE(check_rowset_file(rowset.rowset_id_v2(), true));
+            std::string version =
+                    fmt::format("{}-{}", rowset.start_version(), rowset.end_version());
+            version_to_rowsets[version] = rowset.rowset_id_v2();
+        }
+    }
+
+    // create a tmp rowset (can be deleted because recycle_rowset_key exist)
+    {
+        int64_t txn_id = 0;
+        ASSERT_NO_FATAL_FAILURE(begin_txn(meta_service.get(), cloud_unique_id, db_id, "label_tmp",
+                                          table_id, txn_id));
+        auto rowset = create_rowset(txn_id, tablet_id, partition_id);
+        ASSERT_NO_FATAL_FAILURE(prepare_rowset(meta_service.get(), cloud_unique_id, rowset));
+        auto path = doris::cloud::segment_path(rowset.tablet_id(), rowset.rowset_id_v2(), 0);
+        accessor->put_file(path, "");
+
+        version_to_rowsets["tmp"] = rowset.rowset_id_v2();
+
+        std::unique_ptr<ListIterator> list_iter;
+        ASSERT_EQ(0, accessor->list_directory(rowset_path_prefix(tablet_id, rowset.rowset_id_v2()),
+                                              &list_iter));
+        ASSERT_TRUE(list_iter->has_next());
+    }
+    // create a commit rowset but not commit txn (can be deleted because end_version is 0)
+    {
+        int64_t txn_id = 0;
+        ASSERT_NO_FATAL_FAILURE(begin_txn(meta_service.get(), cloud_unique_id, db_id,
+                                          "label_commit", table_id, txn_id));
+        auto rowset = create_rowset(txn_id, tablet_id, partition_id);
+        ASSERT_NO_FATAL_FAILURE(prepare_rowset(meta_service.get(), cloud_unique_id, rowset));
+        ASSERT_NO_FATAL_FAILURE(commit_rowset(meta_service.get(), cloud_unique_id, rowset));
+        auto path = doris::cloud::segment_path(rowset.tablet_id(), rowset.rowset_id_v2(), 0);
+        accessor->put_file(path, "");
+
+        version_to_rowsets["commit"] = rowset.rowset_id_v2();
+
+        std::unique_ptr<ListIterator> list_iter;
+        ASSERT_EQ(0, accessor->list_directory(rowset_path_prefix(tablet_id, rowset.rowset_id_v2()),
+                                              &list_iter));
+        ASSERT_TRUE(list_iter->has_next());
+    }
+
+    // Phase 5: drop instance1 and recycle
+    drop_instance(meta_service.get(), instance_id);
+    get_instance(meta_service.get(), cloud_unique_id, instance_info1);
+    resource_mgr->refresh_instance(instance_id, instance_info1);
+    ASSERT_NO_FATAL_FAILURE(recycle_instance(instance_info1));
+    // check instance2 rowsets: [0-1][2][3][4][5][6]
+    {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id2, tablet_id, 0, 6, rowsets);
+        ASSERT_EQ(rowsets.size(), 6);
+        for (size_t i = 1; i < rowsets.size(); ++i) {
+            auto& rowset = rowsets[i];
+            auto version = fmt::format("{}-{}", rowset.start_version(), rowset.end_version());
+            ASSERT_NO_FATAL_FAILURE(check_rowset_file(rowset.rowset_id_v2(), true, version));
+        }
+    }
+    // check all rowsets: [0-1][2][3][4][5][6] exists since referenced by instance2
+    // [7][8][9][10][5-8][4-8][2-8] is deleted
+    std::set<std::string> instance2_versions = {"0-1", "2-2", "3-3", "4-4", "5-5", "6-6"};
+    for (auto& [version, rowset_id] : version_to_rowsets) {
+        bool file_exists = instance2_versions.find(version) != instance2_versions.end();
+        ASSERT_NO_FATAL_FAILURE(check_rowset_file(rowset_id, file_exists, version));
+    }
+    // instance1 cannot delete since some rowsets are referenced
+    get_instance(meta_service.get(), cloud_unique_id, instance_info1);
+
+    // Phase 6: compact version 0-6 for instance2
+    compact_rowsets(cloud_unique_id2, 6, 0, 6, 6, 1);
+    {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id2, tablet_id, 0, 6, rowsets);
+        ASSERT_EQ(rowsets.size(), 1);
+        for (size_t i = 0; i < rowsets.size(); ++i) {
+            auto& rowset = rowsets[i];
+            ASSERT_NO_FATAL_FAILURE(check_rowset_file(rowset.rowset_id_v2(), true));
+            std::string version =
+                    fmt::format("{}-{}", rowset.start_version(), rowset.end_version());
+            version_to_rowsets[version] = rowset.rowset_id_v2();
+        }
+    }
+
+    // Phase 7: recycle instance2 and instance1
+    recycle_instance(instance_info2);
+    recycle_instance(instance_info1);
+    // check all rowsets: [0-6] exists since it's created by instance2
+    // [0-1][2][3][4][5][6][7][8][9][10][5-8][4-8][2-8] is deleted
+    instance2_versions = {"0-6"};
+    for (auto& [version, rowset_id] : version_to_rowsets) {
+        bool file_exists = instance2_versions.find(version) != instance2_versions.end();
+        ASSERT_NO_FATAL_FAILURE(check_rowset_file(rowset_id, file_exists, version));
+    }
+
+    // instance1 is deleted
+    {
+        brpc::Controller cntl;
+        GetInstanceRequest req;
+        GetInstanceResponse res;
+        req.set_cloud_unique_id(cloud_unique_id);
+        meta_service->get_instance(&cntl, &req, &res, nullptr);
+        ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT) << res.ShortDebugString();
+    }
+
+    // check kvs
+    std::unique_ptr<Transaction> txn;
+    EXPECT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+    std::string start_key = "";
+    start_key.push_back(CLOUD_VERSIONED_KEY_SPACE03);
+    std::string end_key = "";
+    end_key.push_back(0x04);
+    std::unique_ptr<RangeGetIterator> it;
+    do {
+        ASSERT_EQ(txn->get(start_key, end_key, &it), TxnErrorCode::TXN_OK);
+        while (it->has_next()) {
+            auto [k, v] = it->next();
+            std::string_view k1 = k;
+            k1.remove_prefix(1);
+            std::vector<std::tuple<std::variant<int64_t, std::string>, int, int>> out;
+            decode_key(&k1, &out);
+            ASSERT_GT(out.size(), 2);
+            ASSERT_NE(std::get<std::string>(std::get<0>(out[1])), instance_id);
+        }
+        start_key = it->next_begin_key();
+    } while (it->more());
+}
+
+TEST(SnapshotChainCompactorTest, RecycleDeletedInstance2) {
+    config::force_immediate_recycle = true;
+    DORIS_CLOUD_DEFER {
+        config::force_immediate_recycle = false;
+    };
+    auto meta_service = get_meta_service();
+    auto resource_mgr = meta_service->resource_mgr();
+    auto txn_kv = meta_service->txn_kv();
+
+    // Phase 1: create instance1
+    std::string instance_id = "recycle_deleted_instance2_1";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+    InstanceInfoPB instance_info1;
+    get_instance(meta_service.get(), cloud_unique_id, instance_info1);
+
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+
+    std::shared_ptr<StorageVaultAccessor> accessor = nullptr;
+    {
+        InstanceRecycler recycler(txn_kv, instance_info1, thread_group,
+                                  std::make_shared<TxnLazyCommitter>(txn_kv));
+        ASSERT_EQ(recycler.init(), 0);
+        ASSERT_EQ(recycler.accessor_map_.size(), 1);
+        accessor = recycler.accessor_map_.begin()->second;
+        ASSERT_TRUE(accessor != nullptr);
+    }
+    auto compact_rowsets = [&](const std::string& cloud_unique_id, int64_t max_version,
+                               int64_t start_version, int64_t end_version, int64_t before_rowsets,
+                               int64_t after_rowsets) {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, max_version, rowsets);
+        ASSERT_EQ(rowsets.size(), before_rowsets);
+
+        compact_rowsets_cumulative(meta_service.get(), cloud_unique_id, db_id, "compaction_label_1",
+                                   table_id, partition_id, tablet_id, start_version, end_version,
+                                   300, accessor.get());
+
+        rowsets.clear();
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, max_version, rowsets);
+        ASSERT_EQ(rowsets.size(), after_rowsets);
+    };
+
+    auto check_rowset_file = [&](const std::string& rowset_id, bool exist,
+                                 const std::string version = "") {
+        std::unique_ptr<ListIterator> list_iter;
+        ASSERT_EQ(0,
+                  accessor->list_directory(rowset_path_prefix(tablet_id, rowset_id), &list_iter));
+        std::stringstream ss;
+        ss << ", rowset_id=" << rowset_id;
+        if (!version.empty()) {
+            ss << ", version=" << version;
+        }
+        ASSERT_EQ(list_iter->has_next(), exist) << ss.str();
+    };
+
+    std::map<std::string, std::string> version_to_rowsets;
+    auto record_version_rowsets = [&](int expected_rowsts) {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, 10, rowsets);
+        ASSERT_EQ(rowsets.size(), expected_rowsts);
+        for (size_t i = 1; i < rowsets.size(); ++i) {
+            auto& rowset = rowsets[i];
+            std::string version =
+                    fmt::format("{}-{}", rowset.start_version(), rowset.end_version());
+            version_to_rowsets[version] = rowset.rowset_id_v2();
+        }
+    };
+
+    // Phase 1.1: insert 6 rowsets (version 2-7)
+    for (int i = 2; i <= 7; i++) {
+        insert_rowset(meta_service.get(), cloud_unique_id, db_id, fmt::format("label_{}", i),
+                      table_id, partition_id, tablet_id, nullptr, accessor.get());
+    }
+    record_version_rowsets(7);
+
+    // Phase 1.2: compact version 2-4: [0-1][2-4][5][6][7]
+    compact_rowsets(cloud_unique_id, 7, 2, 4, 7, 5);
+    record_version_rowsets(5);
+
+    // Phase 1.3: compact version 5-7: [0-1][2-4][5-7]
+    compact_rowsets(cloud_unique_id, 7, 5, 7, 5, 3);
+    record_version_rowsets(3);
+
+    // Phase 1.4: snapshot1
+    SnapshotContext ctx1;
+    begin_and_commit_snapshot(meta_service.get(), cloud_unique_id, ctx1);
+    std::vector<SnapshotContext> snapshots;
+    list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
+    ASSERT_EQ(snapshots.size(), 1);
+
+    // Phase 1.5: compact version 2-7: [0-1][2-7]
+    compact_rowsets(cloud_unique_id, 7, 2, 7, 3, 2);
+    record_version_rowsets(2);
+
+    // Phase 1.6: check rowsets
+    for (auto& [version, rowset_id] : version_to_rowsets) {
+        ASSERT_NO_FATAL_FAILURE(check_rowset_file(rowset_id, true)) << version;
+    }
+
+    // Phase 2: clone instance2 from snapshot1
+    std::string instance_id2 = "recycle_deleted_instance2_2";
+    std::string cloud_unique_id2 = fmt::format("1:{}:0", instance_id2);
+    InstanceInfoPB instance_info2;
+    {
+        clone_and_refresh_instance(meta_service.get(), resource_mgr.get(), instance_id,
+                                   ctx1.snapshot_id, instance_id2, instance_info2,
+                                   CloneInstanceRequest::READ_ONLY);
+    }
+
+    // Phase 2.1: compact snapshot chain for instance2
+    {
+        SnapshotChainCompactor snapshot_chain_compactor(txn_kv);
+        ASSERT_FALSE(snapshot_chain_compactor.is_snapshot_chain_need_compact(instance_info2));
+        InstanceChainCompactor compactor(txn_kv, instance_info2);
+        ASSERT_EQ(compactor.do_compact(), 0);
+        get_instance(meta_service.get(), cloud_unique_id2, instance_info2);
+        resource_mgr->refresh_instance(instance_id2, instance_info2);
+    }
+
+    // Phase 3: drop snapshot1 and drop instance1
+    {
+        drop_snapshot(meta_service.get(), cloud_unique_id, ctx1.snapshot_id);
+        drop_instance(meta_service.get(), instance_id);
+        get_instance(meta_service.get(), cloud_unique_id, instance_info1);
+        resource_mgr->refresh_instance(instance_id, instance_info1);
+    }
+
+    // Phase 4: recycle instance2/instance1
+    auto recycle_instance = [&](const InstanceInfoPB& instance_info) {
+        // recycle snapshots
+        {
+            auto recycler = get_instance_recycler(meta_service.get(), instance_info, accessor);
+            ASSERT_EQ(recycler->init(), 0);
+            ASSERT_EQ(recycler->do_recycle(), 0);
+        }
+        // recycle operation logs and generate RecycleRowset keys
+        {
+            auto recycler = get_instance_recycler(meta_service.get(), instance_info, accessor);
+            ASSERT_EQ(recycler->init(), 0);
+            ASSERT_EQ(recycler->do_recycle(), 0);
+        }
+        // recycle rowsets
+        {
+            auto recycler = get_instance_recycler(meta_service.get(), instance_info, accessor);
+            ASSERT_EQ(recycler->init(), 0);
+            ASSERT_EQ(recycler->do_recycle(), 0);
+        }
+    };
+    recycle_instance(instance_info2);
+    recycle_instance(instance_info1);
+
+    // Phase 4.1: check all rowsets: [2-4][5-6] exists since referenced by instance2
+    std::set<std::string> instance2_versions = {"0-1", "2-4", "5-7"};
+    for (auto& [version, rowset_id] : version_to_rowsets) {
+        bool file_exists = instance2_versions.find(version) != instance2_versions.end();
+        ASSERT_NO_FATAL_FAILURE(check_rowset_file(rowset_id, file_exists, version));
+    }
 }
