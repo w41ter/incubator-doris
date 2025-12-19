@@ -1498,6 +1498,7 @@ int CompactExecutor::get_all_index_schema_versions(Transaction* txn, int64_t ind
     FullRangeGetOptions opts;
     opts.snapshot = true;
     opts.prefetch = true;
+    opts.txn_kv = txn_kv_;
     auto iter = txn->full_range_get(begin_key, end_key, opts);
     int64_t last_schema_version = -1;
     for (auto kvp = iter->next(); kvp.has_value(); kvp = iter->next()) {

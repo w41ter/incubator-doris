@@ -549,7 +549,8 @@ void finish_compaction_job(MetaService* meta_service, const std::string& cloud_u
                            const std::string& initiator, int base_compaction_cnt,
                            int cumu_compaction_cnt, TabletCompactionJobPB::CompactionType type,
                            const std::string& output_rowset_id,
-                           std::pair<int64_t, int64_t> input_version, int64_t txn_id) {
+                           std::pair<int64_t, int64_t> input_version, int64_t txn_id,
+                           int64_t size_input_rowsets, int64_t size_output_rowsets) {
     brpc::Controller cntl;
     FinishTabletJobRequest req;
     FinishTabletJobResponse res;
@@ -562,6 +563,8 @@ void finish_compaction_job(MetaService* meta_service, const std::string& cloud_u
     compaction->set_cumulative_compaction_cnt(cumu_compaction_cnt);
     compaction->set_type(type);
     long now = time(nullptr);
+    compaction->set_size_input_rowsets(size_input_rowsets);
+    compaction->set_size_output_rowsets(size_output_rowsets);
     compaction->set_expiration(now + 12);
     compaction->set_lease(now + 3);
     compaction->add_input_versions(input_version.first);
@@ -574,6 +577,34 @@ void finish_compaction_job(MetaService* meta_service, const std::string& cloud_u
     meta_service->finish_tablet_job(&cntl, &req, &res, nullptr);
     ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
     ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
+}
+
+void get_rowsets(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
+                 int64_t tablet_id, int64_t start_version, int64_t end_version,
+                 std::vector<doris::RowsetMetaCloudPB>& rowsets) {
+    rowsets.clear();
+    TabletStatsPB stats;
+    ASSERT_NO_FATAL_FAILURE(get_tablet_stats(meta_service, cloud_unique_id, tablet_id, stats));
+
+    brpc::Controller cntl;
+    GetRowsetRequest req;
+    GetRowsetResponse res;
+    req.set_cloud_unique_id(cloud_unique_id);
+    req.set_base_compaction_cnt(stats.base_compaction_cnt());
+    req.set_cumulative_compaction_cnt(stats.cumulative_compaction_cnt());
+    if (stats.has_full_compaction_cnt()) {
+        req.set_full_compaction_cnt(stats.full_compaction_cnt());
+    }
+    req.set_cumulative_point(stats.cumulative_point());
+    req.set_start_version(start_version);
+    req.set_end_version(end_version);
+    req.mutable_idx()->set_tablet_id(tablet_id);
+    meta_service->get_rowset(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
+    for (int i = 0; i < res.rowset_meta_size(); i++) {
+        rowsets.push_back(res.rowset_meta(i));
+    }
 }
 
 void compact_rowsets_cumulative(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
@@ -596,10 +627,21 @@ void compact_rowsets_cumulative(MetaServiceProxy* meta_service, const std::strin
     compact_rowset.set_end_version(end_version);
     ASSERT_NO_FATAL_FAILURE(prepare_rowset(meta_service, cloud_unique_id, compact_rowset));
     ASSERT_NO_FATAL_FAILURE(commit_rowset(meta_service, cloud_unique_id, compact_rowset));
+
+    std::vector<doris::RowsetMetaCloudPB> rowsets;
+    get_rowsets(meta_service, cloud_unique_id, tablet_id, 0, end_version, rowsets);
+    int64_t input_rowsets_data_size = 0;
+    for (auto& rowset : rowsets) {
+        if (rowset.start_version() >= start_version && rowset.end_version() <= end_version) {
+            input_rowsets_data_size += rowset.total_disk_size();
+        }
+    }
+
     ASSERT_NO_FATAL_FAILURE(finish_compaction_job(
             meta_service, cloud_unique_id, tablet_id, job_id, "test_case", base_compaction_cnt,
             cumu_compaction_cnt, TabletCompactionJobPB::CUMULATIVE, output_rowset_id,
-            {start_version, end_version}, txn_id));
+            {start_version, end_version}, txn_id, input_rowsets_data_size,
+            compact_rowset.total_disk_size()));
     if (accessor) {
         for (int i = 0; i < 1; ++i) {
             auto path = doris::cloud::segment_path(tablet_id, output_rowset_id, i);
@@ -678,6 +720,10 @@ struct SnapshotContext {
     std::string snapshot_id;
     std::string image_url;
     ObjectStoreInfoPB store_info;
+    int64_t snapshot_meta_image_size = -1;
+    int64_t snapshot_logical_data_size = -1;
+    int64_t snapshot_retained_data_size = -1;
+    int64_t snapshot_billable_data_size = -1;
 };
 
 void begin_snapshot(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
@@ -705,15 +751,16 @@ void begin_snapshot(MetaServiceProxy* meta_service, const std::string& cloud_uni
 
 void commit_snapshot(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
                      const std::string& snapshot_id, const std::string& image_url,
-                     int64_t last_journal_id) {
+                     int64_t last_journal_id, int64_t snapshot_meta_image_size,
+                     int64_t snapshot_logical_data_size) {
     CommitSnapshotRequest req;
     req.set_cloud_unique_id(cloud_unique_id);
     req.set_snapshot_id(snapshot_id);
     req.set_image_url(image_url);
     req.set_last_journal_id(last_journal_id);
     req.set_request_ip("127.0.0.1");
-    req.set_image_file_size(100);
-    req.set_snapshot_data_size(1000);
+    req.set_snapshot_meta_image_size(snapshot_meta_image_size);
+    req.set_snapshot_logical_data_size(snapshot_logical_data_size);
 
     brpc::Controller cntl;
     CommitSnapshotResponse res;
@@ -724,6 +771,7 @@ void commit_snapshot(MetaServiceProxy* meta_service, const std::string& cloud_un
 
 void list_snapshot(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
                    std::vector<SnapshotContext>* snapshots) {
+    snapshots->clear();
     ListSnapshotRequest req;
     req.set_cloud_unique_id(cloud_unique_id);
     // req.set_required_snapshot_id(snapshot_ids[1]); // Query specific aborted snapshot
@@ -737,6 +785,18 @@ void list_snapshot(MetaServiceProxy* meta_service, const std::string& cloud_uniq
         SnapshotContext ctx;
         ctx.snapshot_id = snapshot.snapshot_id();
         ctx.image_url = snapshot.image_url();
+        if (snapshot.has_snapshot_meta_image_size()) {
+            ctx.snapshot_meta_image_size = snapshot.snapshot_meta_image_size();
+        }
+        if (snapshot.has_snapshot_logical_data_size()) {
+            ctx.snapshot_logical_data_size = snapshot.snapshot_logical_data_size();
+        }
+        if (snapshot.has_snapshot_retained_data_size()) {
+            ctx.snapshot_retained_data_size = snapshot.snapshot_retained_data_size();
+        }
+        if (snapshot.has_snapshot_billable_data_size()) {
+            ctx.snapshot_billable_data_size = snapshot.snapshot_billable_data_size();
+        }
         snapshots->emplace_back(ctx);
     }
 }
@@ -777,33 +837,6 @@ void clone_instance(MetaServiceProxy* meta_service, const std::string& from_inst
     meta_service->clone_instance(&cntl, &req, &res, nullptr);
     ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
     ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
-}
-
-void get_rowsets(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
-                 int64_t tablet_id, int64_t start_version, int64_t end_version,
-                 std::vector<doris::RowsetMetaCloudPB>& rowsets) {
-    TabletStatsPB stats;
-    ASSERT_NO_FATAL_FAILURE(get_tablet_stats(meta_service, cloud_unique_id, tablet_id, stats));
-
-    brpc::Controller cntl;
-    GetRowsetRequest req;
-    GetRowsetResponse res;
-    req.set_cloud_unique_id(cloud_unique_id);
-    req.set_base_compaction_cnt(stats.base_compaction_cnt());
-    req.set_cumulative_compaction_cnt(stats.cumulative_compaction_cnt());
-    if (stats.has_full_compaction_cnt()) {
-        req.set_full_compaction_cnt(stats.full_compaction_cnt());
-    }
-    req.set_cumulative_point(stats.cumulative_point());
-    req.set_start_version(start_version);
-    req.set_end_version(end_version);
-    req.mutable_idx()->set_tablet_id(tablet_id);
-    meta_service->get_rowset(&cntl, &req, &res, nullptr);
-    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
-    ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
-    for (int i = 0; i < res.rowset_meta_size(); i++) {
-        rowsets.push_back(res.rowset_meta(i));
-    }
 }
 
 void update_snapshot_properties(MetaServiceProxy* meta_service, const std::string& instance_id,
@@ -874,9 +907,11 @@ void clone_and_refresh_instance(
 }
 
 void begin_and_commit_snapshot(MetaServiceProxy* meta_service, const std::string& cloud_unique_id,
-                               SnapshotContext& ctx) {
+                               SnapshotContext& ctx, int64_t snapshot_meta_image_size = 100,
+                               int64_t snapshot_logical_data_size = 1000) {
     begin_snapshot(meta_service, cloud_unique_id, "test_label", &ctx, false);
-    commit_snapshot(meta_service, cloud_unique_id, ctx.snapshot_id, ctx.image_url, 1000);
+    commit_snapshot(meta_service, cloud_unique_id, ctx.snapshot_id, ctx.image_url, 1000,
+                    snapshot_meta_image_size, snapshot_logical_data_size);
 }
 
 std::unique_ptr<InstanceRecycler> get_instance_recycler(
@@ -1399,8 +1434,7 @@ TEST(SnapshotChainCompactorTest, Basic) {
     list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
     ASSERT_EQ(snapshots.size(), 0);
     SnapshotContext ctx;
-    begin_snapshot(meta_service.get(), cloud_unique_id, "snapshot_1", &ctx, false);
-    commit_snapshot(meta_service.get(), cloud_unique_id, ctx.snapshot_id, ctx.image_url, 1000);
+    begin_and_commit_snapshot(meta_service.get(), cloud_unique_id, ctx);
     list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
     ASSERT_EQ(snapshots.size(), 1);
 
@@ -1578,8 +1612,7 @@ TEST(SnapshotChainCompactorTest, Insert) {
     list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
     ASSERT_EQ(snapshots.size(), 0);
     SnapshotContext ctx;
-    begin_snapshot(meta_service.get(), cloud_unique_id, "snapshot_1", &ctx, false);
-    commit_snapshot(meta_service.get(), cloud_unique_id, ctx.snapshot_id, ctx.image_url, 1000);
+    begin_and_commit_snapshot(meta_service.get(), cloud_unique_id, ctx);
     list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
     ASSERT_EQ(snapshots.size(), 1);
 
@@ -1806,8 +1839,7 @@ TEST(SnapshotChainCompactorTest, SchemaChange) {
     list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
     ASSERT_EQ(snapshots.size(), 0);
     SnapshotContext ctx;
-    begin_snapshot(meta_service.get(), cloud_unique_id, "snapshot_1", &ctx, false);
-    commit_snapshot(meta_service.get(), cloud_unique_id, ctx.snapshot_id, ctx.image_url, 1000);
+    begin_and_commit_snapshot(meta_service.get(), cloud_unique_id, ctx);
     list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
     ASSERT_EQ(snapshots.size(), 1);
 
@@ -2146,7 +2178,7 @@ void test_compact_multi_chain(CloneInstanceRequest::CloneType instance2_clone_ty
             ASSERT_EQ(recycler->init(), 0);
             // ASSERT_EQ(recycler->do_recycle(), 0);
             ASSERT_EQ(recycler->recycle_operation_logs(), 0);
-            ASSERT_EQ(recycler->recycle_rowsets(), 0);
+            ASSERT_EQ(recycler->do_recycle(), 0);
         }
     };
     recycle_instance(instance_info3);
@@ -2159,6 +2191,21 @@ void test_compact_multi_chain(CloneInstanceRequest::CloneType instance2_clone_ty
         get_rowsets(meta_service.get(), cloud_unique_id3, tablet_id, 0, 6, rowsets);
         ASSERT_EQ(rowsets.size(), 2);
     }
+    {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id4, tablet_id, 0, 6, rowsets);
+        ASSERT_EQ(rowsets.size(), 6);
+        for (size_t i = 1; i < rowsets.size(); ++i) {
+            std::unique_ptr<ListIterator> list_iter;
+            ASSERT_EQ(0, accessor->list_directory(
+                                 rowset_path_prefix(tablet_id, rowsets[i].rowset_id_v2()),
+                                 &list_iter));
+            ASSERT_TRUE(list_iter->has_next());
+        }
+    }
+
+    drop_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id, index_id);
+    recycle_instance(instance_info1);
     {
         std::vector<doris::RowsetMetaCloudPB> rowsets;
         get_rowsets(meta_service.get(), cloud_unique_id4, tablet_id, 0, 6, rowsets);
@@ -2391,29 +2438,32 @@ TEST(SnapshotChainCompactorTest, RecycleDeletedInstance) {
         drop_snapshot(meta_service.get(), cloud_unique_id, ctx1.snapshot_id);
     }
 
+    auto if_instance_deleted = [&](const std::string& cloud_unique_id) {
+        brpc::Controller cntl;
+        GetInstanceRequest req;
+        GetInstanceResponse res;
+        req.set_cloud_unique_id(cloud_unique_id);
+        meta_service->get_instance(&cntl, &req, &res, nullptr);
+        return !cntl.Failed() && res.status().code() == MetaServiceCode::INVALID_ARGUMENT;
+    };
+
     // Phase 4: recycle instance2/instance1
-    auto recycle_instance = [&](const InstanceInfoPB& instance_info) {
-        // recycle snapshots
-        {
-            auto recycler = get_instance_recycler(meta_service.get(), instance_info, accessor);
-            ASSERT_EQ(recycler->init(), 0);
-            ASSERT_EQ(recycler->do_recycle(), 0);
-        }
-        // recycle operation logs and generate RecycleRowset keys
-        {
-            auto recycler = get_instance_recycler(meta_service.get(), instance_info, accessor);
-            ASSERT_EQ(recycler->init(), 0);
-            ASSERT_EQ(recycler->do_recycle(), 0);
-        }
-        // recycle rowsets
-        {
+    auto recycle_instance = [&](const std::string& cloud_unique_id,
+                                const InstanceInfoPB& instance_info) {
+        // 1. recycle snapshots
+        // 2. recycle operation logs and generate RecycleRowset keys
+        // 3.recycle rowsets
+        for (int i = 0; i < 3; ++i) {
+            if (if_instance_deleted(cloud_unique_id)) {
+                return;
+            }
             auto recycler = get_instance_recycler(meta_service.get(), instance_info, accessor);
             ASSERT_EQ(recycler->init(), 0);
             ASSERT_EQ(recycler->do_recycle(), 0);
         }
     };
-    recycle_instance(instance_info2);
-    recycle_instance(instance_info1);
+    recycle_instance(cloud_unique_id2, instance_info2);
+    recycle_instance(cloud_unique_id, instance_info1);
     // 4.1: check instance2 rowsets exists
     {
         std::vector<doris::RowsetMetaCloudPB> rowsets;
@@ -2503,7 +2553,7 @@ TEST(SnapshotChainCompactorTest, RecycleDeletedInstance) {
     drop_instance(meta_service.get(), instance_id);
     get_instance(meta_service.get(), cloud_unique_id, instance_info1);
     resource_mgr->refresh_instance(instance_id, instance_info1);
-    ASSERT_NO_FATAL_FAILURE(recycle_instance(instance_info1));
+    ASSERT_NO_FATAL_FAILURE(recycle_instance(cloud_unique_id, instance_info1));
     // check instance2 rowsets: [0-1][2][3][4][5][6]
     {
         std::vector<doris::RowsetMetaCloudPB> rowsets;
@@ -2541,8 +2591,8 @@ TEST(SnapshotChainCompactorTest, RecycleDeletedInstance) {
     }
 
     // Phase 7: recycle instance2 and instance1
-    recycle_instance(instance_info2);
-    recycle_instance(instance_info1);
+    recycle_instance(cloud_unique_id2, instance_info2);
+    recycle_instance(cloud_unique_id, instance_info1);
     // check all rowsets: [0-6] exists since it's created by instance2
     // [0-1][2][3][4][5][6][7][8][9][10][5-8][4-8][2-8] is deleted
     instance2_versions = {"0-6"};
@@ -2748,5 +2798,711 @@ TEST(SnapshotChainCompactorTest, RecycleDeletedInstance2) {
     for (auto& [version, rowset_id] : version_to_rowsets) {
         bool file_exists = instance2_versions.find(version) != instance2_versions.end();
         ASSERT_NO_FATAL_FAILURE(check_rowset_file(rowset_id, file_exists, version));
+    }
+}
+
+void recycle_delete_instance3(bool compact_snapshot_chain) {
+    LOG(INFO) << "compact_snapshot_chain=" << compact_snapshot_chain;
+    // A1 clone to A2; delete A2
+    config::force_immediate_recycle = true;
+    DORIS_CLOUD_DEFER {
+        config::force_immediate_recycle = false;
+    };
+    auto meta_service = get_meta_service();
+    auto resource_mgr = meta_service->resource_mgr();
+    auto txn_kv = meta_service->txn_kv();
+
+    // Phase 1: create instance1
+    std::string instance_id = "recycle_deleted_instance3_1";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+    InstanceInfoPB instance_info1;
+    get_instance(meta_service.get(), cloud_unique_id, instance_info1);
+
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+
+    std::shared_ptr<StorageVaultAccessor> accessor = nullptr;
+    {
+        InstanceRecycler recycler(txn_kv, instance_info1, thread_group,
+                                  std::make_shared<TxnLazyCommitter>(txn_kv));
+        ASSERT_EQ(recycler.init(), 0);
+        ASSERT_EQ(recycler.accessor_map_.size(), 1);
+        accessor = recycler.accessor_map_.begin()->second;
+        ASSERT_TRUE(accessor != nullptr);
+    }
+    auto compact_rowsets = [&](const std::string& cloud_unique_id, int64_t max_version,
+                               int64_t start_version, int64_t end_version, int64_t before_rowsets,
+                               int64_t after_rowsets) {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, max_version, rowsets);
+        ASSERT_EQ(rowsets.size(), before_rowsets);
+
+        compact_rowsets_cumulative(meta_service.get(), cloud_unique_id, db_id, "compaction_label_1",
+                                   table_id, partition_id, tablet_id, start_version, end_version,
+                                   300, accessor.get());
+
+        rowsets.clear();
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, max_version, rowsets);
+        ASSERT_EQ(rowsets.size(), after_rowsets);
+    };
+
+    auto check_rowset_file = [&](const std::string& rowset_id, bool exist,
+                                 const std::string version = "") {
+        std::unique_ptr<ListIterator> list_iter;
+        ASSERT_EQ(0,
+                  accessor->list_directory(rowset_path_prefix(tablet_id, rowset_id), &list_iter));
+        std::stringstream ss;
+        ss << ", rowset_id=" << rowset_id;
+        if (!version.empty()) {
+            ss << ", version=" << version;
+        }
+        ASSERT_EQ(list_iter->has_next(), exist) << ss.str();
+    };
+
+    std::map<std::string, std::string> version_to_rowsets;
+    auto record_version_rowsets = [&](std::string& cloud_unique_id, int expected_rowsts) {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, 10, rowsets);
+        ASSERT_EQ(rowsets.size(), expected_rowsts);
+        for (size_t i = 1; i < rowsets.size(); ++i) {
+            auto& rowset = rowsets[i];
+            std::string version =
+                    fmt::format("{}-{}", rowset.start_version(), rowset.end_version());
+            version_to_rowsets[version] = rowset.rowset_id_v2();
+        }
+    };
+
+    // Phase 1.1: insert 6 rowsets (version 2-7)
+    for (int i = 2; i <= 7; i++) {
+        insert_rowset(meta_service.get(), cloud_unique_id, db_id, fmt::format("label_{}", i),
+                      table_id, partition_id, tablet_id, nullptr, accessor.get());
+    }
+    record_version_rowsets(cloud_unique_id, 7);
+
+    // Phase 1.2: snapshot
+    SnapshotContext ctx1;
+    begin_and_commit_snapshot(meta_service.get(), cloud_unique_id, ctx1);
+    std::vector<SnapshotContext> snapshots;
+    list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
+    ASSERT_EQ(snapshots.size(), 1);
+
+    // Phase 1.3: check rowset
+    for (auto& [version, rowset_id] : version_to_rowsets) {
+        ASSERT_NO_FATAL_FAILURE(check_rowset_file(rowset_id, true)) << version;
+    }
+
+    // Phase 2: clone instance2 from snapshot1
+    std::string instance_id2 = "recycle_deleted_instance3_2";
+    std::string cloud_unique_id2 = fmt::format("1:{}:0", instance_id2);
+    InstanceInfoPB instance_info2;
+    {
+        clone_and_refresh_instance(meta_service.get(), resource_mgr.get(), instance_id,
+                                   ctx1.snapshot_id, instance_id2, instance_info2,
+                                   CloneInstanceRequest::READ_ONLY);
+    }
+    // Phase 2.1: insert 2 rowsets (version 8-9)
+    for (int i = 8; i <= 9; i++) {
+        insert_rowset(meta_service.get(), cloud_unique_id2, db_id, fmt::format("label_{}", i),
+                      table_id, partition_id, tablet_id, nullptr, accessor.get());
+    }
+    record_version_rowsets(cloud_unique_id2, 9);
+
+    // Phase 2.2: compaction [2-9]
+    compact_rowsets(cloud_unique_id2, 9, 2, 9, 9, 2);
+    record_version_rowsets(cloud_unique_id2, 2);
+
+    // Phase 2.3: compact snapshot chain for instance2
+    if (compact_snapshot_chain) {
+        SnapshotChainCompactor snapshot_chain_compactor(txn_kv);
+        ASSERT_FALSE(snapshot_chain_compactor.is_snapshot_chain_need_compact(instance_info2));
+        InstanceChainCompactor compactor(txn_kv, instance_info2);
+        ASSERT_EQ(compactor.do_compact(), 0);
+        get_instance(meta_service.get(), cloud_unique_id2, instance_info2);
+        resource_mgr->refresh_instance(instance_id2, instance_info2);
+    }
+
+    // Phase 3: drop instance2 and snapshot1
+    {
+        drop_instance(meta_service.get(), instance_id2);
+        get_instance(meta_service.get(), cloud_unique_id2, instance_info2);
+        resource_mgr->refresh_instance(instance_id2, instance_info2);
+    }
+    drop_snapshot(meta_service.get(), cloud_unique_id, ctx1.snapshot_id);
+
+    // Phase 4: recycle instance2/instance1
+    auto if_instance_deleted = [&](const std::string& cloud_unique_id) {
+        brpc::Controller cntl;
+        GetInstanceRequest req;
+        GetInstanceResponse res;
+        req.set_cloud_unique_id(cloud_unique_id);
+        meta_service->get_instance(&cntl, &req, &res, nullptr);
+        return !cntl.Failed() && res.status().code() == MetaServiceCode::INVALID_ARGUMENT;
+    };
+
+    auto recycle_instance = [&](const std::string& cloud_unique_id,
+                                const InstanceInfoPB& instance_info) {
+        // 1. recycle snapshots
+        // 2. recycle operation logs and generate RecycleRowset keys
+        // 3.recycle rowsets
+        for (int i = 0; i < 3; ++i) {
+            if (if_instance_deleted(cloud_unique_id)) {
+                return;
+            }
+            auto recycler = get_instance_recycler(meta_service.get(), instance_info, accessor);
+            ASSERT_EQ(recycler->init(), 0);
+            ASSERT_EQ(recycler->do_recycle(), 0);
+        }
+    };
+    recycle_instance(cloud_unique_id2, instance_info2);
+    recycle_instance(cloud_unique_id, instance_info1);
+
+    // Phase 4.1: check rowsets: [2][3][4][5][6][7] exists since referenced by instance1
+    std::set<std::string> instance1_versions = {"2-2", "3-3", "4-4", "5-5", "6-6", "7-7"};
+    for (auto& [version, rowset_id] : version_to_rowsets) {
+        bool file_exists = instance1_versions.find(version) != instance1_versions.end();
+        ASSERT_NO_FATAL_FAILURE(check_rowset_file(rowset_id, file_exists, version));
+    }
+
+    // Phase 5: compaction instance1 [2-7]
+    compact_rowsets(cloud_unique_id, 7, 2, 7, 7, 2);
+    record_version_rowsets(cloud_unique_id, 2);
+
+    // Phase 6: recycle instance1
+    recycle_instance(cloud_unique_id, instance_info1);
+
+    // Phase 6.1: check rowsets: [2-7] exists since referenced by instance1
+    instance1_versions = {"2-7"};
+    for (auto& [version, rowset_id] : version_to_rowsets) {
+        bool file_exists = instance1_versions.find(version) != instance1_versions.end();
+        ASSERT_NO_FATAL_FAILURE(check_rowset_file(rowset_id, file_exists, version));
+    }
+}
+
+TEST(SnapshotChainCompactorTest, RecycleDeletedInstance3) {
+    recycle_delete_instance3(false);
+    recycle_delete_instance3(true);
+}
+
+TEST(SnapshotChainCompactorTest, SnapshotDataSizeTest) {
+    config::force_immediate_recycle = false;
+    auto meta_service = get_meta_service();
+    auto resource_mgr = meta_service->resource_mgr();
+    auto txn_kv = meta_service->txn_kv();
+    auto recycle_instance = [&](const InstanceInfoPB& instance_info) {
+        {
+            auto recycler = get_instance_recycler(meta_service.get(), instance_info);
+            ASSERT_EQ(recycler->init(), 0);
+            ASSERT_EQ(recycler->do_recycle(), 0);
+        }
+    };
+
+    // create instance
+    std::string instance_id = "snapshot_data_size_test_instance1";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+    InstanceInfoPB instance_info1;
+    get_instance(meta_service.get(), cloud_unique_id, instance_info1);
+
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+    int64_t old_tablet_id = tablet_id, new_tablet_id_1 = 6;
+    int64_t new_partition_id = 7, new_partition_tablet_id = 8;
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+
+    MetaReader reader(instance_id, txn_kv.get());
+    TabletStatsPB tablet_stats;
+    std::vector<SnapshotContext> snapshots;
+    auto compact_rowsets = [&](const std::string& cloud_unique_id, int64_t max_version,
+                               int64_t start_version, int64_t end_version, int64_t before_rowsets,
+                               int64_t after_rowsets) {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, max_version, rowsets);
+        ASSERT_EQ(rowsets.size(), before_rowsets);
+
+        compact_rowsets_cumulative(meta_service.get(), cloud_unique_id, db_id, "compaction_label_1",
+                                   table_id, partition_id, tablet_id, start_version, end_version,
+                                   300);
+
+        rowsets.clear();
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, max_version, rowsets);
+        ASSERT_EQ(rowsets.size(), after_rowsets);
+    };
+
+    // Phase 1.1: insert 5 rowsets (version 2-6)
+    for (int i = 2; i <= 6; i++) {
+        insert_rowset(meta_service.get(), cloud_unique_id, db_id, fmt::format("label_{}", i),
+                      table_id, partition_id, tablet_id);
+    }
+    int64_t snapshot1_data_size = 0;
+    {
+        ASSERT_EQ(reader.get_tablet_merged_stats(tablet_id, &tablet_stats, nullptr),
+                  TxnErrorCode::TXN_OK);
+        ASSERT_EQ(tablet_stats.data_size(), 5 * 100 * DISK_SIZE_CONST);
+        snapshot1_data_size = tablet_stats.data_size();
+    }
+
+    // Phase 1.2: snapshot1
+    SnapshotContext ctx1;
+    begin_and_commit_snapshot(meta_service.get(), cloud_unique_id, ctx1, 100, snapshot1_data_size);
+    list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
+    ASSERT_EQ(snapshots.size(), 1);
+    ASSERT_EQ(snapshots[0].snapshot_id, ctx1.snapshot_id);
+    ASSERT_EQ(snapshots[0].snapshot_meta_image_size, 100);
+    ASSERT_EQ(snapshots[0].snapshot_logical_data_size, snapshot1_data_size);
+    ASSERT_EQ(snapshots[0].snapshot_retained_data_size, -1); // not calculated
+    ASSERT_EQ(snapshots[0].snapshot_billable_data_size, -1);
+
+    // Phase 1.3: recycle instance to trigger calculate data size(no operation log)
+    recycle_instance(instance_info1);
+    list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
+    ASSERT_EQ(snapshots.size(), 1);
+    ASSERT_EQ(snapshots[0].snapshot_retained_data_size, 0);
+    ASSERT_EQ(snapshots[0].snapshot_billable_data_size, 100);
+
+    // Phase 2.1: insert 6 rowsets (version 7-12)
+    for (int i = 7; i <= 12; i++) {
+        insert_rowset(meta_service.get(), cloud_unique_id, db_id, fmt::format("label_{}", i),
+                      table_id, partition_id, tablet_id);
+    }
+    int64_t snapshot2_data_size = 0;
+    {
+        ASSERT_EQ(reader.get_tablet_merged_stats(tablet_id, &tablet_stats, nullptr),
+                  TxnErrorCode::TXN_OK);
+        ASSERT_EQ(tablet_stats.data_size(), 11 * 100 * DISK_SIZE_CONST);
+        snapshot2_data_size = tablet_stats.data_size();
+    }
+
+    // Phase 2.2: snapshot2
+    SnapshotContext ctx2;
+    begin_and_commit_snapshot(meta_service.get(), cloud_unique_id, ctx2, 200, snapshot2_data_size);
+
+    // Phase 2.3: recycle instance to trigger calculate data size (no operation log)
+    recycle_instance(instance_info1);
+    list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
+    ASSERT_EQ(snapshots.size(), 2);
+    ASSERT_EQ(snapshots[0].snapshot_id, ctx1.snapshot_id);
+    ASSERT_EQ(snapshots[0].snapshot_meta_image_size, 100);
+    ASSERT_EQ(snapshots[0].snapshot_logical_data_size, snapshot1_data_size);
+    ASSERT_EQ(snapshots[0].snapshot_retained_data_size, 0);
+    ASSERT_EQ(snapshots[0].snapshot_billable_data_size, 100);
+    ASSERT_EQ(snapshots[1].snapshot_id, ctx2.snapshot_id);
+    ASSERT_EQ(snapshots[1].snapshot_logical_data_size, snapshot2_data_size);
+    ASSERT_EQ(snapshots[1].snapshot_retained_data_size, 0);
+    ASSERT_EQ(snapshots[1].snapshot_billable_data_size, 200);
+
+    // Phase 3.1: compact 6 rowsets (version 2-6)
+    compact_rowsets(cloud_unique_id, 12, 2, 6, 12, 8);
+
+    // Phase 3.2: recycle instance to trigger calculate data size (1 operation log)
+    recycle_instance(instance_info1);
+    list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
+    ASSERT_EQ(snapshots.size(), 2);
+    ASSERT_EQ(snapshots[0].snapshot_id, ctx1.snapshot_id);
+    ASSERT_EQ(snapshots[0].snapshot_retained_data_size, snapshot1_data_size);
+    ASSERT_EQ(snapshots[0].snapshot_billable_data_size, snapshot1_data_size + 100);
+    ASSERT_EQ(snapshots[1].snapshot_id, ctx2.snapshot_id);
+    ASSERT_EQ(snapshots[1].snapshot_retained_data_size, 0);
+    ASSERT_EQ(snapshots[1].snapshot_billable_data_size, 200);
+
+    // Phase 3.3: drop snapshot1 and recycle instance (1 operation log)
+    drop_snapshot(meta_service.get(), cloud_unique_id, ctx1.snapshot_id);
+    recycle_instance(instance_info1);
+    list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
+    ASSERT_EQ(snapshots.size(), 1);
+    ASSERT_EQ(snapshots[0].snapshot_id, ctx2.snapshot_id);
+    ASSERT_EQ(snapshots[0].snapshot_retained_data_size, snapshot1_data_size);
+
+    // Phase 3.4: snapshot3
+    int64_t snapshot3_data_size = 0;
+    {
+        ASSERT_EQ(reader.get_tablet_merged_stats(tablet_id, &tablet_stats, nullptr),
+                  TxnErrorCode::TXN_OK);
+        snapshot3_data_size = tablet_stats.data_size();
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, 12, rowsets);
+        ASSERT_EQ(rowsets.size(), 8);
+    }
+    SnapshotContext ctx3;
+    begin_and_commit_snapshot(meta_service.get(), cloud_unique_id, ctx3, 300, snapshot3_data_size);
+
+    // Phase 3.5: recycle instance to trigger calculate data size (1 operation log)
+    recycle_instance(instance_info1);
+    list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
+    ASSERT_EQ(snapshots.size(), 2);
+    ASSERT_EQ(snapshots[0].snapshot_id, ctx2.snapshot_id);
+    ASSERT_EQ(snapshots[0].snapshot_retained_data_size, snapshot1_data_size);
+    ASSERT_EQ(snapshots[1].snapshot_id, ctx3.snapshot_id);
+    ASSERT_EQ(snapshots[1].snapshot_logical_data_size, snapshot3_data_size);
+    ASSERT_EQ(snapshots[1].snapshot_retained_data_size, 0);
+
+    // Phase 4.1: compact 2 rowsets: [2-6][7-7]
+    compact_rowsets(cloud_unique_id, 12, 2, 7, 8, 7);
+
+    // Phase 4.2: recycle instance to trigger calculate data size (2 operation log)
+    recycle_instance(instance_info1);
+    list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
+    ASSERT_EQ(snapshots.size(), 2);
+    ASSERT_EQ(snapshots[0].snapshot_id, ctx2.snapshot_id);
+    // [2][3][4][5][6] + [2-6][7] rowsets are referenced
+    ASSERT_EQ(snapshots[0].snapshot_retained_data_size,
+              6 * 100 * DISK_SIZE_CONST + 1 * 300 * DISK_SIZE_CONST);
+    ASSERT_EQ(snapshots[1].snapshot_id, ctx3.snapshot_id);
+    ASSERT_EQ(snapshots[1].snapshot_retained_data_size, 0);
+
+    // Phase 4.3: drop snapshot2 and recycle instance (1 operation log is recycled, left 1 op log)
+    drop_snapshot(meta_service.get(), cloud_unique_id, ctx2.snapshot_id);
+    recycle_instance(instance_info1);
+    list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
+    ASSERT_EQ(snapshots.size(), 1);
+    ASSERT_EQ(snapshots[0].snapshot_id, ctx3.snapshot_id);
+    // [2-6][7] rowsets are referenced
+    ASSERT_EQ(snapshots[0].snapshot_retained_data_size,
+              1 * 100 * DISK_SIZE_CONST + 1 * 300 * DISK_SIZE_CONST);
+
+    int64_t old_tablet_data_size = 0;
+    {
+        ASSERT_EQ(reader.get_tablet_merged_stats(tablet_id, &tablet_stats, nullptr),
+                  TxnErrorCode::TXN_OK);
+        old_tablet_data_size = tablet_stats.data_size();
+    }
+
+    // Phase 5.1: schema change
+    {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, 12, rowsets);
+        ASSERT_EQ(rowsets.size(), 7);
+
+        std::vector<doris::RowsetMetaCloudPB> output_rowsets;
+        std::string job_id = fmt::format("schema_change_{}_{}", old_tablet_id, new_tablet_id_1);
+        int64_t alter_version = 12;
+
+        // Create new tablet
+        create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                      new_tablet_id_1, false, TabletStatePB::PB_NOTREADY);
+
+        // Start schema change job
+        start_schema_change_job(meta_service.get(), cloud_unique_id, table_id, index_id,
+                                partition_id, old_tablet_id, new_tablet_id_1, job_id, "test_case",
+                                alter_version);
+
+        // Create output rowsets for new_tablet_1
+        for (auto& rowset : rowsets) {
+            auto version = rowset.end_version();
+            int64_t txn_id = 100000 + version;
+            auto output_rowset = create_rowset(txn_id, new_tablet_id_1, partition_id, version,
+                                               rowset.num_rows());
+            output_rowsets.push_back(output_rowset);
+            prepare_rowset(meta_service.get(), cloud_unique_id, output_rowset);
+            commit_rowset(meta_service.get(), cloud_unique_id, output_rowset);
+        }
+
+        // Finish schema change
+        finish_schema_change_job(meta_service.get(), cloud_unique_id, old_tablet_id,
+                                 new_tablet_id_1, job_id, "test_case", output_rowsets);
+
+        // Verify new_tablet_1 has all rowsets
+        std::vector<doris::RowsetMetaCloudPB> rowsets1;
+        get_rowsets(meta_service.get(), cloud_unique_id, new_tablet_id_1, 0, 12, rowsets1);
+        ASSERT_EQ(rowsets1.size(), 7); // [0-1], [2-7], [8-8], [9-9], [10-10], [11-11], [12-12]
+    }
+    int64_t new_tablet_data_size = 0;
+    {
+        ASSERT_EQ(reader.get_tablet_merged_stats(new_tablet_id_1, &tablet_stats, nullptr),
+                  TxnErrorCode::TXN_OK);
+        new_tablet_data_size = tablet_stats.data_size();
+    }
+
+    recycle_instance(instance_info1);
+    list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
+    ASSERT_EQ(snapshots.size(), 1);
+    ASSERT_EQ(snapshots[0].snapshot_id, ctx3.snapshot_id);
+    ASSERT_EQ(snapshots[0].snapshot_retained_data_size,
+              1 * 100 * DISK_SIZE_CONST + 1 * 300 * DISK_SIZE_CONST);
+
+    // Phase 6.1: drop partition1
+    drop_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id, index_id);
+    recycle_instance(instance_info1);
+    list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
+    ASSERT_EQ(snapshots.size(), 1);
+    ASSERT_EQ(snapshots[0].snapshot_id, ctx3.snapshot_id);
+    ASSERT_EQ(snapshots[0].snapshot_retained_data_size,
+              1 * 100 * DISK_SIZE_CONST + 1 * 300 * DISK_SIZE_CONST + old_tablet_data_size +
+                      new_tablet_data_size);
+
+    // Phase 6.2: recycle agin, the operation log record partition data size
+    recycle_instance(instance_info1);
+    list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
+    ASSERT_EQ(snapshots.size(), 1);
+    ASSERT_EQ(snapshots[0].snapshot_id, ctx3.snapshot_id);
+    ASSERT_EQ(snapshots[0].snapshot_retained_data_size,
+              1 * 100 * DISK_SIZE_CONST + 1 * 300 * DISK_SIZE_CONST + old_tablet_data_size +
+                      new_tablet_data_size);
+    {
+        std::string log_key_prefix = versioned::log_key(instance_id);
+        std::string begin_key = encode_versioned_key(log_key_prefix, Versionstamp::min());
+        std::string end_key = encode_versioned_key(log_key_prefix, Versionstamp::max());
+        std::unique_ptr<BlobIterator> iter = blob_get_range(txn_kv, begin_key, end_key);
+        for (size_t i = 0; iter->valid(); iter->next(), i++) {
+            OperationLogPB operation_log;
+            ASSERT_TRUE(iter->parse_value(&operation_log));
+            if (operation_log.has_drop_partition()) {
+                auto& partition_data_size =
+                        operation_log.drop_partition().index_partition_to_data_size();
+                ASSERT_EQ(partition_data_size.size(), 1);
+                auto key = fmt::format("{}-{}", index_id, partition_id);
+                auto it = partition_data_size.find(key);
+                ASSERT_TRUE(it != partition_data_size.end());
+                ASSERT_EQ(it->second, old_tablet_data_size + new_tablet_data_size);
+            }
+        }
+        ASSERT_EQ(iter->error_code(), TxnErrorCode::TXN_OK);
+    }
+
+    // Phase 7.1: create new partition
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id,
+                                 new_partition_id, index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, new_partition_id,
+                  new_partition_tablet_id);
+    // insert 5 rowsets (version 2-6)
+    for (int i = 2; i <= 6; i++) {
+        insert_rowset(meta_service.get(), cloud_unique_id, db_id, fmt::format("new_label_{}", i),
+                      table_id, new_partition_id, new_partition_tablet_id);
+    }
+
+    // Phase 7.2: snapshot4
+    SnapshotContext ctx4;
+    int64_t snapshot4_data_size = 0;
+    begin_and_commit_snapshot(meta_service.get(), cloud_unique_id, ctx4, 400, snapshot4_data_size);
+
+    // Phase 8.1: drop index
+    drop_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+
+    // recycle agin, the operation log record partition data size
+    recycle_instance(instance_info1);
+    list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
+    ASSERT_EQ(snapshots.size(), 2);
+    ASSERT_EQ(snapshots[0].snapshot_id, ctx3.snapshot_id);
+    ASSERT_EQ(snapshots[0].snapshot_retained_data_size,
+              1 * 100 * DISK_SIZE_CONST + 1 * 300 * DISK_SIZE_CONST + old_tablet_data_size +
+                      new_tablet_data_size + 5 * 100 * DISK_SIZE_CONST);
+    ASSERT_EQ(snapshots[0].snapshot_id, ctx3.snapshot_id);
+    ASSERT_EQ(snapshots[1].snapshot_id, ctx4.snapshot_id);
+    ASSERT_EQ(snapshots[1].snapshot_retained_data_size, 0);
+    {
+        std::string log_key_prefix = versioned::log_key(instance_id);
+        std::string begin_key = encode_versioned_key(log_key_prefix, Versionstamp::min());
+        std::string end_key = encode_versioned_key(log_key_prefix, Versionstamp::max());
+        std::unique_ptr<BlobIterator> iter = blob_get_range(txn_kv, begin_key, end_key);
+        for (size_t i = 0; iter->valid(); iter->next(), i++) {
+            OperationLogPB operation_log;
+            ASSERT_TRUE(iter->parse_value(&operation_log));
+            if (operation_log.has_drop_partition()) {
+                auto& partition_data_size =
+                        operation_log.drop_partition().index_partition_to_data_size();
+                ASSERT_EQ(partition_data_size.size(), 1);
+                auto key = fmt::format("{}-{}", index_id, partition_id);
+                auto it = partition_data_size.find(key);
+                ASSERT_TRUE(it != partition_data_size.end());
+                ASSERT_EQ(it->second, old_tablet_data_size + new_tablet_data_size);
+            } else if (operation_log.has_drop_index()) {
+                auto& partition_data_size =
+                        operation_log.drop_index().index_partition_to_data_size();
+                ASSERT_EQ(partition_data_size.size(), 1);
+                auto key = fmt::format("{}-{}", index_id, new_partition_id);
+                auto it = partition_data_size.find(key);
+                ASSERT_TRUE(it != partition_data_size.end());
+                ASSERT_EQ(it->second, 5 * 100 * DISK_SIZE_CONST);
+            }
+        }
+        ASSERT_EQ(iter->error_code(), TxnErrorCode::TXN_OK);
+    }
+
+    // Phase 8.2: drop snapshot3
+    drop_snapshot(meta_service.get(), cloud_unique_id, ctx3.snapshot_id);
+    recycle_instance(instance_info1);
+    list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
+    ASSERT_EQ(snapshots.size(), 1);
+    ASSERT_EQ(snapshots[0].snapshot_id, ctx4.snapshot_id);
+    ASSERT_EQ(snapshots[0].snapshot_retained_data_size, 5 * 100 * DISK_SIZE_CONST);
+}
+
+TEST(SnapshotChainCompactorTest, CloneSnapshotDataSizeTest) {
+    auto meta_service = get_meta_service();
+    auto resource_mgr = meta_service->resource_mgr();
+    auto txn_kv = meta_service->txn_kv();
+    auto recycle_instance = [&](const InstanceInfoPB& instance_info) {
+        auto recycler = get_instance_recycler(meta_service.get(), instance_info);
+        ASSERT_EQ(recycler->init(), 0);
+        ASSERT_EQ(recycler->do_recycle(), 0);
+    };
+
+    // create instance
+    std::string instance_id = "clone_data_size_test_instance1";
+    std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+    create_and_refresh_instance(meta_service.get(), instance_id);
+    InstanceInfoPB instance_info1;
+    get_instance(meta_service.get(), cloud_unique_id, instance_info1);
+
+    int64_t db_id = 1, table_id = 2, index_id = 3, partition_id = 4, tablet_id = 5;
+    // create partition/index/tablet
+    prepare_and_commit_index(meta_service.get(), cloud_unique_id, db_id, table_id, index_id);
+    prepare_and_commit_partition(meta_service.get(), cloud_unique_id, db_id, table_id, partition_id,
+                                 index_id);
+    create_tablet(meta_service.get(), cloud_unique_id, db_id, table_id, index_id, partition_id,
+                  tablet_id);
+
+    MetaReader reader(instance_id, txn_kv.get());
+    TabletStatsPB tablet_stats;
+    std::vector<SnapshotContext> snapshots;
+    auto compact_rowsets = [&](const std::string& cloud_unique_id, int64_t max_version,
+                               int64_t start_version, int64_t end_version, int64_t before_rowsets,
+                               int64_t after_rowsets) {
+        std::vector<doris::RowsetMetaCloudPB> rowsets;
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, max_version, rowsets);
+        ASSERT_EQ(rowsets.size(), before_rowsets);
+
+        compact_rowsets_cumulative(meta_service.get(), cloud_unique_id, db_id, "compaction_label_1",
+                                   table_id, partition_id, tablet_id, start_version, end_version,
+                                   300);
+
+        rowsets.clear();
+        get_rowsets(meta_service.get(), cloud_unique_id, tablet_id, 0, max_version, rowsets);
+        ASSERT_EQ(rowsets.size(), after_rowsets);
+    };
+
+    // Phase 1.1.1: insert 5 rowsets (version 2-6)
+    for (int i = 2; i <= 6; i++) {
+        insert_rowset(meta_service.get(), cloud_unique_id, db_id, fmt::format("label_{}", i),
+                      table_id, partition_id, tablet_id);
+    }
+    int64_t snapshot1_data_size = 0;
+    {
+        ASSERT_EQ(reader.get_tablet_merged_stats(tablet_id, &tablet_stats, nullptr),
+                  TxnErrorCode::TXN_OK);
+        ASSERT_EQ(tablet_stats.data_size(), 5 * 100 * DISK_SIZE_CONST);
+        snapshot1_data_size = tablet_stats.data_size();
+    }
+
+    // Phase 1.1.2: snapshot1
+    SnapshotContext ctx1;
+    begin_and_commit_snapshot(meta_service.get(), cloud_unique_id, ctx1, 100, snapshot1_data_size);
+    list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
+    ASSERT_EQ(snapshots.size(), 1);
+    ASSERT_EQ(snapshots[0].snapshot_id, ctx1.snapshot_id);
+    ASSERT_EQ(snapshots[0].snapshot_meta_image_size, 100);
+    ASSERT_EQ(snapshots[0].snapshot_logical_data_size, snapshot1_data_size);
+    ASSERT_EQ(snapshots[0].snapshot_retained_data_size, -1); // not calculated
+
+    // Phase 1.1.3: recycle instance to trigger calculate data size(no operation log)
+    recycle_instance(instance_info1);
+    list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
+    ASSERT_EQ(snapshots.size(), 1);
+    ASSERT_EQ(snapshots[0].snapshot_retained_data_size, 0);
+
+    // Phase 1.2.1: insert 6 rowsets (version 7-12)
+    for (int i = 7; i <= 12; i++) {
+        insert_rowset(meta_service.get(), cloud_unique_id, db_id, fmt::format("label_{}", i),
+                      table_id, partition_id, tablet_id);
+    }
+    int64_t snapshot2_data_size = 0;
+    {
+        ASSERT_EQ(reader.get_tablet_merged_stats(tablet_id, &tablet_stats, nullptr),
+                  TxnErrorCode::TXN_OK);
+        ASSERT_EQ(tablet_stats.data_size(), 11 * 100 * DISK_SIZE_CONST);
+        snapshot2_data_size = tablet_stats.data_size();
+    }
+
+    // Phase 1.2.2: snapshot2
+    SnapshotContext ctx2;
+    begin_and_commit_snapshot(meta_service.get(), cloud_unique_id, ctx2, 200, snapshot2_data_size);
+
+    // Phase 1.2.3: recycle instance to trigger calculate data size (no operation log)
+    recycle_instance(instance_info1);
+    list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
+    ASSERT_EQ(snapshots.size(), 2);
+    ASSERT_EQ(snapshots[0].snapshot_id, ctx1.snapshot_id);
+    ASSERT_EQ(snapshots[0].snapshot_meta_image_size, 100);
+    ASSERT_EQ(snapshots[0].snapshot_logical_data_size, snapshot1_data_size);
+    ASSERT_EQ(snapshots[0].snapshot_retained_data_size, 0);
+    ASSERT_EQ(snapshots[1].snapshot_id, ctx2.snapshot_id);
+    ASSERT_EQ(snapshots[1].snapshot_logical_data_size, snapshot2_data_size);
+    ASSERT_EQ(snapshots[1].snapshot_retained_data_size, 0);
+
+    // Phase 1.3.1: compact 6 rowsets (version 2-6)
+    compact_rowsets(cloud_unique_id, 12, 2, 6, 12, 8);
+
+    // Phase 1.3.2: recycle instance to trigger calculate data size (1 operation log)
+    recycle_instance(instance_info1);
+    list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
+    ASSERT_EQ(snapshots.size(), 2);
+    ASSERT_EQ(snapshots[0].snapshot_id, ctx1.snapshot_id);
+    ASSERT_EQ(snapshots[0].snapshot_retained_data_size, snapshot1_data_size);
+    ASSERT_EQ(snapshots[1].snapshot_id, ctx2.snapshot_id);
+    ASSERT_EQ(snapshots[1].snapshot_retained_data_size, 0);
+
+    // Phase 2.1: clone instance2 from snapshot1
+    std::string instance_id2 = "clone_data_size_test_instance2";
+    std::string cloud_unique_id2 = fmt::format("1:{}:0", instance_id2);
+    InstanceInfoPB instance_info2;
+    clone_and_refresh_instance(meta_service.get(), resource_mgr.get(), instance_id,
+                               ctx2.snapshot_id, instance_id2, instance_info2,
+                               CloneInstanceRequest::READ_ONLY);
+    // Phase 2.2: compact version 2-7
+    compact_rowsets(cloud_unique_id2, 12, 2, 7, 12, 7);
+
+    // Phase 2.3: recycle instance to trigger calculate data size (1 operation log)
+    recycle_instance(instance_info1);
+    recycle_instance(instance_info2);
+    {
+        list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
+        ASSERT_EQ(snapshots.size(), 2);
+        ASSERT_EQ(snapshots[0].snapshot_id, ctx1.snapshot_id);
+        ASSERT_EQ(snapshots[0].snapshot_retained_data_size, snapshot1_data_size);
+        ASSERT_EQ(snapshots[1].snapshot_id, ctx2.snapshot_id);
+        ASSERT_EQ(snapshots[1].snapshot_retained_data_size, 0);
+    }
+    {
+        get_instance(meta_service.get(), cloud_unique_id2, instance_info2);
+        ASSERT_TRUE(instance_info2.has_snapshot_retained_data_size());
+        ASSERT_EQ(instance_info2.snapshot_retained_data_size(), 6 * 100 * DISK_SIZE_CONST);
+    }
+
+    // Phase 3.1: clone instance3 from snapshot1
+    std::string instance_id3 = "clone_data_size_test_instance3";
+    std::string cloud_unique_id3 = fmt::format("1:{}:0", instance_id3);
+    InstanceInfoPB instance_info3;
+    clone_and_refresh_instance(meta_service.get(), resource_mgr.get(), instance_id,
+                               ctx2.snapshot_id, instance_id3, instance_info3,
+                               CloneInstanceRequest::READ_ONLY);
+
+    // Phase 3.2: drop partition
+    drop_partition(meta_service.get(), cloud_unique_id3, db_id, table_id, partition_id, index_id);
+
+    // Phase 3.3: recycle instance to trigger calculate data size (1 operation log)
+    recycle_instance(instance_info1);
+    recycle_instance(instance_info3);
+    {
+        list_snapshot(meta_service.get(), cloud_unique_id, &snapshots);
+        ASSERT_EQ(snapshots.size(), 2);
+        ASSERT_EQ(snapshots[0].snapshot_id, ctx1.snapshot_id);
+        ASSERT_EQ(snapshots[0].snapshot_retained_data_size, snapshot1_data_size);
+        ASSERT_EQ(snapshots[1].snapshot_id, ctx2.snapshot_id);
+        ASSERT_EQ(snapshots[1].snapshot_retained_data_size, 0);
+    }
+    {
+        get_instance(meta_service.get(), cloud_unique_id3, instance_info3);
+        // NOTE: because keys are in instance1, can not scan any tablets
+        ASSERT_TRUE(instance_info3.has_snapshot_retained_data_size());
+        ASSERT_EQ(instance_info3.snapshot_retained_data_size(), 0);
     }
 }

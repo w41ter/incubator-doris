@@ -273,8 +273,8 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
         try {
             Cloud.CommitSnapshotRequest request = Cloud.CommitSnapshotRequest.newBuilder()
                     .setCloudUniqueId(Config.cloud_unique_id).setSnapshotId(snapshotId).setImageUrl(imageUrl)
-                    .setLastJournalId(logId).setImageFileSize(imageFileSize).setSnapshotDataSize(snapshotDataSize)
-                    .build();
+                    .setLastJournalId(logId).setSnapshotMetaImageSize(imageFileSize)
+                    .setSnapshotLogicalDataSize(snapshotDataSize).build();
             Cloud.CommitSnapshotResponse response = MetaServiceProxy.getInstance().commitSnapshot(request);
             if (response.getStatus().getCode() != Cloud.MetaServiceCode.OK) {
                 LOG.warn("commitSnapshot response: {} ", response);
