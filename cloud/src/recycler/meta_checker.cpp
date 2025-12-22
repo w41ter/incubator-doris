@@ -39,10 +39,18 @@
 #include "meta-store/keys.h"
 #include "meta-store/txn_kv.h"
 
+#ifdef FEATURE_ENTERPRISE_SNAPSHOT
+#include "enterprise/snapshot/snapshot_manager.h"
+#endif
+
 namespace doris::cloud {
 
-MetaChecker::MetaChecker(std::shared_ptr<TxnKv> txn_kv) : txn_kv_(std::move(txn_kv)) {
-    snapshot_manager_ = std::make_shared<SnapshotManager>(txn_kv_);
+MetaChecker::MetaChecker(std::shared_ptr<TxnKv> txn_kv) : txn_kv_(txn_kv) {
+    #ifdef FEATURE_ENTERPRISE_SNAPSHOT
+    snapshot_manager_ = std::make_shared<selectdb::SnapshotManager>(std::move(txn_kv));
+#else
+    snapshot_manager_ = std::make_shared<SnapshotManager>(std::move(txn_kv));
+#endif
 }
 
 bool MetaChecker::scan_and_handle_kv(

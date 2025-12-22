@@ -16,6 +16,7 @@
 #include "common/util.h"
 #include "meta-service/meta_service_schema.h"
 #include "meta-store/blob_message.h"
+#include "meta-store/clone_chain_reader.h"
 #include "meta-store/document_message.h"
 #include "meta-store/document_message_get_range.h"
 #include "meta-store/keys.h"
@@ -73,9 +74,43 @@ bool is_snapshot_normal(const SnapshotPB& snapshot_pb) {
     }
 }
 
+int check_tablet_stats(TxnKv* txn_kv, InstanceChecker* checker, const std::string& instance_id,
+                       Versionstamp& snapshot_versionstamp, int64_t tablet_id,
+                       std::array<int64_t, 6>& tablet_stats) {
+    CloneChainReader reader(instance_id, snapshot_versionstamp, txn_kv, checker->resource_mgr());
+    TabletStatsPB tablet_stats_pb;
+    TxnErrorCode err = reader.get_tablet_merged_stats(tablet_id, &tablet_stats_pb,
+                                                      &snapshot_versionstamp, false);
+    if (err != TxnErrorCode::TXN_OK) {
+        LOG(WARNING) << "failed to get tablet merged stats, tablet_id=" << tablet_id;
+        return -1;
+    }
+    // num_rowsets, num_rows, num_segments, segment_disk_size, index_disk_size, data_disk_size
+    if (tablet_stats_pb.has_num_rowsets() && tablet_stats_pb.num_rowsets() != tablet_stats[0]) {
+        return 1;
+    }
+    if (tablet_stats_pb.has_num_rows() && tablet_stats_pb.num_rows() != tablet_stats[1]) {
+        return 1;
+    }
+    if (tablet_stats_pb.has_num_segments() && tablet_stats_pb.num_segments() != tablet_stats[2]) {
+        return 1;
+    }
+    if (tablet_stats_pb.has_segment_size() && tablet_stats_pb.data_size() != tablet_stats[3]) {
+        return 1;
+    }
+    if (tablet_stats_pb.has_index_size() && tablet_stats_pb.index_size() != tablet_stats[4]) {
+        return 1;
+    }
+    if (tablet_stats_pb.has_data_size() && tablet_stats_pb.data_size() != tablet_stats[5]) {
+        return 1;
+    }
+    return 0;
+}
+
 int check_rowsets_object(TxnKv* txn_kv, InstanceChecker* checker, const std::string& instance_id,
                          const Versionstamp& snapshot_versionstamp,
-                         std::vector<doris::RowsetMetaCloudPB>& rowset_metas) {
+                         std::vector<doris::RowsetMetaCloudPB>& rowset_metas,
+                         std::array<int64_t, 6>& tablet_stats) {
     struct TabletFiles {
         int64_t tablet_id {0};
         std::unordered_set<std::string> files;
@@ -98,12 +133,30 @@ int check_rowsets_object(TxnKv* txn_kv, InstanceChecker* checker, const std::str
     };
 
     int check_ret = 0;
-    MetaReader reader(instance_id, txn_kv, snapshot_versionstamp);
+    CloneChainReader reader(instance_id, snapshot_versionstamp, txn_kv, checker->resource_mgr());
+
+    int64_t num_rowsets = 0;
+    int64_t num_rows = 0;
+    int64_t num_segments = 0;
+    int64_t segment_disk_size = 0;
+    int64_t index_disk_size = 0;
+    int64_t data_disk_size = 0;
 
     for (auto& rs_meta : rowset_metas) {
         if (rs_meta.num_segments() == 0) {
             // empty rowset, skip
             continue;
+        }
+
+        num_rowsets++;
+        num_rows += rs_meta.num_rows();
+        num_segments += rs_meta.num_segments();
+
+        index_disk_size += rs_meta.index_disk_size();
+        data_disk_size += rs_meta.total_disk_size();
+
+        for (size_t i = 0; i < rs_meta.num_segments(); i++) {
+            segment_disk_size += rs_meta.segments_file_size(i);
         }
 
         if (tablet_files_cache.tablet_id != rs_meta.tablet_id()) {
@@ -217,6 +270,10 @@ int check_rowsets_object(TxnKv* txn_kv, InstanceChecker* checker, const std::str
             }
         }
     }
+
+    tablet_stats = std::array<int64_t, 6> {num_rowsets,       num_rows,        num_segments,
+                                           segment_disk_size, index_disk_size, data_disk_size};
+
     return check_ret;
 }
 
@@ -266,7 +323,8 @@ int check_snapshot_key_exist(TxnKv* txn_kv, std::string_view instance_id,
 int check_inverted_index_file_storage_format_v1(TxnKv* txn_kv, const std::string& instance_id,
                                                 int64_t tablet_id, const std::string& file_path,
                                                 const std::string& rowset_info,
-                                                RowsetIndexesFormatV1& rowset_index_cache_v1) {
+                                                RowsetIndexesFormatV1& rowset_index_cache_v1,
+                                                ResourceManager* rc_mgr) {
     // format v1: data/{tablet_id}/{rowset_id}_{seg_num}_{idx_id}{idx_suffix}.idx
     std::string rowset_id;
     int64_t segment_id;
@@ -304,7 +362,7 @@ int check_inverted_index_file_storage_format_v1(TxnKv* txn_kv, const std::string
     rowset_index_cache_v1.segment_ids.clear();
     rowset_index_cache_v1.index_ids.clear();
 
-    MetaReader reader(instance_id, txn_kv, Versionstamp::max());
+    CloneChainReader reader(instance_id, Versionstamp::max(), txn_kv, rc_mgr);
 
     auto capture_rowset_meta_to_cache =
             [&](std::vector<std::pair<doris::RowsetMetaCloudPB, Versionstamp>>& rowset_metas) {
@@ -401,7 +459,8 @@ int check_inverted_index_file_storage_format_v1(TxnKv* txn_kv, const std::string
 int check_inverted_index_file_storage_format_v2(TxnKv* txn_kv, const std::string& instance_id,
                                                 int64_t tablet_id, const std::string& file_path,
                                                 const std::string& rowset_info,
-                                                RowsetIndexesFormatV2& rowset_index_cache_v2) {
+                                                RowsetIndexesFormatV2& rowset_index_cache_v2,
+                                                ResourceManager* rc_mgr) {
     std::string rowset_id;
     int64_t segment_id;
     // {rowset_id}_{seg_num}.idx
@@ -429,7 +488,7 @@ int check_inverted_index_file_storage_format_v2(TxnKv* txn_kv, const std::string
     rowset_index_cache_v2.segment_ids.clear();
 
     std::vector<std::pair<doris::RowsetMetaCloudPB, Versionstamp>> rowset_metas;
-    MetaReader reader(instance_id, txn_kv, Versionstamp::max());
+    CloneChainReader reader(instance_id, Versionstamp::max(), txn_kv, rc_mgr);
     TxnErrorCode err = reader.get_load_rowset_metas(tablet_id, &rowset_metas, false);
     if (err != TxnErrorCode::TXN_OK) {
         LOG(WARNING) << "failed to get load rowset metas by tablet id"
@@ -469,7 +528,8 @@ int check_inverted_index_file_storage_format_v2(TxnKv* txn_kv, const std::string
 
 int check_inverted_index_file(TxnKv* txn_kv, const std::string& instance_id,
                               const std::string& path, RowsetIndexesFormatV1& rowset_index_cache_v1,
-                              RowsetIndexesFormatV2& rowset_index_cache_v2) {
+                              RowsetIndexesFormatV2& rowset_index_cache_v2,
+                              ResourceManager* rc_mgr) {
     std::vector<std::string> str;
     butil::SplitString(path, '/', &str);
     // format v1: data/{tablet_id}/{rowset_id}_{seg_num}_{idx_id}{idx_suffix}.idx
@@ -507,11 +567,11 @@ int check_inverted_index_file(TxnKv* txn_kv, const std::string& instance_id,
         return -1;
     }
     if (inverted_index_storage_format == doris::InvertedIndexStorageFormatPB::V1) {
-        return check_inverted_index_file_storage_format_v1(txn_kv, instance_id, tablet_id, path,
-                                                           rowset_info, rowset_index_cache_v1);
+        return check_inverted_index_file_storage_format_v1(
+                txn_kv, instance_id, tablet_id, path, rowset_info, rowset_index_cache_v1, rc_mgr);
     } else {
-        return check_inverted_index_file_storage_format_v2(txn_kv, instance_id, tablet_id, path,
-                                                           rowset_info, rowset_index_cache_v2);
+        return check_inverted_index_file_storage_format_v2(
+                txn_kv, instance_id, tablet_id, path, rowset_info, rowset_index_cache_v2, rc_mgr);
     }
 }
 
@@ -524,17 +584,20 @@ int check_mvcc_meta_rowset_key(InstanceChecker* checker, TxnKv* txn_kv) {
     StopWatch stop_watch;
     size_t total_rowsets = 0;
     size_t num_rowsets_loss = 0;
+    size_t num_rowsets_abnormal = 0;
 
     DORIS_CLOUD_DEFER {
         int64_t cost = stop_watch.elapsed_us() / 1000'000;
 
         LOG_INFO("check cluster snapshots, cost={}s", cost)
                 .tag("total_rowsets", total_rowsets)
+                .tag("num_rowsets_abnormal", num_rowsets_abnormal)
                 .tag("num_rowsets_loss", num_rowsets_loss);
     };
 
     std::vector<std::pair<SnapshotPB, Versionstamp>> snapshots;
     MetaReader reader(instance_id, txn_kv);
+    auto* rc_mgr = checker->resource_mgr();
     TxnErrorCode err = reader.get_snapshots(&snapshots);
     if (err != TxnErrorCode::TXN_OK) {
         LOG_WARNING("failed to get snapshots").tag("error_code", err);
@@ -578,7 +641,7 @@ int check_mvcc_meta_rowset_key(InstanceChecker* checker, TxnKv* txn_kv) {
             auto&& [_, __, tablet_meta] = *kvp;
             auto tablet_id = tablet_meta.tablet_id();
             std::vector<doris::RowsetMetaCloudPB> rowset_metas;
-            MetaReader snapshot_reader(instance_id, txn_kv, snapshot_versionstamp);
+            CloneChainReader snapshot_reader(instance_id, snapshot_versionstamp, txn_kv, rc_mgr);
             err = snapshot_reader.get_rowset_metas(tablet_id, 0, INT64_MAX - 1, &rowset_metas,
                                                    false);
 
@@ -600,10 +663,22 @@ int check_mvcc_meta_rowset_key(InstanceChecker* checker, TxnKv* txn_kv) {
 
             total_rowsets += rowset_metas.size();
 
+            // num_rowsets, num_rows, num_segments, segment_disk_size, index_disk_size, data_disk_size
+            std::array<int64_t, 6> tablet_stats;
+
             int ret = check_rowsets_object(txn_kv, checker, instance_id, snapshot_versionstamp,
-                                           rowset_metas);
+                                           rowset_metas, tablet_stats);
             if (ret > 0) {
                 num_rowsets_loss++;
+                check_ret = 1;
+            } else if (ret < 0) {
+                check_ret = -1;
+            }
+
+            ret = check_tablet_stats(txn_kv, checker, instance_id, snapshot_versionstamp, tablet_id,
+                                     tablet_stats);
+            if (ret > 0) {
+                num_rowsets_abnormal++;
                 check_ret = 1;
             } else if (ret < 0) {
                 check_ret = -1;
@@ -611,7 +686,9 @@ int check_mvcc_meta_rowset_key(InstanceChecker* checker, TxnKv* txn_kv) {
         }
 
         if (check_ret != 0) {
-            LOG_WARNING("failed to check rowset objects");
+            LOG_WARNING("failed to check rowset objects")
+                    .tag("snapshot_versionstamp", snapshot_versionstamp.to_string())
+                    .tag("ret", check_ret);
         }
     }
 
@@ -619,7 +696,7 @@ int check_mvcc_meta_rowset_key(InstanceChecker* checker, TxnKv* txn_kv) {
 }
 
 int check_rowset_key_exist(TxnKv* txn_kv, std::string_view instance_id, const std::string& path,
-                           TabletRowsetsCache& tablet_rowsets_cache) {
+                           TabletRowsetsCache& tablet_rowsets_cache, ResourceManager* rc_mgr) {
     if (!txn_kv || instance_id.empty() || path.empty()) {
         return -1;
     }
@@ -673,10 +750,13 @@ int check_rowset_key_exist(TxnKv* txn_kv, std::string_view instance_id, const st
         return -1;
     }
 
+    // start_version - end_version
+    std::map<int64_t, int64_t> version_of_rowset;
+
     // Get load rowset metas
-    MetaReader reader(instance_id, txn_kv, Versionstamp::max());
-    std::vector<std::pair<doris::RowsetMetaCloudPB, Versionstamp>> rowset_metas;
-    err = reader.get_load_rowset_metas(tablet_id, &rowset_metas, false);
+    CloneChainReader reader(instance_id, Versionstamp::max(), txn_kv, rc_mgr);
+    std::vector<doris::RowsetMetaCloudPB> rowset_metas;
+    err = reader.get_rowset_metas(tablet_id, 0, INT64_MAX - 1, &rowset_metas, false);
     if (err != TxnErrorCode::TXN_OK) {
         LOG(WARNING) << "failed to get load rowset metas by tablet id"
                      << ", error_code=" << err;
@@ -685,20 +765,33 @@ int check_rowset_key_exist(TxnKv* txn_kv, std::string_view instance_id, const st
     std::ranges::transform(
             rowset_metas,
             std::inserter(tablet_rowsets_cache.rowset_ids, tablet_rowsets_cache.rowset_ids.end()),
-            [](const auto& it) { return it.first.rowset_id_v2(); });
-    rowset_metas.clear();
+            [](const auto& it) { return it.rowset_id_v2(); });
 
-    // Also get compact rowset metas
-    err = reader.get_compact_rowset_metas(tablet_id, &rowset_metas, false);
-    std::ranges::transform(
-            rowset_metas,
-            std::inserter(tablet_rowsets_cache.rowset_ids, tablet_rowsets_cache.rowset_ids.end()),
-            [](const auto& it) { return it.first.rowset_id_v2(); });
+    for (const auto& rs_meta : rowset_metas) {
+        version_of_rowset.emplace(rs_meta.start_version(), rs_meta.end_version());
+    }
 
-    if (!tablet_rowsets_cache.rowset_ids.contains(rowset_id)) {
-        // Garbage data leak
-        LOG(WARNING) << "rowset should be recycled, key=" << path;
-        return 1;
+    // check version graph
+    int64_t previout_version = -1;
+    for (const auto& [start_version, end_version] : version_of_rowset) {
+        if (previout_version == -1) {
+            previout_version = end_version;
+        } else {
+            if (previout_version + 1 != start_version) {
+                LOG(WARNING) << "rowset version is not in order, key=" << path
+                             << ", start_version=" << start_version
+                             << ", end_version=" << end_version
+                             << ", previous_version=" << previout_version;
+                return -1;
+            }
+            previout_version = end_version;
+        }
+
+        if (!tablet_rowsets_cache.rowset_ids.contains(rowset_id)) {
+            // Garbage data leak
+            LOG(WARNING) << "rowset should be recycled, key=" << path;
+            return 1;
+        }
     }
 
     return 0;
@@ -721,6 +814,7 @@ int inverted_check_mvcc_meta_rowset_key(InstanceChecker* checker, TxnKv* txn_kv)
 
     std::vector<std::pair<SnapshotPB, Versionstamp>> snapshots;
     MetaReader reader(instance_id, txn_kv);
+    auto* rc_mgr = checker->resource_mgr();
     TxnErrorCode err = reader.get_snapshots(&snapshots);
     if (err != TxnErrorCode::TXN_OK) {
         LOG_WARNING("failed to get snapshots").tag("error_code", err);
@@ -756,8 +850,8 @@ int inverted_check_mvcc_meta_rowset_key(InstanceChecker* checker, TxnKv* txn_kv)
 
         for (auto file = list_iter->next(); file.has_value(); file = list_iter->next()) {
             num_scan++;
-            if (check_rowset_key_exist(txn_kv, instance_id, file->path, tablet_rowsets_cache) !=
-                0) {
+            if (check_rowset_key_exist(txn_kv, instance_id, file->path, tablet_rowsets_cache,
+                                       rc_mgr) != 0) {
                 num_loss++;
                 LOG_WARNING("failed to check rowset key because rowset key not exist")
                         .tag("instance_id", instance_id)
@@ -765,7 +859,7 @@ int inverted_check_mvcc_meta_rowset_key(InstanceChecker* checker, TxnKv* txn_kv)
                 check_ret = 1;
             }
             if (check_inverted_index_file(txn_kv, instance_id, file->path, rowset_index_cache_v1,
-                                          rowset_index_cache_v2) != 0) {
+                                          rowset_index_cache_v2, rc_mgr) != 0) {
                 num_loss++;
                 LOG_WARNING("failed to check inverted index file")
                         .tag("instance_id", instance_id)
