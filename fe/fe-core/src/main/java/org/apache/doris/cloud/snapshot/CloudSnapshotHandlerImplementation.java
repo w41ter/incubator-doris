@@ -212,15 +212,18 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
             // 2. upload image
             Checkpoint checkpoint = Env.getCurrentEnv().getCheckpointer();
             long imageFileSize;
+            File imageZipFile;
             checkpoint.getLock().readLock().lock();
             try {
                 if (DebugPointUtil.isEnable("CloudSnapshotHandler.uploadImage.fail")) {
                     throw new Exception("inject CloudSnapshotHandler.uploadImage.fail");
                 }
-                imageFileSize = uploadImage(snapshotId, imageUrl, objInfo, logId);
+                imageZipFile = generateImage(snapshotId, imageUrl, logId);
+                imageFileSize = imageZipFile.length();
             } finally {
                 checkpoint.getLock().readLock().unlock();
             }
+            uploadImage(snapshotId, imageUrl, objInfo, imageZipFile);
             // 3. commit snapshot
             commitSnapshot(snapshotId, imageUrl, logId, imageFileSize, job.getSnapshotDataSize());
             if (job.isAuto()) {
@@ -303,8 +306,7 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
         }
     }
 
-    private long uploadImage(String snapshotId, String imageUrl, Cloud.ObjectStoreInfoPB objInfo,
-            long logId) throws Exception {
+    private File generateImage(String snapshotId, String imageUrl, long logId) throws Exception {
         LOG.info("start to snapshot for id: {}, imageUrl: {}, logId: {}", snapshotId, imageUrl, logId);
         List<File> files = new ArrayList<>();
 
@@ -333,7 +335,13 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
 
         // 3. compress files
         File zipFile = compressFiles(snapshotId, files);
+        // 4. delete edit log file
+        deleteFile(snapshotEditLogFile);
+        return zipFile;
+    }
 
+    private void uploadImage(String snapshotId, String imageUrl, Cloud.ObjectStoreInfoPB objInfo, File zipFile)
+            throws Exception {
         while (DebugPointUtil.isEnable("CloudSnapshotHandler.uploadImage.wait")) {
             Thread.sleep(5000);
         }
@@ -348,10 +356,8 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
             remote.close();
         }
 
-        // 5. delete edit log file and zip file
-        long imageFileSize = zipFile.length();
-        deleteFiles(snapshotEditLogFile, zipFile);
-        return imageFileSize;
+        // 5. delete zip file
+        deleteFile(zipFile);
     }
 
     private File getEditLogFile(long logId) {
@@ -396,6 +402,7 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
         }
         EditLogFileOutputStream outputStream = null;
         try {
+            long dataSize = 0;
             outputStream = new EditLogFileOutputStream(snapshotEditLogFile);
             while (true) {
                 Pair<Long, JournalEntity> kv = cursor.next();
@@ -407,10 +414,20 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
                     break;
                 }
                 outputStream.write(entity.getOpCode(), entity.getData());
+                dataSize += entity.getDataSize() + 2; // 2 bytes for op code
+                if (dataSize > 1048576) { // 1 MB
+                    outputStream.setReadyToFlush();
+                    outputStream.flush();
+                    dataSize = 0;
+                }
             }
-            outputStream.setReadyToFlush();
-            outputStream.flush();
+            if (dataSize > 0) {
+                outputStream.setReadyToFlush();
+                outputStream.flush();
+            }
             outputStream.close();
+            LOG.info("finish write snapshot edit file, snapshot_id: {}, file_name: {}, file_size: {}", snapshotId,
+                    snapshotEditLogFile.getName(), snapshotEditLogFile.length());
             return snapshotEditLogFile;
         } catch (Exception e) {
             LOG.warn("write snapshot edit log failed for id: {}", snapshotId, e);
@@ -693,20 +710,22 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
         // the file name is: image.{version}.{md5}, edits.{logId}.{md5}, {snapshotId}.{md5}.zip
         String zipFileName = this.snapshotDir + snapshotId;
         try (FileOutputStream fos = new FileOutputStream(zipFileName);
-                ZipOutputStream zos = new ZipOutputStream(fos)) {
+                BufferedOutputStream bos = new BufferedOutputStream(fos);
+                ZipOutputStream zos = new ZipOutputStream(bos)) {
             for (File fileToZip : sourceFiles) {
                 if (!fileToZip.exists()) {
                     throw new IOException("source file does not exist: " + fileToZip.getAbsolutePath());
                 }
-                try (FileInputStream fis = new FileInputStream(fileToZip)) {
-                    // calculate md5
-                    String md5 = calculateMd5(fileToZip);
+                // calculate md5
+                String md5 = calculateMd5(fileToZip);
+                try (FileInputStream fis = new FileInputStream(fileToZip);
+                        BufferedInputStream bis = new BufferedInputStream(fis)) {
                     ZipEntry zipEntry = new ZipEntry(fileToZip.getName() + "." + md5);
                     zos.putNextEntry(zipEntry);
 
                     byte[] buffer = new byte[1024];
                     int length;
-                    while ((length = fis.read(buffer)) > 0) {
+                    while ((length = bis.read(buffer)) > 0) {
                         zos.write(buffer, 0, length);
                     }
                     zos.closeEntry();
@@ -729,7 +748,8 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
             dir.mkdirs();
         }
         try (FileInputStream fis = new FileInputStream(zipFile);
-                ZipInputStream zis = new ZipInputStream(fis)) {
+                BufferedInputStream bis = new BufferedInputStream(fis);
+                ZipInputStream zis = new ZipInputStream(bis)) {
             ZipEntry zipEntry = zis.getNextEntry();
             while (zipEntry != null) {
                 String filePath = destDir + File.separator + zipEntry.getName();
