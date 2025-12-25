@@ -82,7 +82,10 @@ public class InferPredicateByReplace {
         }
 
         @Override
-        public Void visitOr(Or expr, Map<Expression, Set<Expression>> context) {
+        public Void visitOr(Or or, Map<Expression, Set<Expression>> context) {
+            for (Expression expr : getAllSubExpressions(or)) {
+                context.computeIfAbsent(expr, k -> new LinkedHashSet<>()).add(or);
+            }
             return null;
         }
 

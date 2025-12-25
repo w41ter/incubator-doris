@@ -29,9 +29,12 @@ import java.util.List;
  * Such as &&,||,AND,OR.
  */
 public abstract class CompoundPredicate extends BinaryOperator {
-
     public CompoundPredicate(List<Expression> children, String symbol) {
-        super(children, symbol);
+        this(children, symbol, false);
+    }
+
+    public CompoundPredicate(List<Expression> children, String symbol, boolean inferred) {
+        super(children, symbol, inferred);
     }
 
     @Override
