@@ -114,15 +114,22 @@ Status JavaFunctionCall::execute_impl(FunctionContext* context, Block& block,
                                               {"required_fields", output_table_schema.first},
                                               {"columns_types", output_table_schema.second}};
     jobject output_map = nullptr;
-    RETURN_IF_ERROR(JniUtil::convert_to_java_map(env, output_params, &output_map));
+    Status status = JniUtil::convert_to_java_map(env, output_params, &output_map);
+    if (!status.ok()) {
+        env->DeleteGlobalRef(input_map);
+        return status;
+    }
     long output_address = env->CallLongMethod(jni_ctx->executor, jni_ctx->executor_evaluate_id,
                                               input_map, output_map);
-    RETURN_ERROR_IF_EXC(env);
+    if (env->ExceptionCheck()) {
+        env->DeleteGlobalRef(input_map);
+        env->DeleteGlobalRef(output_map);
+        RETURN_ERROR_IF_EXC(env);
+    }
+    status = JniConnector::fill_block(&block, {result}, output_address);
     env->DeleteGlobalRef(input_map);
-    RETURN_ERROR_IF_EXC(env);
     env->DeleteGlobalRef(output_map);
-    RETURN_ERROR_IF_EXC(env);
-    return JniConnector::fill_block(&block, {result}, output_address);
+    return status;
 }
 
 Status JavaFunctionCall::close(FunctionContext* context,
