@@ -20,10 +20,13 @@ package org.apache.doris.cloud.snapshot;
 import org.apache.doris.alter.AlterJobV2.JobType;
 import org.apache.doris.cloud.catalog.CloudEnv;
 import org.apache.doris.common.io.CountingDataOutputStream;
+import org.apache.doris.job.base.AbstractJob;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.io.IOException;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class CloudSnapshotEnv extends CloudEnv {
@@ -94,8 +97,17 @@ public class CloudSnapshotEnv extends CloudEnv {
     }
 
     @Override
-    public long saveAsyncJobManager(CountingDataOutputStream out, long checksum) {
-        LOG.info("skip save asyncJobManager");
+    public long saveAsyncJobManager(CountingDataOutputStream out, long checksum) throws IOException {
+        List<? extends AbstractJob<?, ?>> jobs = getJobManager().queryJobs(org.apache.doris.job.common.JobType.MV);
+        LOG.info("save asyncJobManager with {} MV jobs", jobs.size());
+        out.writeInt(jobs.size());
+        jobs.forEach((job) -> {
+            try {
+                job.write(out);
+            } catch (IOException e) {
+                LOG.error("write job error, jobId: {}", job.getJobId(), e);
+            }
+        });
         return checksum;
     }
 
