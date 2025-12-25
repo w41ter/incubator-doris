@@ -585,7 +585,8 @@ public class MaterializedViewUtils {
             NamedExpression partitionColumn = context.getMvPartitionColumn();
 
             OUTER_CHECK: for (Expression projectSlot : expressionsToCheck) {
-                if (projectSlot.isColumnFromTable() && projectSlot.equals(partitionColumn.toSlot())) {
+                if (projectSlot.isColumnFromTable() && projectSlot.equals(partitionColumn.toSlot())
+                        && partitionColumn.isColumnFromTable()) {
                     continue;
                 }
                 // check the expression which use partition column
