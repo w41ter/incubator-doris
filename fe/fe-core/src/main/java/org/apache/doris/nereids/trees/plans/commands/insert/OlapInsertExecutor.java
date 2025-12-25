@@ -252,11 +252,12 @@ public class OlapInsertExecutor extends AbstractInsertExecutor {
         if (Config.isCloudMode() && SystemInfoService.needRetryWithReplan(t.getMessage())) {
             return;
         }
-        StringBuilder sb = new StringBuilder(t.getMessage());
+        String urlPart = "";
         if (!Strings.isNullOrEmpty(coordinator.getTrackingUrl())) {
-            sb.append(". url: ").append(coordinator.getTrackingUrl());
+            urlPart = coordinator.getTrackingUrl();
         }
-        ctx.getState().setError(ErrorCode.ERR_UNKNOWN_ERROR, sb.toString());
+        String finalErrorMsg = InsertUtils.getFinalErrorMsg(errMsg, urlPart);
+        ctx.getState().setError(ErrorCode.ERR_UNKNOWN_ERROR, finalErrorMsg);
     }
 
     @Override

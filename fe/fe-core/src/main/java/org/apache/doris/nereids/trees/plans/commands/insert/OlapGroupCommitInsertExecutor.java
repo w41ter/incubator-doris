@@ -192,11 +192,12 @@ public class OlapGroupCommitInsertExecutor extends OlapInsertExecutor {
         String queryId = DebugUtil.printId(ctx.queryId());
         // if any throwable being thrown during insert operation, first we should abort this txn
         LOG.warn("insert [{}] with query id {} failed, url={}", labelName, queryId, coordinator.getTrackingUrl(), t);
-        StringBuilder sb = new StringBuilder(t.getMessage());
+        String urlPart = "";
         if (!Strings.isNullOrEmpty(coordinator.getTrackingUrl())) {
-            sb.append(". url: ").append(coordinator.getTrackingUrl());
+            urlPart = coordinator.getTrackingUrl();
         }
-        ctx.getState().setError(ErrorCode.ERR_UNKNOWN_ERROR, sb.toString());
+        String finalErrorMsg = InsertUtils.getFinalErrorMsg(errMsg, urlPart);
+        ctx.getState().setError(ErrorCode.ERR_UNKNOWN_ERROR, finalErrorMsg);
     }
 
     @Override
