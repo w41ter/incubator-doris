@@ -59,19 +59,13 @@ exit_flag=0
     cp -rf "${DORIS_HOME}"/ms/ "${DORIS_HOME}"/recycler/
     cp -f "${teamcity_build_checkoutDir}"/regression-test/pipeline/cloud_p0/conf/fe_custom.conf "${DORIS_HOME}"/fe/conf/
     cp -f "${teamcity_build_checkoutDir}"/regression-test/pipeline/cloud_p0/conf/be_custom.conf "${DORIS_HOME}"/be/conf/
-    if [[ -f "${DORIS_HOME}"/ms/conf/doris_cloud.conf && ! -f "${DORIS_HOME}"/ms/conf/selectdb_cloud.conf ]]; then
-        ln -s "${DORIS_HOME}"/ms/conf/doris_cloud.conf "${DORIS_HOME}"/ms/conf/selectdb_cloud.conf
-    fi
-    if [[ -f "${DORIS_HOME}"/ms/conf/selectdb_cloud.conf && ! -f "${DORIS_HOME}"/ms/conf/doris_cloud.conf ]]; then
-        ln -s "${DORIS_HOME}"/ms/conf/selectdb_cloud.conf "${DORIS_HOME}"/ms/conf/doris_cloud.conf
-    fi
     fdb_cluster="$(cat /etc/foundationdb/fdb.cluster)"
-    sed -i "s/^fdb_cluster = .*/fdb_cluster = ${fdb_cluster}/" "${DORIS_HOME}"/ms/conf/doris_cloud.conf
-    sed -i "s/^fdb_cluster = .*/fdb_cluster = ${fdb_cluster}/" "${DORIS_HOME}"/recycler/conf/doris_cloud.conf
-    cat "${teamcity_build_checkoutDir}"/regression-test/pipeline/cloud_p0/conf/ms_custom.conf >>"${DORIS_HOME}"/ms/conf/doris_cloud.conf
-    echo >>"${DORIS_HOME}"/ms/conf/doris_cloud.conf
-    cat "${teamcity_build_checkoutDir}"/regression-test/pipeline/cloud_p0/conf/recycler_custom.conf >>"${DORIS_HOME}"/recycler/conf/doris_cloud.conf
-    echo >>"${DORIS_HOME}"/recycler/conf/doris_cloud.conf
+    sed -i "s/^fdb_cluster = .*/fdb_cluster = ${fdb_cluster}/" "${DORIS_HOME}"/ms/conf/selectdb_cloud.conf
+    sed -i "s/^fdb_cluster = .*/fdb_cluster = ${fdb_cluster}/" "${DORIS_HOME}"/recycler/conf/selectdb_cloud.conf
+    cat "${teamcity_build_checkoutDir}"/regression-test/pipeline/cloud_p0/conf/ms_custom.conf >>"${DORIS_HOME}"/ms/conf/selectdb_cloud.conf
+    echo >>"${DORIS_HOME}"/ms/conf/selectdb_cloud.conf
+    cat "${teamcity_build_checkoutDir}"/regression-test/pipeline/cloud_p0/conf/recycler_custom.conf >>"${DORIS_HOME}"/recycler/conf/selectdb_cloud.conf
+    echo >>"${DORIS_HOME}"/recycler/conf/selectdb_cloud.conf
     print_doris_conf
 
     echo "#### 4. start Doris"

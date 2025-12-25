@@ -54,6 +54,7 @@ excludeSuites = "000_the_start_sentinel_do_not_touch," + // keep this line as th
     "zzz_the_end_sentinel_do_not_touch" // keep this line as the last line
 
 excludeDirectories = "000_the_start_sentinel_do_not_touch," + // keep this line as the first line
+    "javaudf_p0," + // not supported
     "external_table_p0," + // run on external pipeline
     "cloud/multi_cluster," + // run in specific regression pipeline
     "cloud_p0/cache," +

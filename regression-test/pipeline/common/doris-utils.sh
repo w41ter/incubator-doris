@@ -85,8 +85,8 @@ function get_doris_conf_value() {
         return 0
     fi
 
-    if [[ -f "${conf_dir}"/doris_cloud.conf ]] &&
-        _get_doris_conf_value "${conf_dir}"/doris_cloud.conf "${conf_key}"; then
+    if [[ -f "${conf_dir}"/selectdb_cloud.conf ]] &&
+        _get_doris_conf_value "${conf_dir}"/selectdb_cloud.conf "${conf_key}"; then
         return 0
     fi
 
@@ -101,14 +101,14 @@ function start_doris_ms() {
     fi
     local i=1
     while [[ $((i++)) -lt 5 ]]; do
-        if ! pgrep -fia 'doris_cloud --meta-service' >/dev/null; then
+        if ! pgrep -fia 'selectdb_cloud --meta-service' >/dev/null; then
             echo "ERROR: start doris meta-service failed." && return 1
         else
             sleep 1
         fi
     done
     if [[ ${i} -ge 5 ]]; then
-        echo -e "INFO: doris meta-service started,\n$("${DORIS_HOME}"/ms/lib/doris_cloud --version)"
+        echo -e "INFO: doris meta-service started,\n$("${DORIS_HOME}"/ms/lib/selectdb_cloud --version)"
     fi
     cd - || return 1
 }
@@ -121,14 +121,14 @@ function start_doris_recycler() {
     fi
     local i=1
     while [[ $((i++)) -lt 5 ]]; do
-        if ! pgrep -fia 'doris_cloud --recycler' >/dev/null; then
+        if ! pgrep -fia 'selectdb_cloud --recycler' >/dev/null; then
             echo "ERROR: start doris recycler failed." && return 1
         else
             sleep 1
         fi
     done
     if [[ ${i} -ge 5 ]]; then
-        echo -e "INFO: doris recycler started,\n$("${DORIS_HOME}"/ms/lib/doris_cloud --version)"
+        echo -e "INFO: doris recycler started,\n$("${DORIS_HOME}"/ms/lib/selectdb_cloud --version)"
     fi
     cd - || return 1
 }
@@ -301,23 +301,23 @@ function stop_doris_grace() {
         echo "ERROR: doris fe stop grace failed." && ret=1
     fi
     if [[ -f "${DORIS_HOME}"/ms/bin/stop.sh ]]; then
-        sudo mkdir -p /tmp/ms/bin && cp -rf "${DORIS_HOME}"/ms/bin/doris_cloud.pid /tmp/ms/bin/doris_cloud.pid
+        sudo mkdir -p /tmp/ms/bin && cp -rf "${DORIS_HOME}"/ms/bin/selectdb_cloud.pid /tmp/ms/bin/selectdb_cloud.pid
         if timeout -v "${DORIS_STOP_GRACE_TIMEOUT:-"10m"}" bash "${DORIS_HOME}"/ms/bin/stop.sh --grace; then
             echo "INFO: doris ms stopped gracefully."
             if [[ -n "${DORIS_STOP_GRACE_CHECK_KEYWORD:=''}" && "${DORIS_STOP_GRACE_CHECK_KEYWORD,,}" == "true" ]]; then
-                echo "INFO: try to find keywords ${keywords} in doris_cloud.out"
-                if [[ -f "${DORIS_HOME}"/ms/log/doris_cloud.out ]]; then
-                    if grep -E "${keywords}" "${DORIS_HOME}"/ms/log/doris_cloud.out; then
+                echo "INFO: try to find keywords ${keywords} in selectdb_cloud.out"
+                if [[ -f "${DORIS_HOME}"/ms/log/selectdb_cloud.out ]]; then
+                    if grep -E "${keywords}" "${DORIS_HOME}"/ms/log/selectdb_cloud.out; then
                         echo "##teamcity[buildProblem description='Ubsan or Lsan fail']"
-                        echo "====================================head -n 200 ms/log/doris_cloud.out===================================="
-                        head -n 200 "${DORIS_HOME}"/ms/log/doris_cloud.out
+                        echo "====================================head -n 200 ms/log/selectdb_cloud.out===================================="
+                        head -n 200 "${DORIS_HOME}"/ms/log/selectdb_cloud.out
                         echo "=========================================================================================================="
-                        echo "ERROR: found memory leaks or undefined behavior in ms/log/doris_cloud.out" && ret=1
+                        echo "ERROR: found memory leaks or undefined behavior in ms/log/selectdb_cloud.out" && ret=1
                     else
-                        echo "INFO: no memory leaks or undefined behavior found in ms/log/doris_cloud.out"
+                        echo "INFO: no memory leaks or undefined behavior found in ms/log/selectdb_cloud.out"
                     fi
                 else
-                    echo "ERROR: ms/log/doris_cloud.out not find, which is not expected" && ret=1
+                    echo "ERROR: ms/log/selectdb_cloud.out not find, which is not expected" && ret=1
                 fi
             fi
         else
@@ -326,23 +326,23 @@ function stop_doris_grace() {
         fi
     fi
     if [[ -f "${DORIS_HOME}"/recycler/bin/stop.sh ]]; then
-        sudo mkdir -p /tmp/recycler/bin && cp -rf "${DORIS_HOME}"/recycler/bin/doris_cloud.pid /tmp/recycler/bin/doris_cloud.pid
+        sudo mkdir -p /tmp/recycler/bin && cp -rf "${DORIS_HOME}"/recycler/bin/selectdb_cloud.pid /tmp/recycler/bin/selectdb_cloud.pid
         if timeout -v "${DORIS_STOP_GRACE_TIMEOUT:-"10m"}" bash "${DORIS_HOME}"/recycler/bin/stop.sh --grace; then
             echo "INFO: doris recycler stopped gracefully."
             # if [[ -n "${DORIS_STOP_GRACE_CHECK_KEYWORD:=''}" && "${DORIS_STOP_GRACE_CHECK_KEYWORD,,}" == "true" ]]; then
-            #     echo "INFO: try to find keywords ${keywords} in doris_cloud.out"
-            #     if [[ -f "${DORIS_HOME}"/recycler/log/doris_cloud.out ]]; then
-            #         if grep -E "${keywords}" "${DORIS_HOME}"/recycler/log/doris_cloud.out; then
+            #     echo "INFO: try to find keywords ${keywords} in selectdb_cloud.out"
+            #     if [[ -f "${DORIS_HOME}"/recycler/log/selectdb_cloud.out ]]; then
+            #         if grep -E "${keywords}" "${DORIS_HOME}"/recycler/log/selectdb_cloud.out; then
             #             echo "##teamcity[buildProblem description='Ubsan or Lsan fail']"
-            #             echo "=================================head -n 200 recycler/log/doris_cloud.out================================="
-            #             head -n 200 "${DORIS_HOME}"/recycler/log/doris_cloud.out
+            #             echo "=================================head -n 200 recycler/log/selectdb_cloud.out================================="
+            #             head -n 200 "${DORIS_HOME}"/recycler/log/selectdb_cloud.out
             #             echo "=========================================================================================================="
-            #             echo "ERROR: found memory leaks or undefined behavior in recycler/log/doris_cloud.out" && ret=1
+            #             echo "ERROR: found memory leaks or undefined behavior in recycler/log/selectdb_cloud.out" && ret=1
             #         else
-            #             echo "INFO: no memory leaks or undefined behavior found in recycler/log/doris_cloud.out"
+            #             echo "INFO: no memory leaks or undefined behavior found in recycler/log/selectdb_cloud.out"
             #         fi
             #     else
-            #         echo "ERROR: recycler/log/doris_cloud.out not find, which is not expected" && ret=1
+            #         echo "ERROR: recycler/log/selectdb_cloud.out not find, which is not expected" && ret=1
             #     fi
             # fi
         else
@@ -790,8 +790,8 @@ archive_doris_coredump() {
     mkdir -p "${DORIS_HOME}/${archive_dir}"
     declare -A pids
     pids['be']="$(cat /tmp/be/bin/be.pid)"
-    pids['ms']="$(cat /tmp/ms/bin/doris_cloud.pid)"
-    pids['recycler']="$(cat /tmp/recycler/bin/doris_cloud.pid)"
+    pids['ms']="$(cat /tmp/ms/bin/selectdb_cloud.pid)"
+    pids['recycler']="$(cat /tmp/recycler/bin/selectdb_cloud.pid)"
     local has_core=false
     for p in "${!pids[@]}"; do
         pid="${pids[${p}]}"
@@ -805,9 +805,9 @@ archive_doris_coredump() {
                 if [[ "${p}" == "be" ]]; then
                     mv "${DORIS_HOME}"/be/lib/doris_be "${DORIS_HOME}/${archive_dir}/${p}"
                 elif [[ "${p}" == "ms" ]]; then
-                    mv "${DORIS_HOME}"/ms/lib/doris_cloud "${DORIS_HOME}/${archive_dir}/${p}"
+                    mv "${DORIS_HOME}"/ms/lib/selectdb_cloud "${DORIS_HOME}/${archive_dir}/${p}"
                 elif [[ "${p}" == "recycler" ]]; then
-                    mv "${DORIS_HOME}"/recycler/lib/doris_cloud "${DORIS_HOME}/${archive_dir}/${p}"
+                    mv "${DORIS_HOME}"/recycler/lib/selectdb_cloud "${DORIS_HOME}/${archive_dir}/${p}"
                 fi
                 mv "${coredump_file}" "${DORIS_HOME}/${archive_dir}/${p}"
                 has_core=true
@@ -865,13 +865,13 @@ print_doris_conf() {
         echo -e "\n\n\n\nINFO: --------------------cat ${DORIS_HOME}/be/conf/be_custom.conf--------------------"
         cat "${DORIS_HOME}"/be/conf/be_custom.conf
     fi
-    if [[ -f ${DORIS_HOME}/ms/conf/doris_cloud.conf ]]; then
-        echo -e "\n\n\n\nINFO: --------------------cat ${DORIS_HOME}/ms/conf/doris_cloud.conf--------------------"
-        cat "${DORIS_HOME}"/ms/conf/doris_cloud.conf
+    if [[ -f ${DORIS_HOME}/ms/conf/selectdb_cloud.conf ]]; then
+        echo -e "\n\n\n\nINFO: --------------------cat ${DORIS_HOME}/ms/conf/selectdb_cloud.conf--------------------"
+        cat "${DORIS_HOME}"/ms/conf/selectdb_cloud.conf
     fi
-    if [[ -f ${DORIS_HOME}/recycler/conf/doris_cloud.conf ]]; then
-        echo -e "\n\n\n\nINFO: --------------------cat ${DORIS_HOME}/recycler/conf/doris_cloud.conf--------------------"
-        cat "${DORIS_HOME}"/recycler/conf/doris_cloud.conf
+    if [[ -f ${DORIS_HOME}/recycler/conf/selectdb_cloud.conf ]]; then
+        echo -e "\n\n\n\nINFO: --------------------cat ${DORIS_HOME}/recycler/conf/selectdb_cloud.conf--------------------"
+        cat "${DORIS_HOME}"/recycler/conf/selectdb_cloud.conf
     fi
     echo -e "INFO: ----------------------------------------\n\n\n\n"
 }
