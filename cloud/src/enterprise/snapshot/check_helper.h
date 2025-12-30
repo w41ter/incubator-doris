@@ -75,33 +75,51 @@ bool is_snapshot_normal(const SnapshotPB& snapshot_pb) {
 }
 
 int check_tablet_stats(TxnKv* txn_kv, InstanceChecker* checker, const std::string& instance_id,
-                       Versionstamp& snapshot_versionstamp, int64_t tablet_id,
+                       const Versionstamp& snapshot_versionstamp, int64_t tablet_id,
                        std::array<int64_t, 6>& tablet_stats) {
     CloneChainReader reader(instance_id, snapshot_versionstamp, txn_kv, checker->resource_mgr());
     TabletStatsPB tablet_stats_pb;
-    TxnErrorCode err = reader.get_tablet_merged_stats(tablet_id, &tablet_stats_pb,
-                                                      &snapshot_versionstamp, false);
+    TxnErrorCode err = reader.get_tablet_merged_stats(tablet_id, &tablet_stats_pb, nullptr, false);
     if (err != TxnErrorCode::TXN_OK) {
-        LOG(WARNING) << "failed to get tablet merged stats, tablet_id=" << tablet_id;
+        LOG(WARNING) << "failed to get tablet merged stats, tablet_id=" << tablet_id
+                     << ", err=" << err;
         return -1;
     }
     // num_rowsets, num_rows, num_segments, segment_disk_size, index_disk_size, data_disk_size
     if (tablet_stats_pb.has_num_rowsets() && tablet_stats_pb.num_rowsets() != tablet_stats[0]) {
+        LOG(WARNING) << "tablet num_rowsets mismatch, tablet_id=" << tablet_id
+                     << ", expected=" << tablet_stats[0]
+                     << ", actual=" << tablet_stats_pb.num_rowsets();
         return 1;
     }
     if (tablet_stats_pb.has_num_rows() && tablet_stats_pb.num_rows() != tablet_stats[1]) {
+        LOG(WARNING) << "tablet num_rows mismatch, tablet_id=" << tablet_id
+                     << ", expected=" << tablet_stats[1]
+                     << ", actual=" << tablet_stats_pb.num_rows();
         return 1;
     }
     if (tablet_stats_pb.has_num_segments() && tablet_stats_pb.num_segments() != tablet_stats[2]) {
+        LOG(WARNING) << "tablet num_segments mismatch, tablet_id=" << tablet_id
+                     << ", expected=" << tablet_stats[2]
+                     << ", actual=" << tablet_stats_pb.num_segments();
         return 1;
     }
-    if (tablet_stats_pb.has_segment_size() && tablet_stats_pb.data_size() != tablet_stats[3]) {
+    if (tablet_stats_pb.has_segment_size() && tablet_stats_pb.segment_size() != tablet_stats[3]) {
+        LOG(WARNING) << "tablet segment_size mismatch, tablet_id=" << tablet_id
+                     << ", expected=" << tablet_stats[3]
+                     << ", actual=" << tablet_stats_pb.segment_size();
         return 1;
     }
     if (tablet_stats_pb.has_index_size() && tablet_stats_pb.index_size() != tablet_stats[4]) {
+        LOG(WARNING) << "tablet index_size mismatch, tablet_id=" << tablet_id
+                     << ", expected=" << tablet_stats[4]
+                     << ", actual=" << tablet_stats_pb.index_size();
         return 1;
     }
     if (tablet_stats_pb.has_data_size() && tablet_stats_pb.data_size() != tablet_stats[5]) {
+        LOG(WARNING) << "tablet data_size mismatch, tablet_id=" << tablet_id
+                     << ", expected=" << tablet_stats[5]
+                     << ", actual=" << tablet_stats_pb.data_size();
         return 1;
     }
     return 0;
@@ -143,17 +161,17 @@ int check_rowsets_object(TxnKv* txn_kv, InstanceChecker* checker, const std::str
     int64_t data_disk_size = 0;
 
     for (auto& rs_meta : rowset_metas) {
-        if (rs_meta.num_segments() == 0) {
-            // empty rowset, skip
-            continue;
-        }
-
         num_rowsets++;
         num_rows += rs_meta.num_rows();
         num_segments += rs_meta.num_segments();
 
         index_disk_size += rs_meta.index_disk_size();
         data_disk_size += rs_meta.total_disk_size();
+
+        if (rs_meta.num_segments() == 0) {
+            // empty rowset, skip
+            continue;
+        }
 
         for (size_t i = 0; i < rs_meta.num_segments(); i++) {
             segment_disk_size += rs_meta.segments_file_size(i);
@@ -189,6 +207,11 @@ int check_rowsets_object(TxnKv* txn_kv, InstanceChecker* checker, const std::str
 
         for (int i = 0; i < rs_meta.num_segments(); ++i) {
             auto path = segment_path(rs_meta.tablet_id(), rs_meta.rowset_id_v2(), i);
+
+            const auto& index_map = rs_meta.packed_slice_locations();
+            if (index_map.find(path) != index_map.end()) {
+                continue;
+            }
 
             if (tablet_files_cache.files.contains(path)) {
                 continue;
@@ -236,6 +259,7 @@ int check_rowsets_object(TxnKv* txn_kv, InstanceChecker* checker, const std::str
             }
         }
         if (!index_ids.empty()) {
+            const auto& index_map = rs_meta.packed_slice_locations();
             for (int i = 0; i < rs_meta.num_segments(); ++i) {
                 std::vector<std::string> index_path_v;
                 if (tablet_schema.inverted_index_storage_format() ==
@@ -255,6 +279,10 @@ int check_rowsets_object(TxnKv* txn_kv, InstanceChecker* checker, const std::str
                 }
 
                 if (std::ranges::all_of(index_path_v, [&](const auto& idx_file_path) {
+                        // Skip check if inverted index file is already packed into a larger file
+                        if (index_map.find(idx_file_path) != index_map.end()) {
+                            return true;
+                        }
                         if (!tablet_files_cache.files.contains(idx_file_path)) {
                             LOG(INFO) << "loss index file: " << idx_file_path;
                             num_index_file_loss++;
@@ -530,6 +558,11 @@ int check_inverted_index_file(TxnKv* txn_kv, const std::string& instance_id,
                               const std::string& path, RowsetIndexesFormatV1& rowset_index_cache_v1,
                               RowsetIndexesFormatV2& rowset_index_cache_v2,
                               ResourceManager* rc_mgr) {
+    if (!path.ends_with(".idx")) {
+        // skip check not index file
+        return 0;
+    }
+
     std::vector<std::string> str;
     butil::SplitString(path, '/', &str);
     // format v1: data/{tablet_id}/{rowset_id}_{seg_num}_{idx_id}{idx_suffix}.idx
@@ -701,6 +734,11 @@ int check_rowset_key_exist(TxnKv* txn_kv, std::string_view instance_id, const st
         return -1;
     }
 
+    if (!path.ends_with(".dat")) {
+        // skip check not segment file
+        return 0;
+    }
+
     // Return 0 if check success, return 1 if file is garbage data, negative if error occurred
     std::vector<std::string> str;
     butil::SplitString(path, '/', &str);
@@ -719,11 +757,6 @@ int check_rowset_key_exist(TxnKv* txn_kv, std::string_view instance_id, const st
         return -1;
     }
 
-    if (!str[2].ends_with(".dat")) {
-        // skip check not segment file
-        return 0;
-    }
-
     std::string rowset_id;
     if (auto pos = str.back().find('_'); pos != std::string::npos) {
         rowset_id = str.back().substr(0, pos);
@@ -731,6 +764,8 @@ int check_rowset_key_exist(TxnKv* txn_kv, std::string_view instance_id, const st
         LOG(WARNING) << "failed to parse rowset_id, key=" << path;
         return -1;
     }
+
+    LOG(INFO) << "parsed rowset_id=" << rowset_id << ", path=" << path;
 
     if (tablet_rowsets_cache.tablet_id == tablet_id) {
         if (tablet_rowsets_cache.rowset_ids.contains(rowset_id)) {
@@ -750,24 +785,53 @@ int check_rowset_key_exist(TxnKv* txn_kv, std::string_view instance_id, const st
         return -1;
     }
 
-    // start_version - end_version
-    std::map<int64_t, int64_t> version_of_rowset;
-
     // Get load rowset metas
-    CloneChainReader reader(instance_id, Versionstamp::max(), txn_kv, rc_mgr);
-    std::vector<doris::RowsetMetaCloudPB> rowset_metas;
-    err = reader.get_rowset_metas(tablet_id, 0, INT64_MAX - 1, &rowset_metas, false);
+    CloneChainReader reader(instance_id, txn_kv, rc_mgr);
+    std::vector<std::pair<doris::RowsetMetaCloudPB, Versionstamp>> rowset_metas;
+    err = reader.get_load_rowset_metas(txn.get(), tablet_id, &rowset_metas);
     if (err != TxnErrorCode::TXN_OK) {
         LOG(WARNING) << "failed to get load rowset metas by tablet id"
                      << ", error_code=" << err;
         return -1;
     }
-    std::ranges::transform(
-            rowset_metas,
-            std::inserter(tablet_rowsets_cache.rowset_ids, tablet_rowsets_cache.rowset_ids.end()),
-            [](const auto& it) { return it.rowset_id_v2(); });
 
-    for (const auto& rs_meta : rowset_metas) {
+    for (const auto& [rs_meta, _] : rowset_metas) {
+        tablet_rowsets_cache.rowset_ids.insert(rs_meta.rowset_id_v2());
+    }
+    err = reader.get_compact_rowset_metas(txn.get(), tablet_id, &rowset_metas);
+    if (err != TxnErrorCode::TXN_OK) {
+        LOG(WARNING) << "failed to get load rowset metas by tablet id"
+                     << ", error_code=" << err;
+        return -1;
+    }
+    for (const auto& [rs_meta, _] : rowset_metas) {
+        tablet_rowsets_cache.rowset_ids.insert(rs_meta.rowset_id_v2());
+    }
+
+    LOG(INFO) << "tablet_id: " << tablet_id << ", all rowsets: "
+              << std::accumulate(tablet_rowsets_cache.rowset_ids.begin(),
+                                 tablet_rowsets_cache.rowset_ids.end(), std::string(),
+                                 [](const std::string& a, const std::string& b) {
+                                     return a.empty() ? b : a + "," + b;
+                                 });
+
+    if (!tablet_rowsets_cache.rowset_ids.contains(rowset_id)) {
+        // Garbage data leak
+        LOG(WARNING) << "rowset should be recycled, key=" << path;
+        return 1;
+    }
+
+    // check version graph
+    std::vector<doris::RowsetMetaCloudPB> all_rowset_metas;
+    std::map<int64_t, int64_t> version_of_rowset;
+    err = reader.get_rowset_metas(tablet_id, 0, INT64_MAX - 1, &all_rowset_metas, false);
+    if (err != TxnErrorCode::TXN_OK) {
+        LOG(WARNING) << "failed to get all rowset metas by tablet id"
+                     << ", error_code=" << err;
+        return -1;
+    }
+
+    for (const auto& rs_meta : all_rowset_metas) {
         version_of_rowset.emplace(rs_meta.start_version(), rs_meta.end_version());
     }
 
@@ -786,14 +850,7 @@ int check_rowset_key_exist(TxnKv* txn_kv, std::string_view instance_id, const st
             }
             previout_version = end_version;
         }
-
-        if (!tablet_rowsets_cache.rowset_ids.contains(rowset_id)) {
-            // Garbage data leak
-            LOG(WARNING) << "rowset should be recycled, key=" << path;
-            return 1;
-        }
     }
-
     return 0;
 }
 
@@ -850,6 +907,9 @@ int inverted_check_mvcc_meta_rowset_key(InstanceChecker* checker, TxnKv* txn_kv)
 
         for (auto file = list_iter->next(); file.has_value(); file = list_iter->next()) {
             num_scan++;
+            if (file->path == "data/packed_file" || file->path.starts_with("data/packed_file/")) {
+                continue; // packed_file has dedicated check logic
+            }
             if (check_rowset_key_exist(txn_kv, instance_id, file->path, tablet_rowsets_cache,
                                        rc_mgr) != 0) {
                 num_loss++;

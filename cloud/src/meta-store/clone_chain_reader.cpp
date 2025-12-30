@@ -1109,7 +1109,8 @@ TxnErrorCode CloneChainReader::get_compact_rowset_metas(
     do {
         MetaReader reader(current_instance_id, current_snapshot_version);
         std::vector<std::pair<RowsetMetaCloudPB, Versionstamp>> current_rowsets;
-        TxnErrorCode err = reader.get_compact_rowset_metas(txn, tablet_id, &current_rowsets, snapshot);
+        TxnErrorCode err =
+                reader.get_compact_rowset_metas(txn, tablet_id, &current_rowsets, snapshot);
         if (err != TxnErrorCode::TXN_OK) {
             return err;
         }

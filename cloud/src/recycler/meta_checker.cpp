@@ -46,7 +46,7 @@
 namespace doris::cloud {
 
 MetaChecker::MetaChecker(std::shared_ptr<TxnKv> txn_kv) : txn_kv_(txn_kv) {
-    #ifdef FEATURE_ENTERPRISE_SNAPSHOT
+#ifdef FEATURE_ENTERPRISE_SNAPSHOT
     snapshot_manager_ = std::make_shared<selectdb::SnapshotManager>(std::move(txn_kv));
 #else
     snapshot_manager_ = std::make_shared<SnapshotManager>(std::move(txn_kv));

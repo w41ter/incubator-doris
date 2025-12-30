@@ -18,6 +18,7 @@
 import org.apache.doris.regression.suite.ClusterOptions
 import org.apache.doris.regression.suite.SuiteCluster
 import org.awaitility.Awaitility
+import groovy.json.JsonOutput
 
 suite("test_rollback_basic", "snapshot,docker") {
     // ATTN: This test only runs in cloud mode.
@@ -42,9 +43,57 @@ suite("test_rollback_basic", "snapshot,docker") {
         return res[0]['ID']
     }
 
+    def do_recycle_func = { instance_id, recyclerHttpPort ->
+        def triggerRecycleBody = [instance_ids: ["${instance_id}"]]
+        def jsonOutput = new JsonOutput()
+        def triggerRecycleJson = jsonOutput.toJson(triggerRecycleBody)
+        httpTest {
+            endpoint recyclerHttpPort
+            body triggerRecycleJson
+            uri "/RecyclerService/http/recycle_instance?token=greedisgood9999"
+        }
+    }
+
+    def do_check_func = { instance_id, recyclerHttpPort ->
+        httpTest {
+            op "get"
+            endpoint recyclerHttpPort
+            uri "/RecyclerService/http/check_instance?token=greedisgood9999&instance_id=${instance_id}"
+        }
+    }
+
+    def checkerLastSuccessTime = -1
+    def checkerLastFinishTime = -1
+    def recyclerLastSuccessTime = -1
+
+    def getCheckJobInfo = { instance_id, recyclerHttpPort ->
+        def checkJobInfoApi = { checkFunc ->
+            httpTest {
+                endpoint recyclerHttpPort
+                uri "/RecyclerService/http/check_job_info?token=greedisgood9999&instance_id=${instance_id}"
+                op "get"
+                check checkFunc
+            }
+        }
+        checkJobInfoApi.call() {
+            respCode, body ->
+                logger.info("http cli result: ${body} ${respCode}")
+                def checkJobInfoResult = body
+                logger.info("checkJobInfoResult:${checkJobInfoResult}")
+                assertEquals(respCode, 200)
+                def info = parseJson(checkJobInfoResult.trim())
+                if (info.last_finish_time_ms != null) { // Check done
+                    checkerLastFinishTime = Long.parseLong(info.last_finish_time_ms)
+                }
+                if(info.last_success_time_ms != null) {
+                    checkerLastSuccessTime = Long.parseLong(info.last_success_time_ms)
+                }
+        }
+    }
+
     def cluster_name = "regression_test_rollback_basic"
     def opt = new ClusterOptions(
-        cloudMode: true, feNum: 1, beNum: 1, msNum: 1,
+        cloudMode: true, feNum: 1, beNum: 1, msNum: 1, recyclerNum: 1,
         instanceId: "old_instance_id",
         beConfigs: [
             "delete_bitmap_store_write_version=3",
@@ -58,11 +107,18 @@ suite("test_rollback_basic", "snapshot,docker") {
         ],
         recycleConfigs: [
             "recycle_interval_seconds=1",
+            "check_object_interval_seconds=1",
             "recycler_sleep_before_scheduling_seconds=1",
             "enable_snapshot_data_migrator=true",
+            "enable_mvcc_meta_key_check=true",
+            "enable_checker=true",
+            "recycle_whitelist=dummy",
         ])
 
     docker(opt) {
+        def recyclerService = cluster.getAllRecyclers()
+        def (ip, port) = recyclerService[0].getHttpAddress()
+        def host = "${ip}:${port}"
         // Step 1: Create a snapshot
         String snapshot_id = ""
         connectWithDockerCluster(cluster) {
@@ -74,7 +130,7 @@ suite("test_rollback_basic", "snapshot,docker") {
                     name VARCHAR(100)
                 ) DUPLICATE KEY(id)
                 DISTRIBUTED BY HASH(id) BUCKETS 3
-                PROPERTIES ("replication_num" = "1")
+                PROPERTIES ("replication_num" = "1");
             """
             sql "INSERT INTO test_table VALUES (1, 'cluster1_data')"
             sql "INSERT INTO test_table VALUES (2, 'cluster2_data')"
@@ -112,6 +168,22 @@ suite("test_rollback_basic", "snapshot,docker") {
             assertEquals(res[1]['id'], 2)
             assertEquals(res[1]['name'], 'cluster2_data')
         }
+
+        sleep(10)
+        def retry = 10
+        do {
+            do_recycle_func("old_instance_id", host)
+            Thread.sleep(10000) // 10s
+            do_check_func("old_instance_id", host)
+            Thread.sleep(10000) // 10s
+            getCheckJobInfo("old_instance_id", host)
+            logger.info("checkerLastFinishTime=${checkerLastFinishTime}, checkerLastSuccessTime=${checkerLastSuccessTime}")
+            if (checkerLastSuccessTime > recyclerLastSuccessTime) {
+                break
+            }
+            retry--
+        } while (retry)
+        assertEquals(checkerLastFinishTime, checkerLastSuccessTime)
     }
 }
 
