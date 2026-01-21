@@ -129,7 +129,7 @@ class RoutineLoadTestUtils {
         return count
     }
 
-    static void waitForTaskAbort(Closure sqlRunner, String job, int maxAttempts = 60) {
+    static void waitForTaskAbort(Closure sqlRunner, String job, int maxAttempts = 60, int expectedAbortedTaskNum = 1) {
         def count = 0
         while (true) {
             def res = sqlRunner.call("show routine load for ${job}")
@@ -137,12 +137,40 @@ class RoutineLoadTestUtils {
             logger.info("Routine load statistic: ${statistic}")
             def jsonSlurper = new JsonSlurper()
             def json = jsonSlurper.parseText(res[0][14])
-            if (json.abortedTaskNum > 1) {
+            if (json.abortedTaskNum > expectedAbortedTaskNum) {
                 break
             }
             if (count > maxAttempts) {
                 Assert.assertEquals(1, 2)
                 break;
+            } else {
+                sleep(1000)
+                count++
+            }
+        }
+    }
+
+    static void checkTxnTimeoutMatchesTaskTimeout(Closure sqlRunner, String jobName, String expectedTimeoutMs, int maxAttempts = 60) {
+        def count = 0
+        while (true) {
+            def taskRes = sqlRunner.call("SHOW ROUTINE LOAD TASK WHERE JobName = '${jobName}'")
+            if (taskRes.size() > 0) {
+                def txnId = taskRes[0][1].toString()
+                logger.info("Task txnId: ${txnId}, task timeout: ${taskRes[0][6].toString()}")
+                if (txnId != null && txnId != "null" && txnId != "-1") {
+                    // Get transaction timeout from SHOW TRANSACTION
+                    def txnRes = sqlRunner.call("SHOW TRANSACTION WHERE id = ${txnId}")
+                    if (txnRes.size() > 0) {
+                        def txnTimeoutMs = txnRes[0][13].toString()
+                        logger.info("Transaction timeout (ms): ${txnTimeoutMs}, expected: ${expectedTimeoutMs}")
+                        Assert.assertEquals(expectedTimeoutMs, txnTimeoutMs)
+                        break
+                    }
+                }
+            }
+            if (count > maxAttempts) {
+                Assert.fail("Timeout waiting for task and transaction to be created")
+                break
             } else {
                 sleep(1000)
                 count++
