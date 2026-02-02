@@ -1268,18 +1268,6 @@ int MigrateExecutor::migrate_rowset_meta(int64_t tablet_id,
     std::string data_ref_count_key = versioned::data_rowset_ref_count_key(
             {instance_id_, tablet_id, rowset_meta.rowset_id_v2()});
     txn->atomic_add(data_ref_count_key, 1);
-    std::string meta_rowset_key = versioned::meta_rowset_key({instance_id_, tablet_id, rowset_id});
-    if (config::enable_recycle_rowset_strip_key_bounds) {
-        doris::RowsetMetaCloudPB rowset_meta_copy = rowset_meta;
-        // Strip key bounds to shrink operation log for ts compaction recycle entries
-        rowset_meta_copy.clear_segments_key_bounds();
-        rowset_meta_copy.clear_segments_key_bounds_truncated();
-        blob_put(txn.get(), meta_rowset_key, rowset_meta_copy.SerializeAsString(), 0);
-    } else {
-        blob_put(txn.get(), meta_rowset_key, rowset_meta.SerializeAsString(), 0);
-    }
-    LOG(INFO) << "put meta_rowset_key=" << hex(meta_rowset_key);
-
     err = txn->commit();
     if (err == TxnErrorCode::TXN_OK) {
         VLOG_DEBUG << "migrate rowset meta for tablet " << tablet_id << ", version " << end_version
