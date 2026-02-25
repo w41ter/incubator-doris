@@ -468,6 +468,7 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
         Pair<File, File> files = downloadImage(cloneSnapshotState.getFromSnapshotId(), response);
         loadSnapshotImage(files.first, files.second);
         truncateDir(this.cloneSnapshotDir);
+        LOG.info("clone snapshot {} successfully", cloneSnapshotState.getFromSnapshotId());
     }
 
     private CloneSnapshotState parseClusterSnapshotFile(String clusterSnapshotFile) {
