@@ -1418,6 +1418,10 @@ DECLARE_mBool(enable_variant_doc_sparse_write_subcolumns);
 // Maximum depth of nested arrays to track with NestedGroup
 // Reserved for future use when NestedGroup expansion moves to storage layer
 DECLARE_mInt32(variant_nested_group_max_depth);
+// When true, discard scalar data that conflicts with NestedGroup array<object>
+// data at the same path. This simplifies compaction by always prioritizing
+// nested structure over scalar. When false, report an error on conflict.
+DECLARE_mBool(variant_nested_group_discard_scalar_on_conflict);
 
 DECLARE_mBool(enable_merge_on_write_correctness_check);
 // USED FOR DEBUGING
@@ -1583,6 +1587,7 @@ DECLARE_mInt32(max_s3_client_retry);
 DECLARE_mInt32(s3_read_base_wait_time_ms);
 DECLARE_mInt32(s3_read_max_wait_time_ms);
 DECLARE_mBool(enable_s3_object_check_after_upload);
+DECLARE_mInt32(aws_client_request_timeout_ms);
 
 // write as inverted index tmp directory
 DECLARE_String(tmp_file_dir);
