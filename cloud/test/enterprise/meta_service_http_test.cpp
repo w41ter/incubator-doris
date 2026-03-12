@@ -1068,4 +1068,160 @@ TEST(MetaServiceHttpTest, SetMultiVersionStatusDisableWithSnapshotsTest) {
     }
 }
 
+TEST(MetaServiceHttpTest, DecoupleInstanceHttpTest) {
+    HttpContext ctx;
+
+    // Helper to create a committed snapshot and return its snapshot_id
+    auto create_snapshot = [&](const std::string& instance_id) -> std::string {
+        // Set instance to MULTI_VERSION_READ_WRITE / SNAPSHOT_SWITCH_ON
+        {
+            InstanceInfoPB instance = ctx.get_instance_info(instance_id);
+            instance.set_multi_version_status(MULTI_VERSION_READ_WRITE);
+            instance.set_snapshot_switch_status(SNAPSHOT_SWITCH_ON);
+            EXPECT_EQ(ctx.update_instance_info(instance), TxnErrorCode::TXN_OK);
+        }
+
+        std::string cloud_unique_id = fmt::format("1:{}:1", instance_id);
+
+        BeginSnapshotRequest begin_req;
+        begin_req.set_cloud_unique_id(cloud_unique_id);
+        begin_req.set_snapshot_label("test_label");
+        begin_req.set_timeout_seconds(3600);
+        begin_req.set_ttl_seconds(7200);
+        begin_req.set_auto_snapshot(false);
+        brpc::Controller ctrl;
+        BeginSnapshotResponse begin_resp;
+        ctx.meta_service()->begin_snapshot(&ctrl, &begin_req, &begin_resp, nullptr);
+        EXPECT_EQ(begin_resp.status().code(), MetaServiceCode::OK);
+        std::string snapshot_id = begin_resp.snapshot_id();
+
+        CommitSnapshotRequest commit_req;
+        commit_req.set_cloud_unique_id(cloud_unique_id);
+        commit_req.set_snapshot_id(snapshot_id);
+        commit_req.set_image_url("snapshot/test");
+        commit_req.set_last_journal_id(0);
+        commit_req.set_snapshot_meta_image_size(100);
+        commit_req.set_snapshot_logical_data_size(1000);
+        brpc::Controller ctrl2;
+        CommitSnapshotResponse commit_resp;
+        ctx.meta_service()->commit_snapshot(&ctrl2, &commit_req, &commit_resp, nullptr);
+        EXPECT_EQ(commit_resp.status().code(), MetaServiceCode::OK);
+        return snapshot_id;
+    };
+
+    // --- Test 1: Successful decouple ---
+    {
+        std::string src_id = "decouple_test_source_instance";
+        std::string cloned_id = "decouple_test_cloned_instance";
+
+        create_test_instance_for_snapshot(ctx, src_id);
+        std::string snapshot_id = create_snapshot(src_id);
+
+        // Clone the instance (READ_ONLY)
+        {
+            CloneInstanceRequest req;
+            req.set_clone_type(CloneInstanceRequest::READ_ONLY);
+            req.set_from_instance_id(src_id);
+            req.set_from_snapshot_id(snapshot_id);
+            req.set_new_instance_id(cloned_id);
+            brpc::Controller ctrl;
+            CloneInstanceResponse resp;
+            ctx.meta_service()->clone_instance(&ctrl, &req, &resp, nullptr);
+            ASSERT_EQ(resp.status().code(), MetaServiceCode::OK);
+        }
+
+        // Verify the cloned instance has source fields set
+        {
+            InstanceInfoPB instance = ctx.get_instance_info(cloned_id);
+            ASSERT_TRUE(instance.has_source_instance_id());
+            ASSERT_FALSE(instance.source_instance_id().empty());
+            ASSERT_TRUE(instance.has_source_snapshot_id());
+            ASSERT_FALSE(instance.source_snapshot_id().empty());
+        }
+
+        // Verify snapshot reference key exists in KV
+        Versionstamp snapshot_versionstamp;
+        ASSERT_TRUE(
+                SnapshotManager::parse_snapshot_versionstamp(snapshot_id, &snapshot_versionstamp));
+        versioned::SnapshotReferenceKeyInfo ref_key_info {src_id, snapshot_versionstamp, cloned_id};
+        std::string reference_key = versioned::snapshot_reference_key(ref_key_info);
+        {
+            std::unique_ptr<Transaction> txn;
+            ASSERT_EQ(ctx.meta_service()->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+            std::string val;
+            ASSERT_EQ(txn->get(reference_key, &val), TxnErrorCode::TXN_OK);
+        }
+
+        // decouple_instance should fail: compact_status is not DONE yet
+        {
+            auto [http_code, response] = ctx.query<MetaServiceResponseStatus>(
+                    "decouple_instance", fmt::format("instance_id={}", cloned_id));
+            ASSERT_EQ(http_code, 400);
+            ASSERT_EQ(response.code(), MetaServiceCode::INVALID_ARGUMENT);
+            EXPECT_TRUE(response.msg().find("SNAPSHOT_COMPACT_DONE") != std::string::npos);
+        }
+
+        // Manually set snapshot_compact_status to DONE
+        {
+            InstanceInfoPB instance = ctx.get_instance_info(cloned_id);
+            instance.set_snapshot_compact_status(SNAPSHOT_COMPACT_DONE);
+            ASSERT_EQ(ctx.update_instance_info(instance), TxnErrorCode::TXN_OK);
+        }
+
+        // decouple_instance should succeed now
+        {
+            auto [http_code, response] = ctx.query<MetaServiceResponseStatus>(
+                    "decouple_instance", fmt::format("instance_id={}", cloned_id));
+            ASSERT_EQ(http_code, 200);
+            ASSERT_EQ(response.code(), MetaServiceCode::OK);
+        }
+
+        // Verify source fields are cleared
+        {
+            InstanceInfoPB instance = ctx.get_instance_info(cloned_id);
+            EXPECT_FALSE(instance.has_source_instance_id());
+            EXPECT_FALSE(instance.has_source_snapshot_id());
+        }
+
+        // Verify snapshot reference key is removed
+        {
+            std::unique_ptr<Transaction> txn;
+            ASSERT_EQ(ctx.meta_service()->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+            std::string val;
+            EXPECT_EQ(txn->get(reference_key, &val), TxnErrorCode::TXN_KEY_NOT_FOUND);
+        }
+    }
+
+    // --- Test 2: Missing instance_id parameter ---
+    {
+        auto [http_code, response] = ctx.query<MetaServiceResponseStatus>("decouple_instance", "");
+        ASSERT_EQ(http_code, 400);
+        ASSERT_EQ(response.code(), MetaServiceCode::INVALID_ARGUMENT);
+        EXPECT_TRUE(response.msg().find("instance_id is empty") != std::string::npos);
+    }
+
+    // --- Test 3: Non-existent instance ---
+    // Note: http_json_reply maps CLUSTER_NOT_FOUND -> HTTP 404 with body "code":"NOT_FOUND",
+    // which cannot be parsed back into MetaServiceCode via proto JSON utilities. Use
+    // query<std::string> and check the raw HTTP status code and message instead.
+    {
+        auto [http_code, body] =
+                ctx.query<std::string>("decouple_instance", "instance_id=non_existent_instance");
+        ASSERT_EQ(http_code, 404);
+        EXPECT_TRUE(body.find("NOT_FOUND") != std::string::npos);
+        EXPECT_TRUE(body.find("non_existent_instance") != std::string::npos);
+    }
+
+    // --- Test 4: Instance not created via clone_instance ---
+    {
+        std::string plain_id = "decouple_test_plain_instance";
+        create_test_instance_for_snapshot(ctx, plain_id);
+        auto [http_code, response] = ctx.query<MetaServiceResponseStatus>(
+                "decouple_instance", fmt::format("instance_id={}", plain_id));
+        ASSERT_EQ(http_code, 400);
+        ASSERT_EQ(response.code(), MetaServiceCode::INVALID_ARGUMENT);
+        EXPECT_TRUE(response.msg().find("clone_instance") != std::string::npos);
+    }
+}
+
 } // namespace doris::cloud
