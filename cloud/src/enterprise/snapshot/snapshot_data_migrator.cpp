@@ -1840,6 +1840,8 @@ int persist_migrated_key_set(const std::string& instance_id, KeySetType key_set,
             LOG_WARNING("failed to commit txn to save migrated key set").tag("error", err);
             return -1;
         } else {
+            LOG_INFO("successfully saved migrated key set")
+                    .tag("key_set", KeySetType_Name(key_set));
             return 0;
         }
     }

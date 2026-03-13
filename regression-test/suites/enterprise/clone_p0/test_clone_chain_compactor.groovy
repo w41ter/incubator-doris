@@ -229,6 +229,8 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
         connectWithDockerCluster(clusters[cluster_1]) {
             sql "CREATE DATABASE IF NOT EXISTS test_db"
             sql "USE test_db"
+
+            // normal table
             sql """
                 CREATE TABLE IF NOT EXISTS test_table (
                     id INT,
@@ -239,6 +241,23 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
             """
             for (int i = 0; i < 10; i++) {
                 sql "INSERT INTO test_table VALUES (${i}, 'cluster1_data_${i}')"
+            }
+
+            // normal table with range partition
+            sql """
+                CREATE TABLE IF NOT EXISTS test_range_table (
+                    id INT,
+                    name VARCHAR(100)
+                ) DUPLICATE KEY(id)
+                PARTITION BY RANGE(id) (
+                    PARTITION p0 VALUES LESS THAN (5),
+                    PARTITION p1 VALUES LESS THAN (10)
+                )
+                DISTRIBUTED BY HASH(id) BUCKETS 3
+                PROPERTIES ("replication_num" = "1", "disable_auto_compaction" = "true")
+            """
+            for (int i = 0; i < 10; i++) {
+                sql "INSERT INTO test_range_table VALUES (${i}, 'cluster1_data_${i}')"
             }
 
             // empty table
@@ -263,6 +282,23 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
             sql "INSERT INTO test_mow_table VALUES (1, 'cluster0_data')"
             sql "INSERT INTO test_mow_table VALUES (1, 'cluster1_data_1')"
             sql "INSERT INTO test_mow_table VALUES (2, 'cluster1_data_2')"
+
+            // mow table with list partition
+            sql """
+                CREATE TABLE IF NOT EXISTS test_mow_hash_table (
+                    id INT,
+                    name VARCHAR(100)
+                ) UNIQUE KEY(id)
+                PARTITION BY LIST(id) (
+                    PARTITION p0 VALUES IN (1, 2, 3),
+                    PARTITION p1 VALUES IN (4, 5, 6)
+                )
+                DISTRIBUTED BY HASH(id) BUCKETS 3
+                PROPERTIES ("replication_num" = "1", "disable_auto_compaction" = "true")
+            """
+            for (int i = 1; i <= 5; i++) {
+                sql "INSERT INTO test_mow_hash_table VALUES (${i}, 'cluster1_data_${i}')"
+            }
 
             sql "ADMIN SET CLUSTER SNAPSHOT FEATURE ON"
             sql "ADMIN CREATE CLUSTER SNAPSHOT PROPERTIES('ttl' = '3600', 'label' = 'snapshot_label')"
@@ -316,6 +352,7 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
 
             // Below inserts are not included in the base cluster
             sql "INSERT INTO test_table VALUES (2, 'cluster2_data')"
+            sql "INSERT INTO test_range_table VALUES (2, 'cluster2_data')"
             sql "ADMIN SET CLUSTER SNAPSHOT FEATURE ON"
             sql "ADMIN CREATE CLUSTER SNAPSHOT PROPERTIES('ttl' = '3600', 'label' = 'snapshot_label')"
             wait_snapshot_completed(clusters[cluster_2], "snapshot_label")
@@ -323,6 +360,7 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
             cluster2_snapshot_id = snapshot_id
 
             sql "INSERT INTO test_table VALUES (3, 'cluster2_new_data')"
+            sql "INSERT INTO test_range_table VALUES (3, 'cluster2_new_data')"
         }
 
         // Step 3: Restore the snapshot in the cluster3
@@ -356,6 +394,10 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
             logger.info("Data in derived cluster after clone: " + res.toString())
             assertEquals(res.size(), 11)
 
+            res = sql_return_maparray "SELECT * FROM test_range_table ORDER BY id"
+            logger.info("test_range_table in derived cluster after clone: " + res.toString())
+            assertEquals(res.size(), 11)
+
             res = sql_return_maparray "SELECT * FROM test_empty_table ORDER BY id"
             logger.info("test_empty_table in derived cluster after clone: " + res.toString())
             assertEquals(res.size(), 0)
@@ -367,6 +409,10 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
             assertEquals(res[0]['name'], 'cluster1_data_1')
             assertEquals(res[1]['id'], 2)
             assertEquals(res[1]['name'], 'cluster1_data_2')
+
+            res = sql_return_maparray "SELECT * FROM test_mow_hash_table ORDER BY id"
+            logger.info("test_mow_hash_table in derived cluster after clone: " + res.toString())
+            assertEquals(res.size(), 5)
         }
 
         // Step 4: drop snapshot in instance1 (means instance2 snapshot chain is compacted)
@@ -398,7 +444,7 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
                 def json = parseJson(body)
                 assertTrue(json.code.equalsIgnoreCase("OK"))
                 assertEquals(json.result.source_instance_id, "cluster_1_instance_id")
-                assertEquals(json.result.source_snapshot_id, null)
+                assertEquals(json.result.source_snapshot_id, cluster1_snapshot_id)
         }
 
         // check data in instance2
@@ -406,6 +452,10 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
             sql "USE test_db"
             def res = sql_return_maparray "SELECT * FROM test_table ORDER BY id"
             logger.info("Data in derived cluster after clone: " + res.toString())
+            assertEquals(res.size(), 12)
+
+            res = sql_return_maparray "SELECT * FROM test_range_table ORDER BY id"
+            logger.info("test_range_table in derived cluster after clone: " + res.toString())
             assertEquals(res.size(), 12)
 
             res = sql_return_maparray "SELECT * FROM test_empty_table ORDER BY id"
@@ -419,6 +469,10 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
             assertEquals(res[0]['name'], 'cluster1_data_1')
             assertEquals(res[1]['id'], 2)
             assertEquals(res[1]['name'], 'cluster1_data_2')
+
+            res = sql_return_maparray "SELECT * FROM test_mow_hash_table ORDER BY id"
+            logger.info("test_mow_hash_table in derived cluster after clone: " + res.toString())
+            assertEquals(res.size(), 5)
         }
 
         // Step 5: drop instance1
@@ -495,6 +549,15 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
                 sleep(2000)
                 getTabletStatus(backendId_to_backendIP[backend_id], backendId_to_backendHttpPort[backend_id], tablet.TabletId)
             }
+            
+            res = sql_return_maparray "show tablets from test_range_table"
+            logger.info("test_range_table tablets: " + res.toString())
+            for (final def tablet in res) {
+                getTabletStatus(backendId_to_backendIP[backend_id], backendId_to_backendHttpPort[backend_id], tablet.TabletId)
+                triggerCompaction(backendId_to_backendIP[backend_id], backendId_to_backendHttpPort[backend_id], "full", tablet.TabletId)
+                sleep(2000)
+                getTabletStatus(backendId_to_backendIP[backend_id], backendId_to_backendHttpPort[backend_id], tablet.TabletId)
+            }
 
             res = sql_return_maparray "show tablets from test_empty_table"
             logger.info("test_empty_table tablets: " + res.toString())
@@ -507,6 +570,15 @@ suite("test_clone_chain_compactor", "snapshot,docker") {
 
             res = sql_return_maparray "show tablets from test_mow_table"
             logger.info("test_mow_table tablets: " + res.toString())
+            for (final def tablet in res) {
+                getTabletStatus(backendId_to_backendIP[backend_id], backendId_to_backendHttpPort[backend_id], tablet.TabletId)
+                triggerCompaction(backendId_to_backendIP[backend_id], backendId_to_backendHttpPort[backend_id], "full", tablet.TabletId)
+                sleep(2000)
+                getTabletStatus(backendId_to_backendIP[backend_id], backendId_to_backendHttpPort[backend_id], tablet.TabletId)
+            }
+
+            res = sql_return_maparray "show tablets from test_mow_hash_table"
+            logger.info("test_mow_hash_table tablets: " + res.toString())
             for (final def tablet in res) {
                 getTabletStatus(backendId_to_backendIP[backend_id], backendId_to_backendHttpPort[backend_id], tablet.TabletId)
                 triggerCompaction(backendId_to_backendIP[backend_id], backendId_to_backendHttpPort[backend_id], "full", tablet.TabletId)

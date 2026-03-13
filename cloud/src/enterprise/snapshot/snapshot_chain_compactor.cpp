@@ -945,6 +945,8 @@ int CompactExecutor::compact_partition_version_key(Transaction* txn, int64_t par
 
     std::string key = versioned::partition_version_key({instance_id_, partition_id});
     versioned_put(txn, key, versionstamp, value);
+    VLOG_DEBUG << "compacted partition version key for partition_id=" << partition_id
+               << ", version=" << version_pb.version() << ", instance_id=" << instance_id_;
     return 0;
 }
 
@@ -1620,6 +1622,8 @@ int persist_compacted_key_set(const std::string& instance_id, KeySetType key_set
             LOG_WARNING("failed to commit txn to save compacted key set").tag("error", err);
             return -1;
         } else {
+            LOG_INFO("successfully saved compacted key set")
+                    .tag("key_set", KeySetType_Name(key_set));
             return 0;
         }
     }

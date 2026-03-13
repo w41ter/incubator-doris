@@ -67,6 +67,9 @@ public:
 
     int compact_snapshot_chains(doris::cloud::InstanceChainCompactor* compactor) override;
 
+    std::pair<doris::cloud::MetaServiceCode, std::string> compact_snapshot(
+            std::string_view instance_id) override;
+
 private:
     void start_pools();
 

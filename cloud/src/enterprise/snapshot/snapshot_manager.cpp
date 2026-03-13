@@ -2147,4 +2147,92 @@ std::pair<MetaServiceCode, std::string> SnapshotManager::set_multi_version_statu
     return {MetaServiceCode::OK, "success"};
 }
 
+std::pair<MetaServiceCode, std::string> SnapshotManager::compact_snapshot(
+        std::string_view instance_id) {
+    // 1. Create transaction and get current instance info
+    std::unique_ptr<Transaction> txn;
+    TxnErrorCode err = txn_kv_->create_txn(&txn);
+    if (err != TxnErrorCode::TXN_OK) {
+        return {MetaServiceCode::KV_TXN_CREATE_ERR, "failed to create txn"};
+    }
+
+    std::string key = instance_key({instance_id});
+    std::string value;
+    err = txn->get(key, &value);
+    if (err != TxnErrorCode::TXN_OK) {
+        return {MetaServiceCode::KV_TXN_GET_ERR,
+                fmt::format("failed to get instance info, instance_id={}, err={}", instance_id,
+                            err)};
+    }
+
+    InstanceInfoPB instance;
+    if (!instance.ParseFromString(value)) {
+        return {MetaServiceCode::PROTOBUF_PARSE_ERR, "failed to parse instance info"};
+    }
+
+    // 2. Check source_instance_id exists
+    if (!instance.has_source_instance_id() || instance.source_instance_id().empty()) {
+        return {MetaServiceCode::INVALID_ARGUMENT,
+                fmt::format("instance {} is not cloned from snapshot, cannot compact",
+                            instance_id)};
+    }
+
+    // 3. Check current instance's snapshot_compact_status
+    auto current_status = instance.snapshot_compact_status();
+    if (current_status == SnapshotCompactStatus::SNAPSHOT_COMPACT_DONE) {
+        return {MetaServiceCode::OK,
+                fmt::format("instance {} compact already done, cannot compact again", instance_id)};
+    }
+    if (current_status == SnapshotCompactStatus::SNAPSHOT_COMPACT_DOING) {
+        // Idempotent: return success
+        return {MetaServiceCode::OK, "compact is already in progress"};
+    }
+
+    // 4. Get parent instance info and check constraints
+    const std::string& source_instance_id = instance.source_instance_id();
+    std::string source_key = instance_key({source_instance_id});
+    std::string source_value;
+    err = txn->get(source_key, &source_value);
+    if (err != TxnErrorCode::TXN_OK) {
+        return {MetaServiceCode::KV_TXN_GET_ERR,
+                fmt::format("failed to get source instance info, source_instance_id={}, err={}",
+                            source_instance_id, err)};
+    }
+
+    InstanceInfoPB source_instance;
+    if (!source_instance.ParseFromString(source_value)) {
+        return {MetaServiceCode::PROTOBUF_PARSE_ERR, "failed to parse source instance info"};
+    }
+
+    // 5. Check parent instance constraints:
+    //    parent has source_instance_id AND parent's status != DONE → reject
+    bool parent_has_source = source_instance.has_source_instance_id() &&
+                             !source_instance.source_instance_id().empty();
+    bool parent_done = source_instance.snapshot_compact_status() ==
+                       SnapshotCompactStatus::SNAPSHOT_COMPACT_DONE;
+    if (parent_has_source && !parent_done) {
+        return {MetaServiceCode::INVALID_ARGUMENT,
+                fmt::format("parent instance {} has not completed compact yet, cannot compact "
+                            "instance {}",
+                            source_instance_id, instance_id)};
+    }
+
+    // 6. Set status to DOING and commit
+    instance.set_snapshot_compact_status(SnapshotCompactStatus::SNAPSHOT_COMPACT_DOING);
+    txn->atomic_add(system_meta_service_instance_update_key(), 1);
+    txn->put(key, instance.SerializeAsString());
+
+    err = txn->commit();
+    if (err != TxnErrorCode::TXN_OK) {
+        return {MetaServiceCode::KV_TXN_COMMIT_ERR,
+                fmt::format("failed to commit txn, instance_id={}, err={}", instance_id, err)};
+    }
+
+    LOG_INFO("compact_snapshot: set instance to DOING status, waiting for background compactor")
+            .tag("instance_id", instance_id)
+            .tag("source_instance_id", source_instance_id);
+
+    return {MetaServiceCode::OK, "compact snapshot triggered successfully"};
+}
+
 } // namespace selectdb
