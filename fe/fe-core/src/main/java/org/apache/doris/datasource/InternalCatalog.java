@@ -88,7 +88,6 @@ import org.apache.doris.clone.DynamicPartitionScheduler;
 import org.apache.doris.cloud.catalog.CloudEnv;
 import org.apache.doris.cloud.transaction.CloudGlobalTransactionMgr;
 import org.apache.doris.cluster.Cluster;
-import org.apache.doris.cluster.ClusterNamespace;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
@@ -101,10 +100,10 @@ import org.apache.doris.common.Pair;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.io.CountingDataOutputStream;
 import org.apache.doris.common.lock.MonitoredReentrantLock;
+import org.apache.doris.common.util.BufferSizeUtil;
 import org.apache.doris.common.util.DbUtil;
 import org.apache.doris.common.util.DebugPointUtil;
 import org.apache.doris.common.util.DynamicPartitionUtil;
-import org.apache.doris.common.util.IdGeneratorUtil;
 import org.apache.doris.common.util.MetaLockUtils;
 import org.apache.doris.common.util.PropertyAnalyzer;
 import org.apache.doris.common.util.TimeUtils;
@@ -256,8 +255,6 @@ public class InternalCatalog implements CatalogIf<Database> {
         if (StringUtils.isEmpty(dbName)) {
             return null;
         }
-        // ATTN: this should be removed in v3.0
-        dbName = ClusterNamespace.getNameFromFullName(dbName);
         if (fullNameToDb.containsKey(dbName)) {
             return fullNameToDb.get(dbName);
         } else {
@@ -2293,7 +2290,7 @@ public class InternalCatalog implements CatalogIf<Database> {
             replicaAlloc = ReplicaAllocation.DEFAULT_ALLOCATION;
         }
 
-        long bufferSize = IdGeneratorUtil.getBufferSizeForCreateTable(createTableInfo, replicaAlloc);
+        long bufferSize = BufferSizeUtil.getBufferSizeForCreateTable(createTableInfo, replicaAlloc);
         IdGeneratorBuffer idGeneratorBuffer = Env.getCurrentEnv().getIdGeneratorBuffer(bufferSize);
 
         // create partition info
@@ -2495,7 +2492,8 @@ public class InternalCatalog implements CatalogIf<Database> {
         boolean variantEnableFlattenNested  = false;
         try {
             variantEnableFlattenNested = PropertyAnalyzer.analyzeVariantFlattenNested(properties);
-            // only if session variable: enable_variant_flatten_nested = true and
+            // Deprecated legacy flatten-nested switches.
+            // Only if session variable: enable_variant_flatten_nested = true and
             // table property: variant_enable_flatten_nested = true
             // we can enable variant flatten nested otherwise throw error
             if (ctx != null && ctx.getSessionVariable().getEnableVariantFlattenNested()
@@ -2967,6 +2965,13 @@ public class InternalCatalog implements CatalogIf<Database> {
         }
 
         try {
+            String groupCommitMode = PropertyAnalyzer.analyzeGroupCommitMode(properties, true);
+            olapTable.setGroupCommitMode(groupCommitMode);
+        } catch (Exception e) {
+            throw new DdlException(e.getMessage());
+        }
+
+        try {
             TEncryptionAlgorithm tdeAlgorithm = PropertyAnalyzer.analyzeTDEAlgorithm(properties);
             olapTable.setEncryptionAlgorithm(tdeAlgorithm);
         } catch (Exception e) {
@@ -3132,7 +3137,7 @@ public class InternalCatalog implements CatalogIf<Database> {
             db.writeLockOrDdlException();
             try {
                 // db name not changed
-                if (!db.getName().equals(ClusterNamespace.getNameFromFullName(createTableInfo.getDbName()))) {
+                if (!db.getName().equals(createTableInfo.getDbName())) {
                     throw new DdlException("Database name renamed, please check the database name");
                 }
                 // register table, write create table edit log
@@ -3546,7 +3551,7 @@ public class InternalCatalog implements CatalogIf<Database> {
             }
         };
         try {
-            long bufferSize = IdGeneratorUtil.getBufferSizeForTruncateTable(copiedTbl, origPartitions.values());
+            long bufferSize = BufferSizeUtil.getBufferSizeForTruncateTable(copiedTbl, origPartitions.values());
             IdGeneratorBuffer idGeneratorBuffer =
                     origPartitions.isEmpty() ? null : Env.getCurrentEnv().getIdGeneratorBuffer(bufferSize);
 
@@ -3722,6 +3727,10 @@ public class InternalCatalog implements CatalogIf<Database> {
         for (Map.Entry<Long, RecyclePartitionParam> pair : recyclePartitionParamMap.entrySet()) {
             olapTable.dropPartitionForTruncate(olapTable.getDatabase().getId(), isforceDrop, pair.getValue());
         }
+
+        // Reset table-level visibleVersion to TABLE_INIT_VERSION so it stays consistent
+        // with the newly created partitions (which also start at PARTITION_INIT_VERSION).
+        olapTable.resetVisibleVersion();
 
         return oldPartitions;
     }

@@ -112,7 +112,7 @@
 #include "exec/pipeline/task_scheduler.h"
 #include "exec/runtime_filter/runtime_filter_mgr.h"
 #include "exec/sort/topn_sorter.h"
-#include "exec/spill/spill_stream.h"
+#include "exec/spill/spill_file.h"
 #include "io/fs/stream_load_pipe.h"
 #include "load/stream_load/new_load_stream_mgr.h"
 #include "runtime/exec_env.h"
@@ -607,9 +607,9 @@ void PipelineFragmentContext::trigger_report_if_necessary() {
     }
     int32_t interval_s = config::pipeline_status_report_interval;
     if (interval_s <= 0) {
-        LOG(WARNING)
-                << "config::status_report_interval is equal to or less than zero, do not trigger "
-                   "report.";
+        LOG(WARNING) << "config::status_report_interval is equal to or less than zero, do not "
+                        "trigger "
+                        "report.";
     }
     uint64_t next_report_time = _previous_report_time.load(std::memory_order_acquire) +
                                 (uint64_t)(interval_s)*NANOS_PER_SEC;
@@ -676,18 +676,20 @@ Status PipelineFragmentContext::_create_tree_helper(
     int num_children = tnodes[*node_idx].num_children;
     bool current_followed_by_shuffled_operator = followed_by_shuffled_operator;
     bool current_require_bucket_distribution = require_bucket_distribution;
+    // TODO: Create CacheOperator is confused now
     OperatorPtr op = nullptr;
+    OperatorPtr cache_op = nullptr;
     RETURN_IF_ERROR(_create_operator(pool, tnodes[*node_idx], descs, op, cur_pipe,
                                      parent == nullptr ? -1 : parent->node_id(), child_idx,
                                      followed_by_shuffled_operator,
-                                     current_require_bucket_distribution));
+                                     current_require_bucket_distribution, cache_op));
     // Initialization must be done here. For example, group by expressions in agg will be used to
     // decide if a local shuffle should be planed, so it must be initialized here.
     RETURN_IF_ERROR(op->init(tnode, _runtime_state.get()));
     // assert(parent != nullptr || (node_idx == 0 && root_expr != nullptr));
     if (parent != nullptr) {
         // add to parent's child(s)
-        RETURN_IF_ERROR(parent->set_child(op));
+        RETURN_IF_ERROR(parent->set_child(cache_op ? cache_op : op));
     } else {
         *root = op;
     }
@@ -707,16 +709,20 @@ Status PipelineFragmentContext::_create_tree_helper(
                     ? cur_pipe->sink()->required_data_distribution(_runtime_state.get())
                     : op->required_data_distribution(_runtime_state.get());
     current_followed_by_shuffled_operator =
-            (followed_by_shuffled_operator ||
-             (cur_pipe->operators().empty() ? cur_pipe->sink()->is_shuffled_operator()
-                                            : op->is_shuffled_operator())) &&
-            Pipeline::is_hash_exchange(required_data_distribution.distribution_type);
+            ((followed_by_shuffled_operator ||
+              (cur_pipe->operators().empty() ? cur_pipe->sink()->is_shuffled_operator()
+                                             : op->is_shuffled_operator())) &&
+             Pipeline::is_hash_exchange(required_data_distribution.distribution_type)) ||
+            (followed_by_shuffled_operator &&
+             required_data_distribution.distribution_type == ExchangeType::NOOP);
 
     current_require_bucket_distribution =
-            (require_bucket_distribution ||
-             (cur_pipe->operators().empty() ? cur_pipe->sink()->is_colocated_operator()
-                                            : op->is_colocated_operator())) &&
-            Pipeline::is_hash_exchange(required_data_distribution.distribution_type);
+            ((require_bucket_distribution ||
+              (cur_pipe->operators().empty() ? cur_pipe->sink()->is_colocated_operator()
+                                             : op->is_colocated_operator())) &&
+             Pipeline::is_hash_exchange(required_data_distribution.distribution_type)) ||
+            (require_bucket_distribution &&
+             required_data_distribution.distribution_type == ExchangeType::NOOP);
 
     if (num_children == 0) {
         _use_serial_source = op->is_serial_operator();
@@ -732,7 +738,8 @@ Status PipelineFragmentContext::_create_tree_helper(
         // this means we have been given a bad tree and must fail
         if (*node_idx >= tnodes.size()) {
             return Status::InternalError(
-                    "Failed to reconstruct plan tree from thrift. Node id: {}, number of nodes: {}",
+                    "Failed to reconstruct plan tree from thrift. Node id: {}, number of "
+                    "nodes: {}",
                     *node_idx, tnodes.size());
         }
     }
@@ -1230,7 +1237,8 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
                                                  PipelinePtr& cur_pipe, int parent_idx,
                                                  int child_idx,
                                                  const bool followed_by_shuffled_operator,
-                                                 const bool require_bucket_distribution) {
+                                                 const bool require_bucket_distribution,
+                                                 OperatorPtr& cache_op) {
     std::vector<DataSinkOperatorPtr> sink_ops;
     Defer defer = Defer([&]() {
         if (op) {
@@ -1327,7 +1335,7 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
             _dag[downstream_pipeline_id].push_back(new_pipe->id());
 
             DataSinkOperatorPtr cache_sink(new CacheSinkOperatorX(
-                    next_sink_operator_id(), cache_source_id, op->operator_id()));
+                    next_sink_operator_id(), op->node_id(), op->operator_id()));
             RETURN_IF_ERROR(new_pipe->set_sink(cache_sink));
             return Status::OK();
         };
@@ -1341,8 +1349,9 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
         const bool is_streaming_agg = tnode.agg_node.__isset.use_streaming_preaggregation &&
                                       tnode.agg_node.use_streaming_preaggregation &&
                                       !tnode.agg_node.grouping_exprs.empty();
+        // TODO: distinct streaming agg does not support spill.
         const bool can_use_distinct_streaming_agg =
-                tnode.agg_node.aggregate_functions.empty() &&
+                (!enable_spill || is_streaming_agg) && tnode.agg_node.aggregate_functions.empty() &&
                 !tnode.agg_node.__isset.agg_sort_info_by_group_key &&
                 _params.query_options.__isset.enable_distinct_streaming_aggregation &&
                 _params.query_options.enable_distinct_streaming_aggregation;
@@ -1352,6 +1361,7 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
                 PipelinePtr new_pipe;
                 RETURN_IF_ERROR(create_query_cache_operator(new_pipe));
 
+                cache_op = op;
                 op = std::make_shared<DistinctStreamingAggOperatorX>(pool, next_operator_id(),
                                                                      tnode, descs);
                 RETURN_IF_ERROR(new_pipe->add_operator(op, _parallel_instances));
@@ -1366,7 +1376,7 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
             if (need_create_cache_op) {
                 PipelinePtr new_pipe;
                 RETURN_IF_ERROR(create_query_cache_operator(new_pipe));
-
+                cache_op = op;
                 op = std::make_shared<StreamingAggOperatorX>(pool, next_operator_id(), tnode,
                                                              descs);
                 RETURN_IF_ERROR(cur_pipe->operators().front()->set_child(op));
@@ -1382,6 +1392,7 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
             PipelinePtr new_pipe;
             if (need_create_cache_op) {
                 RETURN_IF_ERROR(create_query_cache_operator(new_pipe));
+                cache_op = op;
             }
 
             if (enable_spill) {
@@ -1424,7 +1435,6 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
         if (enable_spill && !is_broadcast_join) {
             auto tnode_ = tnode;
             tnode_.runtime_filters.clear();
-            uint32_t partition_count = _runtime_state->spill_hash_join_partition_count();
             auto inner_probe_operator =
                     std::make_shared<HashJoinProbeOperatorX>(pool, tnode_, 0, descs);
 
@@ -1437,7 +1447,7 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
             RETURN_IF_ERROR(probe_side_inner_sink_operator->init(tnode_, _runtime_state.get()));
 
             auto probe_operator = std::make_shared<PartitionedHashJoinProbeOperatorX>(
-                    pool, tnode_, next_operator_id(), descs, partition_count);
+                    pool, tnode_, next_operator_id(), descs);
             probe_operator->set_inner_operators(probe_side_inner_sink_operator,
                                                 inner_probe_operator);
             op = std::move(probe_operator);
@@ -1453,8 +1463,7 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
             auto inner_sink_operator =
                     std::make_shared<HashJoinBuildSinkOperatorX>(pool, 0, 0, tnode, descs);
             auto sink_operator = std::make_shared<PartitionedHashJoinSinkOperatorX>(
-                    pool, next_sink_operator_id(), op->operator_id(), tnode_, descs,
-                    partition_count);
+                    pool, next_sink_operator_id(), op->operator_id(), tnode_, descs);
             RETURN_IF_ERROR(inner_sink_operator->init(tnode, _runtime_state.get()));
 
             sink_operator->set_inner_operators(inner_sink_operator, inner_probe_operator);
@@ -1964,7 +1973,7 @@ size_t PipelineFragmentContext::get_revocable_size(bool* has_running_task) const
             }
 
             size_t revocable_size = task.first->get_revocable_size();
-            if (revocable_size >= SpillStream::MIN_SPILL_WRITE_BATCH_MEM) {
+            if (revocable_size >= SpillFile::MIN_SPILL_WRITE_BATCH_MEM) {
                 res += revocable_size;
             }
         }
@@ -1977,7 +1986,8 @@ std::vector<PipelineTask*> PipelineFragmentContext::get_revocable_tasks() const 
     for (const auto& task_instances : _tasks) {
         for (const auto& task : task_instances) {
             size_t revocable_size_ = task.first->get_revocable_size();
-            if (revocable_size_ >= SpillStream::MIN_SPILL_WRITE_BATCH_MEM) {
+
+            if (revocable_size_ >= SpillFile::MIN_SPILL_WRITE_BATCH_MEM) {
                 revocable_tasks.emplace_back(task.first.get());
             }
         }
