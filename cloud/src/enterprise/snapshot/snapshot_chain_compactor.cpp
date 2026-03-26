@@ -522,6 +522,8 @@ int CompactExecutor::compact_table_version_key(int64_t table_id) {
 
     err = txn->commit();
     if (err == TxnErrorCode::TXN_OK) {
+        VLOG_DEBUG << "compact table version key, table_id=" << table_id
+                   << ", versionstamp=" << versionstamp.to_string();
         return 0; // success
     } else if (err == TxnErrorCode::TXN_CONFLICT) {
         LOG_WARNING("compact table version key failed due to transaction conflict");
@@ -581,6 +583,7 @@ int CompactExecutor::compact_partition_key(int64_t partition_id) {
 
     err = txn->commit();
     if (err == TxnErrorCode::TXN_OK) {
+        VLOG_DEBUG << "compact partition key, partition_id=" << partition_id;
         return 0; // success
     } else if (err == TxnErrorCode::TXN_CONFLICT) {
         LOG_WARNING("compact partition key failed due to transaction conflict");
@@ -646,6 +649,7 @@ int CompactExecutor::compact_index_key(int64_t index_id) {
 
     err = txn->commit();
     if (err == TxnErrorCode::TXN_OK) {
+        VLOG_DEBUG << "compact index key, index_id=" << index_id;
         return 0; // success
     } else if (err == TxnErrorCode::TXN_CONFLICT) {
         LOG_WARNING("compact index key failed due to transaction conflict");
@@ -712,6 +716,7 @@ int CompactExecutor::compact_tablet_key(int64_t tablet_id) {
 
     err = txn->commit();
     if (err == TxnErrorCode::TXN_OK) {
+        VLOG_DEBUG << "compact tablet key, tablet_id=" << tablet_id;
         return 0; // success
     } else if (err == TxnErrorCode::TXN_CONFLICT) {
         LOG_WARNING("compact tablet key failed due to transaction conflict");
@@ -845,6 +850,8 @@ int CompactExecutor::compact_partition_meta_key(Transaction* txn, int64_t partit
     }
 
     versioned_put(txn, key, versionstamp, value);
+    VLOG_DEBUG << "compact partition meta key, partition_id=" << partition_id
+               << ", versionstamp=" << versionstamp.to_string();
     return 0;
 }
 
@@ -877,6 +884,7 @@ int CompactExecutor::compact_partition_index_key(Transaction* txn, int64_t parti
 
     std::string key = versioned::partition_index_key({instance_id_, partition_id});
     txn->put(key, index_value);
+    VLOG_DEBUG << "compact partition index key, partition_id=" << partition_id;
     return 0;
 }
 
@@ -899,6 +907,8 @@ int CompactExecutor::compact_partition_inverted_index_key(Transaction* txn, int6
     }
 
     txn->put(key, "");
+    VLOG_DEBUG << "compact partition inverted index key, partition_id=" << partition_id
+               << ", db_id=" << db_id << ", table_id=" << table_id;
     return 0;
 }
 
@@ -946,7 +956,8 @@ int CompactExecutor::compact_partition_version_key(Transaction* txn, int64_t par
     std::string key = versioned::partition_version_key({instance_id_, partition_id});
     versioned_put(txn, key, versionstamp, value);
     VLOG_DEBUG << "compacted partition version key for partition_id=" << partition_id
-               << ", version=" << version_pb.version() << ", instance_id=" << instance_id_;
+               << ", version=" << version_pb.version()
+               << ", versionstamp=" << versionstamp.to_string() << ", instance_id=" << instance_id_;
     return 0;
 }
 
@@ -974,6 +985,8 @@ int CompactExecutor::compact_index_meta_key(Transaction* txn, int64_t index_id) 
     }
 
     versioned_put(txn, meta_key, versionstamp, value);
+    VLOG_DEBUG << "compact index meta key, index_id=" << index_id
+               << ", versionstamp=" << versionstamp.to_string();
     return 0;
 }
 
@@ -1006,6 +1019,7 @@ int CompactExecutor::compact_index_index_key(Transaction* txn, int64_t index_id,
 
     std::string index_key = versioned::index_index_key({instance_id_, index_id});
     txn->put(index_key, index_value);
+    VLOG_DEBUG << "compact index index key, index_id=" << index_id;
     return 0;
 }
 
@@ -1025,6 +1039,8 @@ int CompactExecutor::compact_index_inverted_index_key(Transaction* txn, int64_t 
     }
 
     txn->put(key, "");
+    VLOG_DEBUG << "compact index inverted index key, db_id=" << db_id << ", table_id=" << table_id
+               << ", index_id=" << index_id;
     return 0;
 }
 
@@ -1056,6 +1072,8 @@ int CompactExecutor::compact_tablet_meta_key(Transaction* txn, int64_t tablet_id
         LOG_WARNING("failed to serialize versioned tablet meta");
         return -1;
     }
+    VLOG_DEBUG << "compact tablet meta key, tablet_id=" << tablet_id
+               << ", versionstamp=" << meta_version.to_string();
     return 0;
 }
 
@@ -1088,6 +1106,7 @@ int CompactExecutor::compact_tablet_index_key(Transaction* txn, int64_t tablet_i
 
     std::string index_key = versioned::tablet_index_key({instance_id_, tablet_id});
     txn->put(index_key, index_value);
+    VLOG_DEBUG << "compact tablet index key, tablet_id=" << tablet_id;
     return 0;
 }
 
@@ -1109,6 +1128,9 @@ int CompactExecutor::compact_tablet_inverted_index_key(Transaction* txn, int64_t
     }
 
     txn->put(key, "");
+    VLOG_DEBUG << "compact tablet inverted index key, tablet_id=" << tablet_id
+               << ", db_id=" << db_id << ", table_id=" << table_id << ", index_id=" << index_id
+               << ", partition_id=" << partition_id;
     return 0;
 }
 
@@ -1146,6 +1168,8 @@ int CompactExecutor::compact_tablet_load_stats_key(Transaction* txn, int64_t tab
         LOG_WARNING("failed to serialize versioned tablet stats");
         return -1;
     }
+    VLOG_DEBUG << "compact tablet load stats key, tablet_id=" << tablet_id
+               << ", versionstamp=" << versionstamp.to_string();
     return 0;
 }
 
@@ -1183,6 +1207,9 @@ int CompactExecutor::compact_tablet_compact_stats_key(Transaction* txn, int64_t 
         LOG_WARNING("failed to serialize versioned tablet stats");
         return -1;
     }
+
+    VLOG_DEBUG << "compact tablet compact stats key, tablet_id=" << tablet_id
+               << ", versionstamp=" << versionstamp.to_string();
     return 0;
 }
 
@@ -1219,6 +1246,9 @@ int CompactExecutor::compact_meta_schema_key(Transaction* txn, int64_t index_id,
         LOG_WARNING("failed to serialize versioned tablet schema");
         return -1;
     }
+
+    VLOG_DEBUG << "compact meta schema key, index_id=" << index_id
+               << ", schema_version=" << schema_version;
     return 0;
 }
 
@@ -1271,10 +1301,13 @@ int CompactExecutor::compact_rowset_load_key(Transaction* txn, int64_t tablet_id
                 {reference_instance_id, tablet_id, rowset_meta.rowset_id_v2()});
         LOG_INFO("add rowset ref count key")
                 .tag("reference_instance_id", reference_instance_id)
+                .tag("tablet_id", tablet_id)
                 .tag("rowset_id", rowset_meta.rowset_id_v2())
                 .tag("key", hex(rowset_ref_count_key));
         txn->atomic_add(rowset_ref_count_key, 1);
     }
+    VLOG_DEBUG << "compact rowset load key, tablet_id=" << tablet_id << ", version=" << version
+               << ", versionstamp=" << versionstamp.to_string();
     return 0;
 }
 
@@ -1322,9 +1355,12 @@ int CompactExecutor::compact_rowset_compact_key(Transaction* txn, int64_t tablet
             {reference_instance_id, tablet_id, rowset_meta.rowset_id_v2()});
     LOG_INFO("add rowset ref count key")
             .tag("reference_instance_id", reference_instance_id)
+            .tag("tablet_id", tablet_id)
             .tag("rowset_id", rowset_meta.rowset_id_v2())
             .tag("key", hex(rowset_ref_count_key));
     txn->atomic_add(rowset_ref_count_key, 1);
+    VLOG_DEBUG << "compact rowset compact key, tablet_id=" << tablet_id << ", version=" << version
+               << ", versionstamp=" << versionstamp.to_string();
     return 0;
 }
 
@@ -1368,6 +1404,8 @@ int CompactExecutor::compact_delete_bitmap_key(Transaction* txn, int64_t tablet_
         return -1;
     }
     doris::cloud::blob_put(txn, key, val, 0);
+    VLOG_DEBUG << "compact delete bitmap key, tablet_id=" << tablet_id
+               << ", rowset_id=" << rowset_id;
     return 0;
 }
 

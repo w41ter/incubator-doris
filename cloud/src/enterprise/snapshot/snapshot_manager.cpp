@@ -1735,6 +1735,8 @@ MetaServiceCode SnapshotManager::handle_rollback_clone(Transaction* txn,
     // the source instance is the real instance which creates this snapshot
     target_instance_info.set_source_instance_id(snapshot_pb.instance_id());
     target_instance_info.set_ctime(std::time(nullptr));
+    target_instance_info.clear_compacted_key_sets();
+    target_instance_info.clear_snapshot_compact_status();
 
     // Set original instance relationship
     if (from_instance_info.has_original_instance_id()) {
