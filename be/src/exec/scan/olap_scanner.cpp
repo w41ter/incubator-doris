@@ -178,6 +178,11 @@ Status OlapScanner::prepare() {
                 return false;
             }
 
+            // If `delete_predicates` is not empty, will merge the columns in delete predicate into current tablet schema
+            if (!_tablet_reader_params.delete_predicates.empty()) {
+                return false;
+            }
+
             const bool has_pruned_column =
                     std::ranges::any_of(_output_tuple_desc->slots(), [](const auto& slot) {
                         if ((slot->type()->get_primitive_type() == PrimitiveType::TYPE_STRUCT ||
@@ -398,10 +403,11 @@ Status OlapScanner::_init_tablet_reader_params(
         tablet_schema->merge_dropped_columns(*del_pred->tablet_schema());
     }
 
-    // Range
+    // Push key ranges to the tablet reader.
+    // Skip the "full scan" placeholder (has_lower_bound == false) — when no key
+    // predicates exist, start_key/end_key remain empty and the reader does a full scan.
     for (auto* key_range : key_ranges) {
-        if (key_range->begin_scan_range.size() == 1 &&
-            key_range->begin_scan_range.get_value(0) == NEGATIVE_INFINITY) {
+        if (!key_range->has_lower_bound) {
             continue;
         }
 
@@ -548,11 +554,12 @@ Status OlapScanner::_init_variant_columns() {
         if (slot->type()->get_primitive_type() == PrimitiveType::TYPE_VARIANT) {
             // Such columns are not exist in frontend schema info, so we need to
             // add them into tablet_schema for later column indexing.
+            const auto& dt_variant =
+                    assert_cast<const DataTypeVariant&>(*remove_nullable(slot->type()));
             TabletColumn subcol = TabletColumn::create_materialized_variant_column(
                     tablet_schema->column_by_uid(slot->col_unique_id()).name_lower_case(),
                     slot->column_paths(), slot->col_unique_id(),
-                    assert_cast<const DataTypeVariant&>(*remove_nullable(slot->type()))
-                            .variant_max_subcolumns_count());
+                    dt_variant.variant_max_subcolumns_count(), dt_variant.enable_doc_mode());
             if (tablet_schema->field_index(*subcol.path_info_ptr()) < 0) {
                 tablet_schema->append_column(subcol, TabletSchema::ColumnType::VARIANT);
             }
