@@ -312,6 +312,8 @@ doris::RowsetMetaCloudPB create_rowset(int64_t txn_id, int64_t tablet_id, int pa
     rowset.set_data_disk_size(num_rows * DATA_DISK_SIZE_CONST);
     rowset.set_index_disk_size(num_rows * INDEX_DISK_SIZE_CONST);
     rowset.set_total_disk_size(num_rows * DISK_SIZE_CONST);
+    rowset.set_enable_segments_file_size(true);
+    rowset.add_segments_file_size(num_rows * DATA_DISK_SIZE_CONST);
     rowset.mutable_tablet_schema()->set_schema_version(schema_version);
     rowset.set_txn_expiration(::time(nullptr)); // Required by DCHECK
     return rowset;
@@ -2334,4 +2336,347 @@ TEST(RecycleSnapshotTest, CheckInvertedIndexFileV1InvalidIndexId) {
 
     // Should return 1 indicating invalid index_id with suffix
     ASSERT_EQ(snapshot_manager->inverted_check_mvcc_meta_key(checker.get()), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Helper: write successor/original linkage between two existing instances via
+// direct txn_kv operations.  Mirrors what clone_instance(ROLLBACK) does.
+// ---------------------------------------------------------------------------
+static void link_instance_chain(TxnKv* txn_kv, const std::string& original_id,
+                                const std::string& successor_id) {
+    std::unique_ptr<Transaction> txn;
+    ASSERT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+
+    // Read original
+    InstanceInfoPB orig_pb;
+    {
+        std::string key = instance_key({original_id});
+        std::string val;
+        ASSERT_EQ(txn->get(key, &val), TxnErrorCode::TXN_OK);
+        ASSERT_TRUE(orig_pb.ParseFromString(val));
+    }
+
+    // Read successor
+    InstanceInfoPB succ_pb;
+    {
+        std::string key = instance_key({successor_id});
+        std::string val;
+        ASSERT_EQ(txn->get(key, &val), TxnErrorCode::TXN_OK);
+        ASSERT_TRUE(succ_pb.ParseFromString(val));
+    }
+
+    orig_pb.set_successor_instance_id(successor_id);
+    succ_pb.set_original_instance_id(original_id);
+    succ_pb.set_source_instance_id(original_id);
+
+    txn->put(instance_key({original_id}), orig_pb.SerializeAsString());
+    txn->put(instance_key({successor_id}), succ_pb.SerializeAsString());
+    ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+}
+
+// Fetch InstanceInfoPB for an instance_id directly from txn_kv.
+static InstanceInfoPB get_instance_info_direct(TxnKv* txn_kv, const std::string& instance_id) {
+    std::unique_ptr<Transaction> txn;
+    EXPECT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+    std::string key = instance_key({instance_id});
+    std::string val;
+    EXPECT_EQ(txn->get(key, &val), TxnErrorCode::TXN_OK);
+    InstanceInfoPB pb;
+    EXPECT_TRUE(pb.ParseFromString(val));
+    return pb;
+}
+
+// ---------------------------------------------------------------------------
+// Task 1 – Drop instance: successor / chain tests
+// ---------------------------------------------------------------------------
+
+// Dropping an instance that has a successor must be rejected.
+TEST(RecycleSnapshotTest, DropInstanceWithSuccessorRejected) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+
+    std::string instance_id1 = "drop_chain_test_has_successor_inst1";
+    std::string instance_id2 = "drop_chain_test_has_successor_inst2";
+    std::string cloud_unique_id1 = fmt::format("1:{}:0", instance_id1);
+
+    MOCK_GET_INSTANCE_ID(instance_id1);
+    create_and_refresh_instance(meta_service.get(), instance_id1);
+    create_and_refresh_instance(meta_service.get(), instance_id2);
+
+    // Link: instance1 → instance2
+    ASSERT_NO_FATAL_FAILURE(link_instance_chain(txn_kv.get(), instance_id1, instance_id2));
+
+    // Attempting to drop instance1 (which now has a successor) must fail.
+    {
+        brpc::Controller cntl;
+        AlterInstanceRequest req;
+        AlterInstanceResponse res;
+        req.set_instance_id(instance_id1);
+        req.set_op(AlterInstanceRequest::DROP);
+        meta_service->alter_instance(&cntl, &req, &res, nullptr);
+        ASSERT_FALSE(cntl.Failed());
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT) << res.ShortDebugString();
+        EXPECT_TRUE(res.status().msg().find("successor") != std::string::npos)
+                << res.status().msg();
+    }
+}
+
+// Dropping the chain tail also drops the whole chain atomically.
+TEST(RecycleSnapshotTest, DropInstanceChainSuccess) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+
+    std::string instance_id1 = "drop_chain_success_inst1";
+    std::string instance_id2 = "drop_chain_success_inst2";
+    std::string cloud_unique_id1 = fmt::format("1:{}:0", instance_id1);
+    std::string cloud_unique_id2 = fmt::format("1:{}:0", instance_id2);
+
+    MOCK_GET_INSTANCE_ID(instance_id2);
+    create_and_refresh_instance(meta_service.get(), instance_id1);
+    create_and_refresh_instance(meta_service.get(), instance_id2);
+
+    // Link: instance1 → instance2
+    ASSERT_NO_FATAL_FAILURE(link_instance_chain(txn_kv.get(), instance_id1, instance_id2));
+
+    // Dropping the chain tail (instance2) must succeed and mark both DELETED.
+    {
+        brpc::Controller cntl;
+        AlterInstanceRequest req;
+        AlterInstanceResponse res;
+        req.set_instance_id(instance_id2);
+        req.set_op(AlterInstanceRequest::DROP);
+        meta_service->alter_instance(&cntl, &req, &res, nullptr);
+        ASSERT_FALSE(cntl.Failed());
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
+    }
+
+    // Both instances must be marked DELETED.
+    {
+        auto pb1 = get_instance_info_direct(txn_kv.get(), instance_id1);
+        EXPECT_EQ(pb1.status(), InstanceInfoPB::DELETED) << "instance1 must be DELETED";
+        auto pb2 = get_instance_info_direct(txn_kv.get(), instance_id2);
+        EXPECT_EQ(pb2.status(), InstanceInfoPB::DELETED) << "instance2 must be DELETED";
+    }
+}
+
+// Chain drop is rejected when any instance in the chain still has a non-RECYCLED snapshot.
+TEST(RecycleSnapshotTest, DropInstanceChainRejectedHasSnapshots) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+
+    std::string instance_id1 = "drop_chain_snap_inst1";
+    std::string instance_id2 = "drop_chain_snap_inst2";
+    std::string cloud_unique_id1 = fmt::format("1:{}:0", instance_id1);
+    std::string cloud_unique_id2 = fmt::format("1:{}:0", instance_id2);
+
+    MOCK_GET_INSTANCE_ID(instance_id1);
+    create_and_refresh_instance(meta_service.get(), instance_id1);
+    update_snapshot_properties(meta_service.get(), instance_id1, true, 5, 3600);
+
+    // Create and commit a snapshot on instance1.
+    SnapshotContext ctx;
+    begin_snapshot(meta_service.get(), cloud_unique_id1, "snap-in-chain", &ctx, false);
+    commit_snapshot(meta_service.get(), cloud_unique_id1, ctx.snapshot_id, ctx.image_url, 1);
+
+    create_and_refresh_instance(meta_service.get(), instance_id2);
+    update_snapshot_properties(meta_service.get(), instance_id2, true, 5, 3600);
+
+    // Link: instance1 → instance2
+    ASSERT_NO_FATAL_FAILURE(link_instance_chain(txn_kv.get(), instance_id1, instance_id2));
+
+    // Drop chain tail (instance2): must fail because instance1 still has a snapshot.
+    {
+        brpc::Controller cntl;
+        AlterInstanceRequest req;
+        AlterInstanceResponse res;
+        req.set_instance_id(instance_id2);
+        req.set_op(AlterInstanceRequest::DROP);
+        meta_service->alter_instance(&cntl, &req, &res, nullptr);
+        ASSERT_FALSE(cntl.Failed());
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT) << res.ShortDebugString();
+        EXPECT_TRUE(res.status().msg().find("snapshots") != std::string::npos)
+                << res.status().msg();
+    }
+
+    // Mark the snapshot as RECYCLED and try again.
+    {
+        brpc::Controller cntl;
+        DropSnapshotRequest req;
+        req.set_snapshot_id(ctx.snapshot_id);
+        DropSnapshotResponse res;
+        meta_service->snapshot_manager()->drop_snapshot(instance_id1, req, &res);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
+    }
+
+    // Now the chain drop should succeed.
+    {
+        brpc::Controller cntl;
+        AlterInstanceRequest req;
+        AlterInstanceResponse res;
+        req.set_instance_id(instance_id2);
+        req.set_op(AlterInstanceRequest::DROP);
+        meta_service->alter_instance(&cntl, &req, &res, nullptr);
+        ASSERT_FALSE(cntl.Failed());
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
+    }
+
+    auto pb1 = get_instance_info_direct(txn_kv.get(), instance_id1);
+    EXPECT_EQ(pb1.status(), InstanceInfoPB::DELETED);
+    auto pb2 = get_instance_info_direct(txn_kv.get(), instance_id2);
+    EXPECT_EQ(pb2.status(), InstanceInfoPB::DELETED);
+}
+
+// ---------------------------------------------------------------------------
+// Task 2 – recycle_snapshots: successor / chain tests
+// ---------------------------------------------------------------------------
+
+// recycle_snapshots on an instance that has a successor must skip immediately.
+TEST(RecycleSnapshotTest, RecycleSnapshotsSkipWhenHasSuccessor) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+
+    std::string instance_id1 = "recycle_skip_successor_inst1";
+    std::string instance_id2 = "recycle_skip_successor_inst2";
+    std::string cloud_unique_id1 = fmt::format("1:{}:0", instance_id1);
+
+    MOCK_GET_INSTANCE_ID(instance_id1);
+    create_and_refresh_instance(meta_service.get(), instance_id1);
+    update_snapshot_properties(meta_service.get(), instance_id1, true, 5, 3600);
+
+    // Create a snapshot on instance1 that would normally be eligible for recycling.
+    SnapshotContext ctx;
+    begin_snapshot(meta_service.get(), cloud_unique_id1, "auto-gen", &ctx);
+
+    config::force_immediate_recycle = true;
+    DORIS_CLOUD_DEFER {
+        config::force_immediate_recycle = false;
+    };
+
+    create_and_refresh_instance(meta_service.get(), instance_id2);
+
+    // Link: instance1 → instance2
+    ASSERT_NO_FATAL_FAILURE(link_instance_chain(txn_kv.get(), instance_id1, instance_id2));
+
+    // Recycle from instance1's perspective (it has a successor): must be skipped.
+    InstanceInfoPB instance_info1 = get_instance_info_direct(txn_kv.get(), instance_id1);
+    auto recycler1 = get_instance_recycler(meta_service.get(), instance_info1);
+    ASSERT_EQ(recycler1->recycle_cluster_snapshots(), 0);
+
+    // The snapshot on instance1 must NOT have been touched.
+    std::vector<SnapshotInfoPB> snapshots;
+    get_snapshots(meta_service.get(), instance_id1, snapshots);
+    ASSERT_EQ(snapshots.size(), 1);
+    // Still in PREPARE (would have been aborted if recycler had run).
+    EXPECT_EQ(snapshots[0].status(), SnapshotStatus::SNAPSHOT_PREPARE);
+}
+
+// recycle_snapshots on the chain tail processes expired snapshots from predecessor instances.
+TEST(RecycleSnapshotTest, RecycleSnapshotsChainProcessesPredecessorSnapshots) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+
+    std::string instance_id1 = "recycle_chain_pred_inst1";
+    std::string instance_id2 = "recycle_chain_pred_inst2";
+    std::string cloud_unique_id1 = fmt::format("1:{}:0", instance_id1);
+    std::string cloud_unique_id2 = fmt::format("1:{}:0", instance_id2);
+
+    MOCK_GET_INSTANCE_ID(instance_id1);
+    create_and_refresh_instance(meta_service.get(), instance_id1);
+    update_snapshot_properties(meta_service.get(), instance_id1, true, 5, 3600);
+
+    // Create and commit an expired snapshot on instance1 (manual, with ttl = 0).
+    {
+        BeginSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id1);
+        req.set_auto_snapshot(false);
+        req.set_timeout_seconds(12);
+        req.set_ttl_seconds(1); // Immediately expired.
+        req.set_request_ip("127.0.0.1");
+        req.set_snapshot_label("expired-snap");
+        brpc::Controller cnt;
+        BeginSnapshotResponse resp;
+        meta_service->begin_snapshot(&cnt, &req, &resp, brpc::DoNothing());
+        ASSERT_EQ(resp.status().code(), MetaServiceCode::OK) << resp.ShortDebugString();
+        commit_snapshot(meta_service.get(), cloud_unique_id1, resp.snapshot_id(), resp.image_url(),
+                        1);
+    }
+
+    // Verify the snapshot exists on instance1.
+    {
+        std::vector<SnapshotInfoPB> snaps;
+        get_snapshots(meta_service.get(), instance_id1, snaps);
+        ASSERT_EQ(snaps.size(), 1);
+        EXPECT_EQ(snaps[0].status(), SnapshotStatus::SNAPSHOT_NORMAL);
+    }
+
+    create_and_refresh_instance(meta_service.get(), instance_id2);
+    update_snapshot_properties(meta_service.get(), instance_id2, true, 5, 3600);
+
+    // Link: instance1 → instance2
+    ASSERT_NO_FATAL_FAILURE(link_instance_chain(txn_kv.get(), instance_id1, instance_id2));
+
+    config::force_immediate_recycle = true;
+    DORIS_CLOUD_DEFER {
+        config::force_immediate_recycle = false;
+    };
+
+    // Run recycle_snapshots from instance2 (chain tail): it should process instance1's snapshot.
+    InstanceInfoPB instance_info2 = get_instance_info_direct(txn_kv.get(), instance_id2);
+    auto recycler2 = get_instance_recycler(meta_service.get(), instance_info2);
+    ASSERT_EQ(recycler2->recycle_cluster_snapshots(), 0);
+
+    // The expired snapshot on instance1 must have been marked RECYCLED.
+    std::vector<SnapshotInfoPB> snaps;
+    get_snapshots(meta_service.get(), instance_id1, snaps);
+    ASSERT_EQ(snaps.size(), 1);
+    EXPECT_EQ(snaps[0].status(), SnapshotStatus::SNAPSHOT_RECYCLED);
+}
+
+// Auto snapshots across the whole chain are counted together against max_reserved_snapshot.
+TEST(RecycleSnapshotTest, RecycleSnapshotsChainMergesAutoSnapshotCount) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+
+    std::string instance_id1 = "recycle_chain_count_inst1";
+    std::string instance_id2 = "recycle_chain_count_inst2";
+    std::string cloud_unique_id1 = fmt::format("1:{}:0", instance_id1);
+    std::string cloud_unique_id2 = fmt::format("1:{}:0", instance_id2);
+
+    MOCK_GET_INSTANCE_ID(instance_id1);
+    create_and_refresh_instance(meta_service.get(), instance_id1);
+    update_snapshot_properties(meta_service.get(), instance_id1, true, 5, 3600);
+
+    // Create 2 auto snapshots on instance1.
+    SnapshotContext ctx1, ctx2;
+    begin_snapshot(meta_service.get(), cloud_unique_id1, "auto-1", &ctx1);
+    commit_snapshot(meta_service.get(), cloud_unique_id1, ctx1.snapshot_id, ctx1.image_url, 1);
+    begin_snapshot(meta_service.get(), cloud_unique_id1, "auto-2", &ctx2);
+    commit_snapshot(meta_service.get(), cloud_unique_id1, ctx2.snapshot_id, ctx2.image_url, 2);
+
+    create_and_refresh_instance(meta_service.get(), instance_id2);
+    // Chain tail allows only 1 snapshot total across the chain.
+    update_snapshot_properties(meta_service.get(), instance_id2, true, 1, 3600);
+
+    // Link: instance1 → instance2
+    ASSERT_NO_FATAL_FAILURE(link_instance_chain(txn_kv.get(), instance_id1, instance_id2));
+
+    // Run recycle from chain tail (instance2).
+    InstanceInfoPB instance_info2 = get_instance_info_direct(txn_kv.get(), instance_id2);
+    auto recycler2 = get_instance_recycler(meta_service.get(), instance_info2);
+    ASSERT_EQ(recycler2->recycle_cluster_snapshots(), 0);
+
+    // After enforcing max_reserved_snapshot=1, the older of the 2 auto snapshots on instance1
+    // must have been marked as RECYCLED.
+    std::vector<SnapshotInfoPB> snaps1;
+    get_snapshots(meta_service.get(), instance_id1, snaps1);
+    ASSERT_EQ(snaps1.size(), 2);
+
+    int recycled = 0, normal = 0;
+    for (auto& s : snaps1) {
+        if (s.status() == SnapshotStatus::SNAPSHOT_RECYCLED) ++recycled;
+        if (s.status() == SnapshotStatus::SNAPSHOT_NORMAL) ++normal;
+    }
+    // Exactly 1 recycled (oldest), 1 still normal.
+    EXPECT_EQ(recycled, 1);
+    EXPECT_EQ(normal, 1);
 }

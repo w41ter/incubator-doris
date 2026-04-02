@@ -810,7 +810,8 @@ void drop_snapshot(MetaServiceProxy* meta_service, const std::string& cloud_uniq
     DropSnapshotResponse res;
     meta_service->drop_snapshot(&cntl, &req, &res, nullptr);
     ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
-    ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+    ASSERT_EQ(res.status().code(), MetaServiceCode::OK)
+            << cloud_unique_id << "," << snapshot_id << ", Response: " << res.ShortDebugString();
 }
 
 void clone_instance(MetaServiceProxy* meta_service, const std::string& from_instance_id,
@@ -2267,14 +2268,12 @@ void test_compact_multi_chain(CloneInstanceRequest::CloneType instance2_clone_ty
         ASSERT_EQ(compactor.do_compact(), 0);
         get_instance(meta_service.get(), cloud_unique_id4, instance_info4);
         resource_mgr->refresh_instance(instance_id4, instance_info4);
+        drop_snapshot(meta_service.get(), cloud_unique_id3, ctx3.snapshot_id);
     }
     recycle_instance(instance_info4);
 
-    // Phase 10: instance3 drop snapshot and recycle
-    {
-        drop_snapshot(meta_service.get(), cloud_unique_id3, ctx3.snapshot_id);
-        recycle_instance(instance_info3);
-    }
+    // Phase 10: instance3 recycle
+    recycle_instance(instance_info3);
 
     // Phase 11: check rowsets are recycled
     {

@@ -165,6 +165,17 @@ int SnapshotManager::recycle_snapshots(InstanceRecycler* recycler) {
     AnnotateTag tag("instance_id", instance_id);
     LOG_WARNING("begin to recycle cluster snapshots");
 
+    const InstanceInfoPB& instance_info = recycler->instance_info();
+
+    // If this instance has a successor, it is not the chain tail.
+    // The chain tail recycler is responsible for processing the whole chain.
+    if (instance_info.has_successor_instance_id() &&
+        !instance_info.successor_instance_id().empty()) {
+        LOG_WARNING("skip recycle snapshots, instance has a successor")
+                .tag("successor_instance_id", instance_info.successor_instance_id());
+        return 0;
+    }
+
     StopWatch stop_watch;
     size_t total_snapshots = 0;
     size_t recycled_snapshots = 0;
@@ -177,7 +188,25 @@ int SnapshotManager::recycle_snapshots(InstanceRecycler* recycler) {
     };
 
     std::vector<std::pair<SnapshotPB, Versionstamp>> snapshots;
-    {
+    if (instance_info.has_original_instance_id() && !instance_info.original_instance_id().empty()) {
+        // This instance was created by rollback. Collect snapshots from the whole chain
+        // (all predecessor instances up to the current one) so that old snapshots are
+        // also recycled by the chain-tail recycler.
+        std::unique_ptr<Transaction> txn;
+        TxnErrorCode err = txn_kv_->create_txn(&txn);
+        if (err != TxnErrorCode::TXN_OK) {
+            LOG_WARNING("failed to create txn for get_all_snapshots").tag("error_code", err);
+            return -1;
+        }
+        auto [code, error_msg] = doris::cloud::SnapshotManager::get_all_snapshots(
+                txn.get(), instance_id, "", &snapshots);
+        if (code != doris::cloud::MetaServiceCode::OK) {
+            LOG_WARNING("failed to get all snapshots from chain")
+                    .tag("error_code", code)
+                    .tag("error_msg", error_msg);
+            return -1;
+        }
+    } else {
         MetaReader reader(instance_id, txn_kv_.get());
         TxnErrorCode err = reader.get_snapshots(&snapshots);
         if (err != TxnErrorCode::TXN_OK) {
@@ -192,14 +221,27 @@ int SnapshotManager::recycle_snapshots(InstanceRecycler* recycler) {
         std::string snapshot_id = snapshot_versionstamp.to_string();
         AnnotateTag snapshot_id_tag("snapshot_id", snapshot_id);
 
+        // Use the instance_id embedded in the snapshot PB so that chain snapshots
+        // (belonging to predecessor instances) are keyed correctly.
+        const std::string& snap_instance_id = snapshot_pb.instance_id();
+        AnnotateTag snap_instance_id_tag("snap_instance_id", snap_instance_id);
+
         const std::string& resource_id = snapshot_pb.resource_id();
-        if (snapshot_pb.status() == SnapshotStatus::SNAPSHOT_PREPARE &&
-            is_creating_snapshot_timeout(snapshot_pb)) {
+        if ((snapshot_pb.status() == SnapshotStatus::SNAPSHOT_ABORTED ||
+             snapshot_pb.status() == SnapshotStatus::SNAPSHOT_NORMAL) &&
+            instance_info.status() == InstanceInfoPB::DELETED) {
+            LOG_WARNING("recycle snapshot for deleted instance")
+                    .tag("finish_at", snapshot_pb.finish_at());
+            // Ignore the error, and try to recycle other snapshots
+            recycler->recycle_snapshot_meta_and_data(snap_instance_id, resource_id,
+                                                     snapshot_versionstamp, std::move(snapshot_pb));
+        } else if (snapshot_pb.status() == SnapshotStatus::SNAPSHOT_PREPARE &&
+                   is_creating_snapshot_timeout(snapshot_pb)) {
             LOG_WARNING("abort snapshot due to timeout")
                     .tag("create_at", snapshot_pb.create_at())
                     .tag("timeout_seconds", snapshot_pb.timeout_seconds());
             // Ignore the error, and try to recycle other snapshots
-            if (!abort_timeout_snapshot(txn_kv_.get(), instance_id, snapshot_versionstamp)) {
+            if (!abort_timeout_snapshot(txn_kv_.get(), snap_instance_id, snapshot_versionstamp)) {
                 recycled_snapshots += 1;
             }
         } else if (snapshot_pb.status() == SnapshotStatus::SNAPSHOT_ABORTED &&
@@ -207,13 +249,14 @@ int SnapshotManager::recycle_snapshots(InstanceRecycler* recycler) {
             LOG_WARNING("prune aborted snapshot meta and data")
                     .tag("finish_at", snapshot_pb.finish_at());
             // Ignore the error, and try to recycle other snapshots
-            recycler->recycle_snapshot_meta_and_data(resource_id, snapshot_versionstamp,
-                                                     std::move(snapshot_pb));
+            recycler->recycle_snapshot_meta_and_data(snap_instance_id, resource_id,
+                                                     snapshot_versionstamp, std::move(snapshot_pb));
         } else if (snapshot_pb.status() == SnapshotStatus::SNAPSHOT_NORMAL && snapshot_pb.auto_()) {
             auto_snapshots.emplace_back(std::move(snapshot_pb), snapshot_versionstamp);
         } else if (snapshot_pb.status() == SnapshotStatus::SNAPSHOT_NORMAL &&
                    is_snapshot_expired(snapshot_pb)) {
-            int res = recycle_normal_snapshot(txn_kv_.get(), instance_id, snapshot_versionstamp);
+            int res =
+                    recycle_normal_snapshot(txn_kv_.get(), snap_instance_id, snapshot_versionstamp);
             if (res == 0) {
                 LOG_WARNING("recycle expired snapshot")
                         .tag("create_at", snapshot_pb.create_at())
@@ -224,23 +267,26 @@ int SnapshotManager::recycle_snapshots(InstanceRecycler* recycler) {
         } else if (snapshot_pb.status() == SnapshotStatus::SNAPSHOT_RECYCLED) {
             LOG_WARNING("prune recycled snapshot meta and data");
             // Ignore the error, and try to recycle other snapshots
-            recycler->recycle_snapshot_meta_and_data(resource_id, snapshot_versionstamp,
-                                                     std::move(snapshot_pb));
+            recycler->recycle_snapshot_meta_and_data(snap_instance_id, resource_id,
+                                                     snapshot_versionstamp, std::move(snapshot_pb));
         }
     }
 
-    // Sort auto snapshots by versionstamp.
+    // Sort auto snapshots by versionstamp (newest first).
+    // When the instance has original_instance_id, auto snapshots from the whole chain are merged
+    // and counted together, applying the chain-tail instance's max_reserved_snapshot rule.
     std::sort(auto_snapshots.begin(), auto_snapshots.end(),
               [](const auto& a, const auto& b) { return a.second > b.second; });
 
-    const InstanceInfoPB& instance_info = recycler->instance_info();
     int64_t max_reserved_snapshot = instance_info.max_reserved_snapshot();
-    while (auto_snapshots.size() > max_reserved_snapshot) {
+    while (auto_snapshots.size() > static_cast<size_t>(max_reserved_snapshot)) {
         auto&& [snapshot_pb, snapshot_versionstamp] = auto_snapshots.back();
         std::string snapshot_id = snapshot_versionstamp.to_string();
         AnnotateTag snapshot_id_tag("snapshot_id", snapshot_id);
 
-        int res = recycle_normal_snapshot(txn_kv_.get(), instance_id, snapshot_versionstamp);
+        const std::string& snap_instance_id = snapshot_pb.instance_id();
+        AnnotateTag snap_instance_id_tag("snap_instance_id", snap_instance_id);
+        int res = recycle_normal_snapshot(txn_kv_.get(), snap_instance_id, snapshot_versionstamp);
         if (res == -1) {
             LOG_WARNING("failed to recycle auto snapshot to keep the max_reserved_snapshot");
             return -1;

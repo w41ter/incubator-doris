@@ -173,9 +173,7 @@ int check_rowsets_object(TxnKv* txn_kv, InstanceChecker* checker, const std::str
             continue;
         }
 
-        for (size_t i = 0; i < rs_meta.num_segments(); i++) {
-            segment_disk_size += rs_meta.segments_file_size(i);
-        }
+        segment_disk_size += rs_meta.data_disk_size();
 
         if (tablet_files_cache.tablet_id != rs_meta.tablet_id()) {
             // Clear cache

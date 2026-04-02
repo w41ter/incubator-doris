@@ -26,6 +26,7 @@
 #include <chrono>
 #include <numeric>
 #include <queue>
+#include <ranges>
 #include <regex>
 #include <string>
 #include <tuple>
