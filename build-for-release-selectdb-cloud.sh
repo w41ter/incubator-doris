@@ -74,6 +74,8 @@ export DORIS_BUILD_VERSION_HOTFIX=0
 export DORIS_BUILD_VERSION_RC_VERSION=""
 
 echo "build.sh with args_remain: ${args_remain}"
+
+export MVN_OPT='-Dmaven.build.cache.enabled=false'
 # export WITH_TDE_DIR=enterprise
 sh build.sh ${args_remain}
 
