@@ -2924,6 +2924,127 @@ TEST(MetaServiceSnapshotTest, CloneInstanceRollbackTest) {
     }
 }
 
+TEST(MetaServiceSnapshotTest, CloneInstanceLatestSuccessorAnchorTest) {
+    auto meta_service = get_meta_service(false);
+
+    const std::string instance_id_a = "anchor_instance_a";
+    const std::string instance_id_b = "anchor_instance_b";
+    const std::string instance_id_c = "anchor_instance_c";
+    const std::string clone_instance_id = "anchor_instance_clone";
+    const std::string invalid_clone_from_a = "anchor_invalid_clone_from_a";
+    const std::string invalid_rollback_from_a = "anchor_invalid_rollback_from_a";
+    const std::string invalid_clone_from_b = "anchor_invalid_clone_from_b";
+    const std::string cloud_unique_id_a = fmt::format("1:{}:0", instance_id_a);
+    const std::string cloud_unique_id_b = fmt::format("1:{}:0", instance_id_b);
+    const std::string cloud_unique_id_c = fmt::format("1:{}:0", instance_id_c);
+
+    create_and_refresh_instance(meta_service.get(), instance_id_a);
+
+    SnapshotContext snapshot_s1;
+    begin_and_commit_snapshot(meta_service.get(), cloud_unique_id_a, snapshot_s1,
+                              "anchor_snapshot_s1");
+    SnapshotContext snapshot_s2;
+    begin_and_commit_snapshot(meta_service.get(), cloud_unique_id_a, snapshot_s2,
+                              "anchor_snapshot_s2");
+
+    clone_instance(meta_service.get(), instance_id_a, snapshot_s2.snapshot_id, instance_id_b,
+                   CloneInstanceRequest_CloneType_ROLLBACK);
+
+    {
+        InstanceInfoPB instance_info_a;
+        InstanceInfoPB instance_info_b;
+        get_instance(meta_service.get(), cloud_unique_id_a, instance_info_a);
+        get_instance(meta_service.get(), cloud_unique_id_b, instance_info_b);
+        ASSERT_EQ(instance_info_a.successor_instance_id(), instance_id_b);
+        ASSERT_EQ(instance_info_b.original_instance_id(), instance_id_a);
+        ASSERT_EQ(instance_info_b.source_instance_id(), instance_id_a);
+    }
+
+    {
+        brpc::Controller cntl;
+        CloneInstanceRequest req;
+        req.set_clone_type(CloneInstanceRequest::READ_ONLY);
+        req.set_from_instance_id(instance_id_a);
+        req.set_from_snapshot_id(snapshot_s1.snapshot_id);
+        req.set_new_instance_id(invalid_clone_from_a);
+
+        CloneInstanceResponse res;
+        meta_service->clone_instance(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                     &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+        ASSERT_TRUE(res.status().msg().find(fmt::format("latest successor instance {}",
+                                                        instance_id_b)) != std::string::npos)
+                << res.ShortDebugString();
+    }
+
+    {
+        brpc::Controller cntl;
+        CloneInstanceRequest req;
+        req.set_clone_type(CloneInstanceRequest::ROLLBACK);
+        req.set_from_instance_id(instance_id_a);
+        req.set_from_snapshot_id(snapshot_s1.snapshot_id);
+        req.set_new_instance_id(invalid_rollback_from_a);
+
+        CloneInstanceResponse res;
+        meta_service->clone_instance(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                     &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+        ASSERT_TRUE(res.status().msg().find(fmt::format("latest successor instance {}",
+                                                        instance_id_b)) != std::string::npos)
+                << res.ShortDebugString();
+    }
+
+    clone_instance(meta_service.get(), instance_id_b, snapshot_s1.snapshot_id, instance_id_c,
+                   CloneInstanceRequest_CloneType_ROLLBACK);
+
+    {
+        InstanceInfoPB instance_info_a;
+        InstanceInfoPB instance_info_b;
+        InstanceInfoPB instance_info_c;
+        get_instance(meta_service.get(), cloud_unique_id_a, instance_info_a);
+        get_instance(meta_service.get(), cloud_unique_id_b, instance_info_b);
+        get_instance(meta_service.get(), cloud_unique_id_c, instance_info_c);
+        ASSERT_EQ(instance_info_a.successor_instance_id(), instance_id_b);
+        ASSERT_EQ(instance_info_b.successor_instance_id(), instance_id_c);
+        ASSERT_EQ(instance_info_c.original_instance_id(), instance_id_a);
+        ASSERT_EQ(instance_info_c.source_instance_id(), instance_id_a);
+        ASSERT_EQ(instance_info_c.predecessor_instance_id(), instance_id_b);
+    }
+
+    {
+        brpc::Controller cntl;
+        CloneInstanceRequest req;
+        req.set_clone_type(CloneInstanceRequest::READ_ONLY);
+        req.set_from_instance_id(instance_id_b);
+        req.set_from_snapshot_id(snapshot_s1.snapshot_id);
+        req.set_new_instance_id(invalid_clone_from_b);
+
+        CloneInstanceResponse res;
+        meta_service->clone_instance(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                     &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+        ASSERT_TRUE(res.status().msg().find(fmt::format("latest successor instance {}",
+                                                        instance_id_c)) != std::string::npos)
+                << res.ShortDebugString();
+    }
+
+    clone_instance(meta_service.get(), instance_id_c, snapshot_s1.snapshot_id, clone_instance_id,
+                   CloneInstanceRequest_CloneType_READ_ONLY);
+
+    {
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(meta_service->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+        std::string instance_key_str = instance_key(clone_instance_id);
+        std::string instance_value;
+        ASSERT_EQ(txn->get(instance_key_str, &instance_value), TxnErrorCode::TXN_OK);
+
+        InstanceInfoPB instance_info;
+        ASSERT_TRUE(instance_info.ParseFromString(instance_value));
+        ASSERT_TRUE(instance_info.ready_only());
+        ASSERT_EQ(instance_info.source_snapshot_id(), snapshot_s1.snapshot_id);
+    }
+}
+
 TEST(MetaServiceSnapshotTest, CloneInstanceParameterValidationTest) {
     auto meta_service = get_meta_service(true);
 
@@ -2987,6 +3108,31 @@ TEST(MetaServiceSnapshotTest, CloneInstanceParameterValidationTest) {
         ASSERT_TRUE(res.status().msg().find("new_instance_id not specified") != std::string::npos);
     }
 
+    // Create source instance
+    {
+        InstanceInfoPB instance_info;
+        instance_info.set_instance_id("source");
+        instance_info.set_name("test_instance");
+        instance_info.set_user_id("test_user");
+        auto* obj_info = instance_info.mutable_obj_info()->Add();
+        obj_info->set_ak("ak_test");
+        obj_info->set_sk("sk_test");
+        obj_info->set_bucket("test_bucket");
+        obj_info->set_prefix("test_prefix");
+        obj_info->set_endpoint("test_endpoint");
+        obj_info->set_region("test_region");
+        obj_info->set_external_endpoint("test_external_endpoint");
+        obj_info->set_provider(ObjectStoreInfoPB::OSS);
+        obj_info->set_id("obj_info_id");
+        instance_info.set_snapshot_switch_status(SnapshotSwitchStatus::SNAPSHOT_SWITCH_ON);
+        instance_info.set_multi_version_status(MultiVersionStatus::MULTI_VERSION_READ_WRITE);
+
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(meta_service->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+        txn->put(instance_key("source"), instance_info.SerializeAsString());
+        ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+    }
+
     // Test invalid snapshot ID format (wrong length)
     {
         brpc::Controller cntl;
@@ -3000,7 +3146,8 @@ TEST(MetaServiceSnapshotTest, CloneInstanceParameterValidationTest) {
         meta_service->clone_instance(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
                                      &req, &res, nullptr);
         ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
-        ASSERT_TRUE(res.status().msg().find("failed to parse") != std::string::npos);
+        ASSERT_TRUE(res.status().msg().find("failed to parse") != std::string::npos)
+                << res.ShortDebugString();
     }
 
     // Test invalid snapshot ID format (non-hex characters)
@@ -3657,7 +3804,7 @@ TEST(MetaServiceHttpTest, RollbackListSnapshotTest) {
     std::string instance_id4 = "snapshot_chain_compactor_test_instance4";
     std::string cloud_unique_id4 = fmt::format("1:{}:0", instance_id4);
     InstanceInfoPB instance_info4;
-    clone_and_refresh_instance(meta_service.get(), resource_mgr.get(), instance_id2,
+    clone_and_refresh_instance(meta_service.get(), resource_mgr.get(), instance_id3,
                                snapshot_1_3.snapshot_id, instance_id4, instance_info4,
                                CloneInstanceRequest_CloneType_READ_ONLY);
     get_instance(meta_service.get(), cloud_unique_id2, instance_info2);
@@ -3681,7 +3828,7 @@ TEST(MetaServiceHttpTest, RollbackListSnapshotTest) {
     std::string instance_id5 = "snapshot_chain_compactor_test_instance5";
     std::string cloud_unique_id5 = fmt::format("1:{}:0", instance_id5);
     InstanceInfoPB instance_info5;
-    clone_and_refresh_instance(meta_service.get(), resource_mgr.get(), instance_id2,
+    clone_and_refresh_instance(meta_service.get(), resource_mgr.get(), instance_id3,
                                snapshot_2_1.snapshot_id, instance_id5, instance_info5,
                                CloneInstanceRequest_CloneType_WRITABLE);
     get_instance(meta_service.get(), cloud_unique_id2, instance_info2);

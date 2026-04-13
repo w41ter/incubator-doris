@@ -1078,54 +1078,106 @@ void SnapshotManager::validate_source_snapshot(Transaction* txn,
 
     LOG_INFO("snapshot validation completed successfully")
             .tag("snapshot_id", from_snapshot_id)
+            .tag("snapshot_instance_id", snapshot_pb->instance_id())
             .tag("snapshot_status", SnapshotStatus_Name(snapshot_pb->status()))
             .tag("create_at", snapshot_pb->create_at())
             .tag("image_url", snapshot_pb->image_url());
 }
 
-TxnErrorCode SnapshotManager::validate_source_instance(Transaction* txn,
-                                                       const std::string& from_instance_id,
-                                                       const std::string& from_snapshot_id,
-                                                       CloneInstanceRequest::CloneType clone_type,
-                                                       InstanceInfoPB* from_instance_info,
-                                                       std::string* error_msg) {
-    // Get source instance information
+MetaServiceCode SnapshotManager::validate_source_instance(Transaction* txn,
+                                                          const std::string& from_instance_id,
+                                                          InstanceInfoPB* from_instance_info,
+                                                          std::string* error_msg) {
     InstanceKeyInfo source_key_info {from_instance_id};
     std::string from_instance_key;
     instance_key(source_key_info, &from_instance_key);
 
     std::string from_instance_value;
     TxnErrorCode err = txn->get(from_instance_key, &from_instance_value);
+    if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        *error_msg = fmt::format("source instance not found: {}", from_instance_id);
+        return MetaServiceCode::INVALID_ARGUMENT;
+    }
     if (err != TxnErrorCode::TXN_OK) {
-        if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
-            *error_msg = fmt::format("source instance not found: {}", from_instance_id);
-        } else {
-            *error_msg = "failed to get source instance";
-        }
-        return err;
+        *error_msg =
+                fmt::format("failed to get source instance: {}, err={}", from_instance_id, err);
+        return cast_as<ErrCategory::READ>(err);
     }
 
-    // Parse source instance information
     if (!from_instance_info->ParseFromArray(from_instance_value.data(),
                                             from_instance_value.size())) {
-        *error_msg = "failed to parse source InstanceInfoPB";
-        return TxnErrorCode::TXN_UNIDENTIFIED_ERROR;
+        *error_msg = fmt::format("failed to parse source InstanceInfoPB: {}", from_instance_id);
+        return MetaServiceCode::PROTOBUF_PARSE_ERR;
     }
 
-    // Validate source instance status
-    if (from_instance_info->status() != InstanceInfoPB::NORMAL) {
-        *error_msg = fmt::format("source instance status is not NORMAL: {}",
-                                 InstanceInfoPB::Status_Name(from_instance_info->status()));
-        return TxnErrorCode::TXN_KEY_NOT_FOUND;
+    if (from_instance_info->has_successor_instance_id() &&
+        !from_instance_info->successor_instance_id().empty()) {
+        InstanceInfoPB successor_instance_info;
+        std::string current_instance_id = from_instance_info->successor_instance_id();
+        std::unordered_set<std::string> visited_instances {from_instance_id};
+        while (true) {
+            InstanceKeyInfo successor_key_info {current_instance_id};
+            std::string successor_key;
+            instance_key(successor_key_info, &successor_key);
+
+            std::string successor_value;
+            err = txn->get(successor_key, &successor_value);
+            if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
+                *error_msg = fmt::format(
+                        "instance {} has been rolled back. latest successor instance {} was not "
+                        "found, please repair the rollback chain metadata",
+                        from_instance_id, current_instance_id);
+                return MetaServiceCode::INVALID_ARGUMENT;
+            }
+            if (err != TxnErrorCode::TXN_OK) {
+                *error_msg = fmt::format(
+                        "failed to get latest successor instance for {}, current successor={}, "
+                        "err={}",
+                        from_instance_id, current_instance_id, err);
+                return cast_as<ErrCategory::READ>(err);
+            }
+            if (!successor_instance_info.ParseFromArray(successor_value.data(),
+                                                        successor_value.size())) {
+                *error_msg = fmt::format("failed to parse instance {} successor InstanceInfoPB: {}",
+                                         from_instance_id, current_instance_id);
+                return MetaServiceCode::PROTOBUF_PARSE_ERR;
+            }
+            if (!successor_instance_info.has_successor_instance_id() ||
+                successor_instance_info.successor_instance_id().empty()) {
+                break;
+            }
+            visited_instances.insert(current_instance_id);
+            current_instance_id = successor_instance_info.successor_instance_id();
+            if (visited_instances.count(current_instance_id)) {
+                *error_msg =
+                        fmt::format("detected a loop in the successor chain for instance {}: {}",
+                                    from_instance_id, current_instance_id);
+                return MetaServiceCode::UNDEFINED_ERR;
+            }
+        }
+
+        *error_msg = fmt::format(
+                "instance {} has been rolled back, please use latest successor instance {} as "
+                "from_instance_id",
+                from_instance_id, current_instance_id);
+        return MetaServiceCode::INVALID_ARGUMENT;
     }
-    return TxnErrorCode::TXN_OK;
+
+    if (from_instance_info->status() != InstanceInfoPB::NORMAL) {
+        *error_msg = fmt::format("source instance {} status is not NORMAL: {}", from_instance_id,
+                                 InstanceInfoPB::Status_Name(from_instance_info->status()));
+        return MetaServiceCode::INVALID_ARGUMENT;
+    }
+    return MetaServiceCode::OK;
 }
 
 TxnErrorCode SnapshotManager::check_target_instance_existence(
-        Transaction* txn, const std::string& new_instance_id, const std::string& from_instance_id,
-        const std::string& from_snapshot_id, bool is_readonly, bool* already_exists,
-        CloneInstanceResponse* response, const SnapshotPB& snapshot_pb,
-        const InstanceInfoPB& from_instance_info, std::string* error_msg) {
+        Transaction* txn, const std::string& new_instance_id, const std::string& from_snapshot_id,
+        bool is_readonly, bool* already_exists, CloneInstanceResponse* response,
+        const SnapshotPB& snapshot_pb, const InstanceInfoPB& from_instance_info,
+        std::string* error_msg) {
+    const std::string& source_instance_id = snapshot_pb.instance_id();
+
     std::string new_instance_key;
     InstanceKeyInfo new_key_info {new_instance_id};
     instance_key(new_key_info, &new_instance_key);
@@ -1137,7 +1189,7 @@ TxnErrorCode SnapshotManager::check_target_instance_existence(
         // Instance exists, check if it's an idempotent operation
         InstanceInfoPB existing_instance;
         if (existing_instance.ParseFromString(existing_val) &&
-            existing_instance.source_instance_id() == from_instance_id &&
+            existing_instance.source_instance_id() == source_instance_id &&
             existing_instance.source_snapshot_id() == from_snapshot_id &&
             existing_instance.ready_only() == is_readonly) {
             // Idempotent operation
@@ -1383,12 +1435,13 @@ MetaServiceCode SnapshotManager::setup_writable_storage(Transaction* txn,
 }
 
 MetaServiceCode SnapshotManager::clone_storage_vault_entries(
-        Transaction* txn, const std::string& from_instance_id, const std::string& new_instance_id,
+        Transaction* txn, const std::string& new_instance_id,
         const InstanceInfoPB& from_instance_info, std::string* error_msg) {
     if (!from_instance_info.enable_storage_vault()) {
         return MetaServiceCode::OK;
     }
 
+    const std::string& from_instance_id = from_instance_info.instance_id();
     // storage_vault entries are stored under keys encoded as:
     //   0x01 "storage_vault" ${instance_id} "vault" ${resource_id}
     // so every instance has its own namespace. To let the new instance
@@ -1450,16 +1503,24 @@ void SnapshotManager::establish_snapshot_reference(Transaction* txn,
 }
 
 MetaServiceCode SnapshotManager::update_source_instance_successor(
-        Transaction* txn, const std::string& from_instance_key, InstanceInfoPB* from_instance_info,
-        const std::string& new_instance_id, std::string* error_msg) {
+        Transaction* txn, const std::string& from_instance_key,
+        const InstanceInfoPB& from_instance_info, const std::string& new_instance_id,
+        std::string* error_msg) {
+    InstanceInfoPB update_instance_info(from_instance_info);
     // Update source instance to record the successor instance
-    from_instance_info->set_successor_instance_id(new_instance_id);
+    update_instance_info.set_successor_instance_id(new_instance_id);
+    // Update source instance status to DELETED, to recycle the source instance after rollback.
+    update_instance_info.set_status(InstanceInfoPB::DELETED);
+
     std::string updated_source_instance_val;
-    if (!from_instance_info->SerializeToString(&updated_source_instance_val)) {
+    if (!update_instance_info.SerializeToString(&updated_source_instance_val)) {
         *error_msg = "failed to serialize updated source InstanceInfoPB";
         return MetaServiceCode::PROTOBUF_SERIALIZE_ERR;
     }
     txn->put(from_instance_key, updated_source_instance_val);
+    LOG_INFO("the from instance updated with successor instance and marked as DELETED")
+            .tag("from_instance_id", from_instance_info.instance_id())
+            .tag("successor_instance_id", new_instance_id);
     return MetaServiceCode::OK;
 }
 
@@ -1472,17 +1533,19 @@ MetaServiceCode SnapshotManager::handle_readonly_clone(Transaction* txn,
     const std::string& new_instance_id = request.new_instance_id();
     const std::string& from_instance_id = from_instance_info.instance_id();
     const std::string& from_snapshot_id = request.from_snapshot_id();
+    const std::string& snapshot_instance_id = snapshot_pb.instance_id();
 
     LOG_INFO("starting READ_ONLY clone")
             .tag("new_instance_id", new_instance_id)
             .tag("from_instance_id", from_instance_id)
-            .tag("from_snapshot_id", from_snapshot_id);
+            .tag("from_snapshot_id", from_snapshot_id)
+            .tag("snapshot_instance_id", snapshot_instance_id);
 
     // Check if target instance ID already exists
     bool already_exists = false;
-    TxnErrorCode err = check_target_instance_existence(
-            txn, new_instance_id, from_instance_id, from_snapshot_id, true, &already_exists,
-            response, snapshot_pb, from_instance_info, error_msg);
+    TxnErrorCode err = check_target_instance_existence(txn, new_instance_id, from_snapshot_id, true,
+                                                       &already_exists, response, snapshot_pb,
+                                                       from_instance_info, error_msg);
 
     if (err != TxnErrorCode::TXN_OK) {
         if (already_exists && err == TxnErrorCode::TXN_CONFLICT) {
@@ -1496,8 +1559,8 @@ MetaServiceCode SnapshotManager::handle_readonly_clone(Transaction* txn,
     }
 
     // Create new read-only instance
-    InstanceInfoPB new_instance = create_readonly_instance_info(new_instance_id, from_instance_info,
-                                                                from_instance_id, from_snapshot_id);
+    InstanceInfoPB new_instance = create_readonly_instance_info(
+            new_instance_id, from_instance_info, snapshot_instance_id, from_snapshot_id);
 
     // Serialize and save new instance
     std::string new_instance_val;
@@ -1511,8 +1574,8 @@ MetaServiceCode SnapshotManager::handle_readonly_clone(Transaction* txn,
     instance_key(new_key_info, &new_instance_key);
     txn->put(new_instance_key, new_instance_val);
 
-    MetaServiceCode storage_code = clone_storage_vault_entries(
-            txn, from_instance_id, new_instance_id, from_instance_info, error_msg);
+    MetaServiceCode storage_code =
+            clone_storage_vault_entries(txn, new_instance_id, from_instance_info, error_msg);
     if (storage_code != MetaServiceCode::OK) {
         return storage_code;
     }
@@ -1550,17 +1613,19 @@ MetaServiceCode SnapshotManager::handle_writable_clone(Transaction* txn,
     const std::string& new_instance_id = request.new_instance_id();
     const std::string& from_instance_id = from_instance_info.instance_id();
     const std::string& from_snapshot_id = request.from_snapshot_id();
+    const std::string& snapshot_instance_id = snapshot_pb.instance_id();
 
     LOG_INFO("starting WRITABLE clone")
             .tag("new_instance_id", new_instance_id)
             .tag("from_instance_id", from_instance_id)
-            .tag("from_snapshot_id", from_snapshot_id);
+            .tag("from_snapshot_id", from_snapshot_id)
+            .tag("snapshot_instance_id", snapshot_instance_id);
 
     // Check if target instance ID already exists
     bool already_exists = false;
-    TxnErrorCode err = check_target_instance_existence(
-            txn, new_instance_id, from_instance_id, from_snapshot_id, false, &already_exists,
-            response, snapshot_pb, from_instance_info, error_msg);
+    TxnErrorCode err = check_target_instance_existence(txn, new_instance_id, from_snapshot_id,
+                                                       false, &already_exists, response,
+                                                       snapshot_pb, from_instance_info, error_msg);
 
     if (err != TxnErrorCode::TXN_OK) {
         if (already_exists && err == TxnErrorCode::TXN_CONFLICT) {
@@ -1574,8 +1639,8 @@ MetaServiceCode SnapshotManager::handle_writable_clone(Transaction* txn,
     }
 
     // Create new writable instance
-    InstanceInfoPB new_instance = create_writable_instance_info(new_instance_id, from_instance_info,
-                                                                from_instance_id, from_snapshot_id);
+    InstanceInfoPB new_instance = create_writable_instance_info(
+            new_instance_id, from_instance_info, snapshot_instance_id, from_snapshot_id);
 
     // Setup writable storage - copy source vaults and create new writable vault
     MetaServiceCode code =
@@ -1626,23 +1691,27 @@ MetaServiceCode SnapshotManager::handle_rollback_clone(Transaction* txn,
                                                        const InstanceInfoPB& from_instance_info,
                                                        CloneInstanceResponse* response,
                                                        std::string* error_msg) {
-    const std::string& new_instance_id = request.new_instance_id();
-    const std::string& from_instance_id = request.from_instance_id();
+    const std::string& snapshot_instance_id = snapshot_pb.instance_id();
     const std::string& from_snapshot_id = request.from_snapshot_id();
+    const std::string& new_instance_id = request.new_instance_id();
+    const std::string& from_instance_id = from_instance_info.instance_id();
 
     LOG_INFO("Creating ROLLBACK clone")
-            .tag("from_instance_id", from_instance_id)
+            .tag("snapshot_instance_id", snapshot_instance_id)
             .tag("new_instance_id", new_instance_id)
-            .tag("from_snapshot_id", from_snapshot_id);
+            .tag("from_snapshot_id", from_snapshot_id)
+            .tag("from_instance_id", from_instance_id);
 
     // Create new instance by copying from source instance
     InstanceInfoPB target_instance_info = from_instance_info;
 
     // Update key fields for the new instance
     target_instance_info.set_instance_id(new_instance_id);
+    // Set predecessor instance for rollback
+    target_instance_info.set_predecessor_instance_id(from_instance_id);
     target_instance_info.set_source_snapshot_id(from_snapshot_id);
     // the source instance is the real instance which creates this snapshot
-    target_instance_info.set_source_instance_id(snapshot_pb.instance_id());
+    target_instance_info.set_source_instance_id(snapshot_instance_id);
     target_instance_info.set_ctime(std::time(nullptr));
     target_instance_info.clear_compacted_key_sets();
     target_instance_info.clear_snapshot_compact_status();
@@ -1654,38 +1723,28 @@ MetaServiceCode SnapshotManager::handle_rollback_clone(Transaction* txn,
         target_instance_info.set_original_instance_id(from_instance_id);
     }
 
-    // Prepare target instance key
-    InstanceKeyInfo target_key_info {new_instance_id};
-    std::string target_instance_key_str;
-    instance_key(target_key_info, &target_instance_key_str);
-
-    // Serialize updated instance info
+    // Prepare target instance key and serialize updated instance info
+    std::string target_instance_key = instance_key({new_instance_id});
     std::string updated_target_instance_val = target_instance_info.SerializeAsString();
     if (updated_target_instance_val.empty()) {
         *error_msg = "Failed to serialize rollback instance info";
         return MetaServiceCode::PROTOBUF_SERIALIZE_ERR;
     }
+    // Update rollback instance in transaction
+    txn->put(target_instance_key, updated_target_instance_val);
 
     // Update source instance to record the successor instance
-    InstanceKeyInfo source_key_info {from_instance_id};
-    std::string from_instance_key;
-    instance_key(source_key_info, &from_instance_key);
-
-    InstanceInfoPB mutable_from_instance_info = from_instance_info;
+    std::string from_instance_key = instance_key({from_instance_id});
     MetaServiceCode code = update_source_instance_successor(
-            txn, from_instance_key, &mutable_from_instance_info, new_instance_id, error_msg);
+            txn, from_instance_key, from_instance_info, new_instance_id, error_msg);
     if (code != MetaServiceCode::OK) {
         return code;
     }
 
-    code = clone_storage_vault_entries(txn, from_instance_id, new_instance_id, from_instance_info,
-                                       error_msg);
+    code = clone_storage_vault_entries(txn, new_instance_id, from_instance_info, error_msg);
     if (code != MetaServiceCode::OK) {
         return code;
     }
-
-    // Update rollback instance in transaction
-    txn->put(target_instance_key_str, updated_target_instance_val);
 
     // Set snapshot info in response
     std::string helper_error;
@@ -1700,6 +1759,8 @@ MetaServiceCode SnapshotManager::handle_rollback_clone(Transaction* txn,
 
     LOG_INFO("ROLLBACK clone prepared successfully")
             .tag("target_instance_id", new_instance_id)
+            .tag("from_instance_id", from_instance_info.instance_id())
+            .tag("snapshot_instance_id", snapshot_instance_id)
             .tag("snapshot_id", from_snapshot_id)
             .tag("rollback_to_ctime", target_instance_info.ctime())
             .tag("image_url", snapshot_pb.image_url())
@@ -1733,7 +1794,7 @@ void SnapshotManager::clone_instance(const CloneInstanceRequest& request,
         return;
     }
 
-    // 3. Parse and validate snapshot
+    // 3. Parse and validate snapshot.
     Versionstamp snapshot_versionstamp;
     if (!parse_snapshot_versionstamp(request.from_snapshot_id(), &snapshot_versionstamp)) {
         status->set_code(MetaServiceCode::INVALID_ARGUMENT);
@@ -1741,7 +1802,17 @@ void SnapshotManager::clone_instance(const CloneInstanceRequest& request,
         return;
     }
 
+    // 4. Validate source instance anchor. Clone and rollback must use the latest successor
+    // instance as the request anchor so the request semantics stay explicit.
     std::string from_instance_id = request.from_instance_id();
+    InstanceInfoPB from_instance_info;
+    code = validate_source_instance(txn.get(), from_instance_id, &from_instance_info, &error_msg);
+    if (code != MetaServiceCode::OK) {
+        status->set_code(code);
+        status->set_msg(error_msg);
+        return;
+    }
+
     SnapshotPB snapshot_pb;
     validate_source_snapshot(txn.get(), from_instance_id, request.from_snapshot_id(), &snapshot_pb,
                              code, error_msg);
@@ -1749,45 +1820,6 @@ void SnapshotManager::clone_instance(const CloneInstanceRequest& request,
         status->set_code(code);
         status->set_msg(error_msg);
         return;
-    }
-
-    // If the from_instance is created by rollback, the snapshot may be created in its predecessor
-    // instances. For READ_ONLY and WRITABLE clone, set its source instance to the real instance
-    // which creates this snapshot.
-    if (request.clone_type() != CloneInstanceRequest::ROLLBACK &&
-        snapshot_pb.instance_id() != request.from_instance_id()) {
-        from_instance_id = snapshot_pb.instance_id();
-        LOG_INFO("clone instance change from_instance_id")
-                .tag("request from_instance_id", request.from_instance_id())
-                .tag("snapshot instance_id", snapshot_pb.instance_id())
-                .tag("snapshot_id", request.from_snapshot_id());
-    }
-
-    // 4. Validate source instance
-    InstanceInfoPB from_instance_info;
-    err = validate_source_instance(txn.get(), from_instance_id, request.from_snapshot_id(),
-                                   request.clone_type(), &from_instance_info, &error_msg);
-    if (err != TxnErrorCode::TXN_OK) {
-        if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
-            status->set_code(MetaServiceCode::CLUSTER_NOT_FOUND);
-        } else {
-            status->set_code(cast_as<ErrCategory::READ>(err));
-        }
-        status->set_msg(error_msg);
-        return;
-    }
-    // Type-specific validation
-    if (request.clone_type() == CloneInstanceRequest::ROLLBACK) {
-        // Validate source instance does not already have a successor instance
-        if (from_instance_info.has_successor_instance_id() &&
-            !from_instance_info.successor_instance_id().empty()) {
-            status->set_code(MetaServiceCode::INVALID_ARGUMENT);
-            status->set_msg(fmt::format(
-                    "source instance already has a successor instance: {}, ROLLBACK only one "
-                    "successor is allowed",
-                    from_instance_info.successor_instance_id()));
-            return;
-        }
     }
 
     // 5. Handle clone by type

@@ -52,6 +52,7 @@
 #include "rate-limiter/rate_limiter.h"
 #include "recycler/checker.h"
 #include "recycler/recycler.h"
+#include "recycler/snapshot_chain_compactor.h"
 #include "recycler/storage_vault_accessor.h"
 #include "recycler/util.h"
 
@@ -2630,6 +2631,191 @@ TEST(RecycleSnapshotTest, RecycleSnapshotsChainProcessesPredecessorSnapshots) {
     get_snapshots(meta_service.get(), instance_id1, snaps);
     ASSERT_EQ(snaps.size(), 1);
     EXPECT_EQ(snaps[0].status(), SnapshotStatus::SNAPSHOT_RECYCLED);
+}
+
+TEST(RecycleSnapshotTest, RollbackDeletedPredecessorRecycledAfterSuccessorGone) {
+    auto meta_service = get_meta_service();
+    auto txn_kv = meta_service->txn_kv();
+
+    const std::string predecessor_id = "rollback_recycle_pred_inst";
+    const std::string successor_id = "rollback_recycle_succ_inst";
+    const std::string cloud_unique_id = fmt::format("1:{}:0", predecessor_id);
+    const int64_t tablet_id = 98765;
+
+    auto key_exists = [&](const std::string& key) {
+        std::unique_ptr<Transaction> txn;
+        EXPECT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+        std::string value;
+        TxnErrorCode rc = txn->get(key, &value);
+        EXPECT_TRUE(rc == TxnErrorCode::TXN_OK || rc == TxnErrorCode::TXN_KEY_NOT_FOUND);
+        return rc == TxnErrorCode::TXN_OK;
+    };
+
+    MOCK_GET_INSTANCE_ID(predecessor_id);
+    create_and_refresh_instance(meta_service.get(), predecessor_id);
+    update_snapshot_properties(meta_service.get(), predecessor_id, true, 5, 3600);
+
+    SnapshotContext ctx;
+    begin_snapshot(meta_service.get(), cloud_unique_id, "rollback-recycle", &ctx, false);
+    commit_snapshot(meta_service.get(), cloud_unique_id, ctx.snapshot_id, ctx.image_url, 1);
+
+    {
+        brpc::Controller cntl;
+        CloneInstanceRequest req;
+        req.set_clone_type(CloneInstanceRequest::ROLLBACK);
+        req.set_from_instance_id(predecessor_id);
+        req.set_from_snapshot_id(ctx.snapshot_id);
+        req.set_new_instance_id(successor_id);
+
+        CloneInstanceResponse res;
+        meta_service->clone_instance(&cntl, &req, &res, nullptr);
+        ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
+    }
+
+    {
+        auto predecessor = get_instance_info_direct(txn_kv.get(), predecessor_id);
+        auto successor = get_instance_info_direct(txn_kv.get(), successor_id);
+        ASSERT_EQ(predecessor.status(), InstanceInfoPB::DELETED);
+        ASSERT_EQ(predecessor.successor_instance_id(), successor_id);
+        ASSERT_EQ(successor.predecessor_instance_id(), predecessor_id);
+    }
+
+    std::string predecessor_meta_key = versioned::meta_tablet_key({predecessor_id, tablet_id});
+    {
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+
+        TabletMetaCloudPB tablet_meta;
+        tablet_meta.set_tablet_id(tablet_id);
+        tablet_meta.set_creation_time(::time(nullptr));
+
+        ASSERT_TRUE(document_put(txn.get(), predecessor_meta_key, std::move(tablet_meta)));
+        ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+    }
+
+    Versionstamp snapshot_versionstamp;
+    ASSERT_TRUE(
+            SnapshotManager::parse_snapshot_versionstamp(ctx.snapshot_id, &snapshot_versionstamp));
+    std::string snapshot_reference_key = versioned::snapshot_reference_key(
+            {predecessor_id, snapshot_versionstamp, successor_id});
+
+    {
+        std::string value;
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+        ASSERT_EQ(txn->get(snapshot_reference_key, &value), TxnErrorCode::TXN_OK);
+    }
+
+    {
+        auto [code, msg] = meta_service->snapshot_manager()->compact_snapshot(successor_id);
+        ASSERT_EQ(code, MetaServiceCode::OK) << msg;
+    }
+
+    {
+        auto successor = get_instance_info_direct(txn_kv.get(), successor_id);
+        ASSERT_EQ(successor.snapshot_compact_status(),
+                  SnapshotCompactStatus::SNAPSHOT_COMPACT_DOING);
+        ASSERT_TRUE(successor.has_source_instance_id());
+        ASSERT_EQ(successor.source_instance_id(), predecessor_id);
+        ASSERT_TRUE(successor.has_source_snapshot_id());
+        ASSERT_EQ(successor.source_snapshot_id(), ctx.snapshot_id);
+    }
+
+    {
+        auto successor = get_instance_info_direct(txn_kv.get(), successor_id);
+        InstanceChainCompactor compactor(txn_kv, successor);
+        ASSERT_EQ(compactor.handle_compaction_completion(), 0);
+    }
+
+    {
+        auto successor = get_instance_info_direct(txn_kv.get(), successor_id);
+        ASSERT_EQ(successor.snapshot_compact_status(),
+                  SnapshotCompactStatus::SNAPSHOT_COMPACT_DONE);
+        ASSERT_TRUE(successor.has_source_instance_id());
+        ASSERT_EQ(successor.source_instance_id(), predecessor_id);
+        ASSERT_TRUE(successor.has_source_snapshot_id());
+        ASSERT_EQ(successor.source_snapshot_id(), ctx.snapshot_id);
+
+        std::string value;
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+        ASSERT_EQ(txn->get(snapshot_reference_key, &value), TxnErrorCode::TXN_KEY_NOT_FOUND);
+    }
+
+    {
+        auto [code, msg] = meta_service->snapshot_manager()->decouple_instance(successor_id);
+        ASSERT_EQ(code, MetaServiceCode::OK) << msg;
+    }
+
+    {
+        auto successor = get_instance_info_direct(txn_kv.get(), successor_id);
+        EXPECT_FALSE(successor.has_source_instance_id());
+        EXPECT_FALSE(successor.has_source_snapshot_id());
+        ASSERT_EQ(successor.snapshot_compact_status(),
+                  SnapshotCompactStatus::SNAPSHOT_COMPACT_DONE);
+    }
+
+    {
+        DropSnapshotRequest req;
+        req.set_snapshot_id(ctx.snapshot_id);
+        DropSnapshotResponse res;
+        meta_service->snapshot_manager()->drop_snapshot(predecessor_id, req, &res);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
+    }
+
+    {
+        auto successor = get_instance_info_direct(txn_kv.get(), successor_id);
+        auto recycler = get_instance_recycler(meta_service.get(), successor);
+        ASSERT_EQ(recycler->recycle_cluster_snapshots(), 0);
+    }
+
+    {
+        std::vector<SnapshotInfoPB> snapshots;
+        get_snapshots(meta_service.get(), predecessor_id, snapshots);
+        ASSERT_TRUE(snapshots.empty());
+    }
+
+    ASSERT_EQ(count_range(txn_kv.get(),
+                          encode_versioned_key(predecessor_meta_key, Versionstamp::min()),
+                          encode_versioned_key(predecessor_meta_key, Versionstamp::max())),
+              0);
+
+    {
+        auto predecessor = get_instance_info_direct(txn_kv.get(), predecessor_id);
+        auto recycler = get_instance_recycler(meta_service.get(), predecessor);
+        ASSERT_EQ(recycler->recycle_deleted_instance(), 0);
+    }
+
+    EXPECT_TRUE(key_exists(instance_key(predecessor_id)));
+    EXPECT_EQ(count_range(txn_kv.get(),
+                          encode_versioned_key(predecessor_meta_key, Versionstamp::min()),
+                          encode_versioned_key(predecessor_meta_key, Versionstamp::max())),
+              0)
+            << dump_range(txn_kv.get());
+
+    drop_instance(meta_service.get(), successor_id);
+    {
+        auto successor = get_instance_info_direct(txn_kv.get(), successor_id);
+        ASSERT_EQ(successor.status(), InstanceInfoPB::DELETED);
+        auto recycler = get_instance_recycler(meta_service.get(), successor);
+        ASSERT_EQ(recycler->recycle_deleted_instance(), 0);
+    }
+
+    EXPECT_FALSE(key_exists(instance_key(successor_id))) << dump_range(txn_kv.get());
+
+    {
+        auto predecessor = get_instance_info_direct(txn_kv.get(), predecessor_id);
+        auto recycler = get_instance_recycler(meta_service.get(), predecessor);
+        ASSERT_EQ(recycler->recycle_deleted_instance(), 0);
+    }
+
+    EXPECT_FALSE(key_exists(instance_key(predecessor_id))) << dump_range(txn_kv.get());
+    EXPECT_EQ(count_range(txn_kv.get(),
+                          encode_versioned_key(predecessor_meta_key, Versionstamp::min()),
+                          encode_versioned_key(predecessor_meta_key, Versionstamp::max())),
+              0)
+            << dump_range(txn_kv.get());
 }
 
 // Auto snapshots across the whole chain are counted together against max_reserved_snapshot.

@@ -248,7 +248,7 @@ suite("test_rollback_chain", "snapshot,docker") {
         cluster_snapshot_content = """
         {
             "from_snapshot_id": "${snapshot_id_1_3}",
-            "from_instance_id": "instance2",
+            "from_instance_id": "instance3",
             "instance_id": "instance4",
             "name": "instance4_name",
             "is_read_only": false,
@@ -293,7 +293,7 @@ suite("test_rollback_chain", "snapshot,docker") {
         cluster_snapshot_content = """
         {
             "from_snapshot_id": "${snapshot_id_2_1}",
-            "from_instance_id": "instance2",
+            "from_instance_id": "instance3",
             "instance_id": "instance5",
             "name": "instance5_name",
             "is_read_only": false,
@@ -301,7 +301,7 @@ suite("test_rollback_chain", "snapshot,docker") {
                 "ak": "${getS3AK()}",
                 "sk": "${getS3SK()}",
                 "bucket": "${getS3BucketName()}",
-                "prefix": "regression_test_rollback_chain_instance4",
+                "prefix": "regression_test_rollback_chain_instance5",
                 "endpoint": "${getS3Endpoint()}",
                 "external_endpoint": "${getS3Endpoint()}",
                 "region": "${getS3Region()}",

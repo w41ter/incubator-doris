@@ -86,10 +86,8 @@ private:
                                   doris::cloud::SnapshotPB* snapshot_pb,
                                   doris::cloud::MetaServiceCode& code, std::string& error_msg);
 
-    doris::cloud::TxnErrorCode validate_source_instance(
+    doris::cloud::MetaServiceCode validate_source_instance(
             doris::cloud::Transaction* txn, const std::string& from_instance_id,
-            const std::string& from_snapshot_id,
-            doris::cloud::CloneInstanceRequest::CloneType clone_type,
             doris::cloud::InstanceInfoPB* from_instance_info, std::string* error_msg);
 
     // Clone type handlers
@@ -114,8 +112,8 @@ private:
     // Helper functions
     doris::cloud::TxnErrorCode check_target_instance_existence(
             doris::cloud::Transaction* txn, const std::string& new_instance_id,
-            const std::string& from_instance_id, const std::string& from_snapshot_id,
-            bool is_readonly, bool* already_exists, doris::cloud::CloneInstanceResponse* response,
+            const std::string& from_snapshot_id, bool is_readonly, bool* already_exists,
+            doris::cloud::CloneInstanceResponse* response,
             const doris::cloud::SnapshotPB& snapshot_pb,
             const doris::cloud::InstanceInfoPB& from_instance_info, std::string* error_msg);
 
@@ -135,8 +133,7 @@ private:
             doris::cloud::InstanceInfoPB* new_instance, std::string* error_msg);
 
     doris::cloud::MetaServiceCode clone_storage_vault_entries(
-            doris::cloud::Transaction* txn, const std::string& from_instance_id,
-            const std::string& new_instance_id,
+            doris::cloud::Transaction* txn, const std::string& new_instance_id,
             const doris::cloud::InstanceInfoPB& from_instance_info, std::string* error_msg);
 
     void establish_snapshot_reference(doris::cloud::Transaction* txn,
@@ -146,8 +143,8 @@ private:
 
     doris::cloud::MetaServiceCode update_source_instance_successor(
             doris::cloud::Transaction* txn, const std::string& from_instance_key,
-            doris::cloud::InstanceInfoPB* from_instance_info, const std::string& new_instance_id,
-            std::string* error_msg);
+            const doris::cloud::InstanceInfoPB& from_instance_info,
+            const std::string& new_instance_id, std::string* error_msg);
 
     // Thread pools for snapshot operations (shared across all instances)
     std::shared_ptr<doris::cloud::SimpleThreadPool> compact_pool_;
