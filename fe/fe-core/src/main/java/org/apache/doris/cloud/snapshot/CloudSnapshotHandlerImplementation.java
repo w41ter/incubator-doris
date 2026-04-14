@@ -22,14 +22,22 @@ import org.apache.doris.catalog.DatabaseIf;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.cloud.proto.Cloud;
 import org.apache.doris.cloud.rpc.MetaServiceProxy;
-import org.apache.doris.cloud.storage.ListObjectsResult;
-import org.apache.doris.cloud.storage.ObjectFile;
-import org.apache.doris.cloud.storage.RemoteBase;
+import org.apache.doris.cloud.storage.ObjectInfo;
+import org.apache.doris.cloud.storage.ObjectInfoAdapter;
 import org.apache.doris.cloud.system.CloudSystemInfoService;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.util.DebugPointUtil;
+import org.apache.doris.datasource.property.storage.StorageProperties;
+import org.apache.doris.filesystem.FileSystemTransferUtil;
+import org.apache.doris.filesystem.Location;
+import org.apache.doris.filesystem.spi.ObjFileSystem;
+import org.apache.doris.filesystem.spi.RemoteObject;
+import org.apache.doris.filesystem.spi.RemoteObjects;
+import org.apache.doris.filesystem.spi.RequestBody;
+import org.apache.doris.filesystem.spi.UploadPartResult;
+import org.apache.doris.fs.FileSystemFactory;
 import org.apache.doris.journal.JournalCursor;
 import org.apache.doris.journal.JournalEntity;
 import org.apache.doris.master.Checkpoint;
@@ -50,6 +58,7 @@ import org.apache.logging.log4j.Logger;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
+import java.io.ByteArrayInputStream;
 import java.io.DataInputStream;
 import java.io.EOFException;
 import java.io.File;
@@ -347,13 +356,13 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
         }
 
         // 4, upload zip file
-        RemoteBase remote = RemoteBase.newInstance(new RemoteBase.ObjectInfo(objInfo));
-        try {
-            remote.multipartUploadObject(zipFile, formatRemoteKey(objInfo.getPrefix(), imageUrl, zipFile.getName()),
+        ObjectInfo objectInfo = new ObjectInfo(objInfo);
+        try (ObjFileSystem fs = createObjFileSystem(objectInfo)) {
+            uploadFileByMultipart(fs, zipFile,
+                    formatRemotePath(objectInfo.getBucket(),
+                            formatRemoteKey(objectInfo.getPrefix(), imageUrl, zipFile.getName())),
                     (Function<String, Pair<Boolean, String>>) uploadId -> updateSnapshotUploadId(snapshotId,
                             zipFile.getName(), uploadId));
-        } finally {
-            remote.close();
         }
 
         // 5. delete zip file
@@ -518,21 +527,26 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
     private Pair<File, File> downloadImage(String snapshotId, Cloud.CloneInstanceResponse response) throws Exception {
         LOG.info("start to download snapshot id: {}, image url: {}", snapshotId, response.getImageUrl());
         // download zip file
-        RemoteBase remote = RemoteBase.newInstance(new RemoteBase.ObjectInfo(response.getObjInfo()));
-        try {
-            String imageUrl = response.getImageUrl();
-            if (imageUrl.startsWith("/")) {
-                imageUrl = imageUrl.substring(1);
+        ObjectInfo objectInfo = new ObjectInfo(response.getObjInfo());
+        try (ObjFileSystem fs = createObjFileSystem(objectInfo)) {
+            String imageUrl = normalizeRelativePrefix(response.getImageUrl());
+            String continuationToken = null;
+            while (true) {
+                RemoteObjects listObjectsResult = fs.listObjectsWithPrefix(
+                        objectInfo.getPrefix(), imageUrl, continuationToken);
+                for (RemoteObject objectFile : listObjectsResult.getObjectList()) {
+                    String lastPart = objectFile.getKey().substring(objectFile.getKey().lastIndexOf("/") + 1);
+                    String localPath = cloneSnapshotDir + lastPart;
+                    LOG.info("download objectFile: {}  to local path: {}", objectFile.toString(), localPath);
+                    FileSystemTransferUtil.download(fs,
+                            Location.of(formatRemotePath(objectInfo.getBucket(), objectFile.getKey())),
+                            new File(localPath).toPath(), objectFile.getSize());
+                }
+                if (!listObjectsResult.isTruncated()) {
+                    break;
+                }
+                continuationToken = listObjectsResult.getContinuationToken();
             }
-            ListObjectsResult listObjectsResult = remote.listObjects(imageUrl, null);
-            for (ObjectFile objectFile : listObjectsResult.getObjectInfoList()) {
-                String lastPart = objectFile.getKey().substring(objectFile.getKey().lastIndexOf("/") + 1);
-                String localPath = cloneSnapshotDir + lastPart;
-                LOG.info("download objectFile: {}  to local path: {}", objectFile.toString(), localPath);
-                remote.getObject(objectFile.getKey(), localPath);
-            }
-        } finally {
-            remote.close();
         }
 
         // check zip file and md5
@@ -705,6 +719,65 @@ public class CloudSnapshotHandlerImplementation extends CloudSnapshotHandler {
         try (FileInputStream fis = new FileInputStream(file)) {
             return DigestUtils.md5Hex(fis);
         }
+    }
+
+    private ObjFileSystem createObjFileSystem(ObjectInfo objectInfo) throws IOException {
+        StorageProperties storageProps = ObjectInfoAdapter.toStorageProperties(objectInfo);
+        org.apache.doris.filesystem.FileSystem rawFs = FileSystemFactory.getFileSystem(storageProps);
+        Preconditions.checkState(rawFs instanceof ObjFileSystem,
+                "Snapshot operations require ObjFileSystem, but got: %s", rawFs.getClass().getSimpleName());
+        return (ObjFileSystem) rawFs;
+    }
+
+    private void uploadFileByMultipart(ObjFileSystem fs, File localFile, String remotePath,
+            Function<String, Pair<Boolean, String>> uploadIdRecorder) throws IOException {
+        final int chunkSize = 5 * 1024 * 1024;
+        String uploadId = fs.getObjStorage().initiateMultipartUpload(remotePath);
+        Pair<Boolean, String> updateResult = uploadIdRecorder.apply(uploadId);
+        if (!updateResult.first) {
+            try {
+                fs.getObjStorage().abortMultipartUpload(remotePath, uploadId);
+            } catch (IOException abortException) {
+                LOG.warn("failed to abort multipart upload, remotePath={}, uploadId={}",
+                        remotePath, uploadId, abortException);
+            }
+            throw new IOException("failed to update snapshot upload id, reason=" + updateResult.second);
+        }
+
+        List<UploadPartResult> partResults = new ArrayList<>();
+        byte[] buffer = new byte[chunkSize];
+        int partNum = 1;
+        try (FileInputStream inputStream = new FileInputStream(localFile)) {
+            int bytesRead;
+            while ((bytesRead = inputStream.read(buffer)) != -1) {
+                partResults.add(fs.getObjStorage().uploadPart(remotePath, uploadId, partNum++,
+                        RequestBody.of(new ByteArrayInputStream(buffer, 0, bytesRead), bytesRead)));
+            }
+            fs.getObjStorage().completeMultipartUpload(remotePath, uploadId, partResults);
+        } catch (IOException e) {
+            try {
+                fs.getObjStorage().abortMultipartUpload(remotePath, uploadId);
+            } catch (IOException abortException) {
+                LOG.warn("failed to abort multipart upload after upload failure, remotePath={}, uploadId={}",
+                        remotePath, uploadId, abortException);
+            }
+            throw e;
+        }
+    }
+
+    private String normalizeRelativePrefix(String prefix) {
+        String normalizedPrefix = prefix;
+        if (normalizedPrefix.startsWith("/")) {
+            normalizedPrefix = normalizedPrefix.substring(1);
+        }
+        if (!normalizedPrefix.isEmpty() && !normalizedPrefix.endsWith("/")) {
+            normalizedPrefix = normalizedPrefix + "/";
+        }
+        return normalizedPrefix;
+    }
+
+    private String formatRemotePath(String bucket, String key) {
+        return "s3://" + bucket + "/" + key;
     }
 
     private File compressFiles(String snapshotId, List<File> sourceFiles) throws IOException {
