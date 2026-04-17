@@ -88,7 +88,13 @@ private:
 
     doris::cloud::MetaServiceCode validate_source_instance(
             doris::cloud::Transaction* txn, const std::string& from_instance_id,
-            doris::cloud::InstanceInfoPB* from_instance_info, std::string* error_msg);
+            doris::cloud::InstanceInfoPB* from_instance_info, std::string* error_msg,
+            bool* has_been_rolled_back, std::string* latest_successor_instance_id);
+
+    doris::cloud::MetaServiceCode get_instance_info(doris::cloud::Transaction* txn,
+                                                    const std::string& instance_id,
+                                                    doris::cloud::InstanceInfoPB* instance_info,
+                                                    std::string* error_msg);
 
     // Clone type handlers
     doris::cloud::MetaServiceCode handle_readonly_clone(
@@ -112,10 +118,9 @@ private:
     // Helper functions
     doris::cloud::TxnErrorCode check_target_instance_existence(
             doris::cloud::Transaction* txn, const std::string& new_instance_id,
-            const std::string& from_snapshot_id, bool is_readonly, bool* already_exists,
-            doris::cloud::CloneInstanceResponse* response,
-            const doris::cloud::SnapshotPB& snapshot_pb,
-            const doris::cloud::InstanceInfoPB& from_instance_info, std::string* error_msg);
+            const std::string& source_instance_id, const std::string& from_snapshot_id,
+            doris::cloud::CloneInstanceRequest::CloneType clone_type, bool* already_exists,
+            std::string* error_msg);
 
     doris::cloud::InstanceInfoPB create_readonly_instance_info(
             const std::string& new_instance_id,

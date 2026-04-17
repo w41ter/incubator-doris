@@ -1068,6 +1068,87 @@ TEST(MetaServiceHttpTest, SetMultiVersionStatusDisableWithSnapshotsTest) {
     }
 }
 
+TEST(MetaServiceHttpTest, CloneRollbackIdempotentRetryAfterSuccessorMarked) {
+    HttpContext ctx;
+
+    const std::string predecessor_id = "test_clone_rollback_predecessor";
+    const std::string successor_id = "test_clone_rollback_successor";
+    create_test_instance_for_snapshot(ctx, predecessor_id);
+
+    {
+        InstanceInfoPB instance = ctx.get_instance_info(predecessor_id);
+        instance.set_snapshot_switch_status(SNAPSHOT_SWITCH_ON);
+        ASSERT_EQ(ctx.update_instance_info(instance), TxnErrorCode::TXN_OK);
+    }
+
+    std::string snapshot_id;
+    {
+        BeginSnapshotRequest req;
+        req.set_cloud_unique_id(fmt::format("1:{}:1", predecessor_id));
+        req.set_snapshot_label("rollback_idempotent_retry");
+        req.set_timeout_seconds(3600);
+        req.set_ttl_seconds(7200);
+        req.set_auto_snapshot(false);
+
+        brpc::Controller ctrl;
+        BeginSnapshotResponse resp;
+        ctx.meta_service()->begin_snapshot(&ctrl, &req, &resp, nullptr);
+        ASSERT_EQ(resp.status().code(), MetaServiceCode::OK);
+        snapshot_id = resp.snapshot_id();
+    }
+
+    {
+        CommitSnapshotRequest req;
+        req.set_cloud_unique_id(fmt::format("1:{}:1", predecessor_id));
+        req.set_snapshot_id(snapshot_id);
+        req.set_image_url("snapshot/test-rollback-idempotent");
+        req.set_last_journal_id(1);
+        req.set_snapshot_meta_image_size(100);
+        req.set_snapshot_logical_data_size(1000);
+
+        brpc::Controller ctrl;
+        CommitSnapshotResponse resp;
+        ctx.meta_service()->commit_snapshot(&ctrl, &req, &resp, nullptr);
+        ASSERT_EQ(resp.status().code(), MetaServiceCode::OK);
+    }
+
+    auto build_request = [&]() {
+        CloneInstanceRequest req;
+        req.set_clone_type(CloneInstanceRequest::ROLLBACK);
+        req.set_from_instance_id(predecessor_id);
+        req.set_from_snapshot_id(snapshot_id);
+        req.set_new_instance_id(successor_id);
+        return req;
+    };
+
+    {
+        CloneInstanceRequest req = build_request();
+        brpc::Controller ctrl;
+        CloneInstanceResponse resp;
+        ctx.meta_service()->clone_instance(&ctrl, &req, &resp, nullptr);
+        ASSERT_EQ(resp.status().code(), MetaServiceCode::OK) << resp.ShortDebugString();
+        ASSERT_EQ(resp.image_url(), "snapshot/test-rollback-idempotent");
+    }
+
+    {
+        InstanceInfoPB predecessor = ctx.get_instance_info(predecessor_id);
+        InstanceInfoPB successor = ctx.get_instance_info(successor_id);
+        ASSERT_EQ(predecessor.status(), InstanceInfoPB::DELETED);
+        ASSERT_EQ(predecessor.successor_instance_id(), successor_id);
+        ASSERT_EQ(successor.predecessor_instance_id(), predecessor_id);
+        ASSERT_EQ(successor.source_snapshot_id(), snapshot_id);
+    }
+
+    {
+        CloneInstanceRequest req = build_request();
+        brpc::Controller ctrl;
+        CloneInstanceResponse resp;
+        ctx.meta_service()->clone_instance(&ctrl, &req, &resp, nullptr);
+        ASSERT_EQ(resp.status().code(), MetaServiceCode::OK) << resp.ShortDebugString();
+        ASSERT_EQ(resp.image_url(), "snapshot/test-rollback-idempotent");
+    }
+}
+
 TEST(MetaServiceHttpTest, DecoupleInstanceHttpTest) {
     HttpContext ctx;
 
@@ -1221,6 +1302,172 @@ TEST(MetaServiceHttpTest, DecoupleInstanceHttpTest) {
         ASSERT_EQ(http_code, 400);
         ASSERT_EQ(response.code(), MetaServiceCode::INVALID_ARGUMENT);
         EXPECT_TRUE(response.msg().find("clone_instance") != std::string::npos);
+    }
+}
+
+TEST(MetaServiceHttpTest, CloneIdempotencyAllTypes) {
+    HttpContext ctx;
+
+    // Helper: create a committed snapshot for an instance
+    auto create_committed_snapshot = [&](const std::string& instance_id,
+                                         const std::string& label) -> std::string {
+        {
+            InstanceInfoPB instance = ctx.get_instance_info(instance_id);
+            instance.set_snapshot_switch_status(SNAPSHOT_SWITCH_ON);
+            EXPECT_EQ(ctx.update_instance_info(instance), TxnErrorCode::TXN_OK);
+        }
+
+        std::string cloud_unique_id = fmt::format("1:{}:1", instance_id);
+
+        BeginSnapshotRequest begin_req;
+        begin_req.set_cloud_unique_id(cloud_unique_id);
+        begin_req.set_snapshot_label(label);
+        begin_req.set_timeout_seconds(3600);
+        begin_req.set_ttl_seconds(7200);
+        begin_req.set_auto_snapshot(false);
+        brpc::Controller ctrl1;
+        BeginSnapshotResponse begin_resp;
+        ctx.meta_service()->begin_snapshot(&ctrl1, &begin_req, &begin_resp, nullptr);
+        EXPECT_EQ(begin_resp.status().code(), MetaServiceCode::OK);
+        std::string snapshot_id = begin_resp.snapshot_id();
+
+        CommitSnapshotRequest commit_req;
+        commit_req.set_cloud_unique_id(cloud_unique_id);
+        commit_req.set_snapshot_id(snapshot_id);
+        commit_req.set_image_url("snapshot/" + label);
+        commit_req.set_last_journal_id(0);
+        commit_req.set_snapshot_meta_image_size(100);
+        commit_req.set_snapshot_logical_data_size(1000);
+        brpc::Controller ctrl2;
+        CommitSnapshotResponse commit_resp;
+        ctx.meta_service()->commit_snapshot(&ctrl2, &commit_req, &commit_resp, nullptr);
+        EXPECT_EQ(commit_resp.status().code(), MetaServiceCode::OK);
+        return snapshot_id;
+    };
+
+    // ---- Test 1: READ_ONLY idempotency ----
+    {
+        std::string source_id = "idem_ro_source";
+        std::string clone_id = "idem_ro_clone";
+        create_test_instance_for_snapshot(ctx, source_id);
+        std::string snapshot_id = create_committed_snapshot(source_id, "idem_ro_snap");
+
+        auto build_request = [&]() {
+            CloneInstanceRequest req;
+            req.set_clone_type(CloneInstanceRequest::READ_ONLY);
+            req.set_from_instance_id(source_id);
+            req.set_from_snapshot_id(snapshot_id);
+            req.set_new_instance_id(clone_id);
+            return req;
+        };
+
+        // First call should succeed
+        {
+            CloneInstanceRequest req = build_request();
+            brpc::Controller ctrl;
+            CloneInstanceResponse resp;
+            ctx.meta_service()->clone_instance(&ctrl, &req, &resp, nullptr);
+            ASSERT_EQ(resp.status().code(), MetaServiceCode::OK) << resp.ShortDebugString();
+            ASSERT_FALSE(resp.image_url().empty());
+        }
+
+        // Second call (idempotent retry) should also succeed with same response
+        {
+            CloneInstanceRequest req = build_request();
+            brpc::Controller ctrl;
+            CloneInstanceResponse resp;
+            ctx.meta_service()->clone_instance(&ctrl, &req, &resp, nullptr);
+            ASSERT_EQ(resp.status().code(), MetaServiceCode::OK) << resp.ShortDebugString();
+            ASSERT_EQ(resp.image_url(), "snapshot/idem_ro_snap");
+        }
+    }
+
+    // ---- Test 2: WRITABLE idempotency ----
+    {
+        std::string source_id = "idem_wr_source";
+        std::string clone_id = "idem_wr_clone";
+        create_test_instance_for_snapshot(ctx, source_id);
+        std::string snapshot_id = create_committed_snapshot(source_id, "idem_wr_snap");
+
+        auto build_request = [&]() {
+            CloneInstanceRequest req;
+            req.set_clone_type(CloneInstanceRequest::WRITABLE);
+            req.set_from_instance_id(source_id);
+            req.set_from_snapshot_id(snapshot_id);
+            req.set_new_instance_id(clone_id);
+            auto* obj_info = req.mutable_obj_info();
+            obj_info->set_ak("writable_ak");
+            obj_info->set_sk("writable_sk");
+            obj_info->set_bucket("writable_bucket");
+            obj_info->set_prefix("writable_prefix");
+            obj_info->set_endpoint("writable_endpoint");
+            obj_info->set_region("writable_region");
+            return req;
+        };
+
+        // First call
+        {
+            CloneInstanceRequest req = build_request();
+            brpc::Controller ctrl;
+            CloneInstanceResponse resp;
+            ctx.meta_service()->clone_instance(&ctrl, &req, &resp, nullptr);
+            ASSERT_EQ(resp.status().code(), MetaServiceCode::OK) << resp.ShortDebugString();
+            ASSERT_FALSE(resp.image_url().empty());
+        }
+
+        // Idempotent retry
+        {
+            CloneInstanceRequest req = build_request();
+            brpc::Controller ctrl;
+            CloneInstanceResponse resp;
+            ctx.meta_service()->clone_instance(&ctrl, &req, &resp, nullptr);
+            ASSERT_EQ(resp.status().code(), MetaServiceCode::OK) << resp.ShortDebugString();
+            ASSERT_EQ(resp.image_url(), "snapshot/idem_wr_snap");
+        }
+    }
+
+    // ---- Test 3: ROLLBACK idempotency (source already has successor) ----
+    {
+        std::string source_id = "idem_rb_source";
+        std::string clone_id = "idem_rb_successor";
+        create_test_instance_for_snapshot(ctx, source_id);
+        std::string snapshot_id = create_committed_snapshot(source_id, "idem_rb_snap");
+
+        auto build_request = [&]() {
+            CloneInstanceRequest req;
+            req.set_clone_type(CloneInstanceRequest::ROLLBACK);
+            req.set_from_instance_id(source_id);
+            req.set_from_snapshot_id(snapshot_id);
+            req.set_new_instance_id(clone_id);
+            return req;
+        };
+
+        // First call
+        {
+            CloneInstanceRequest req = build_request();
+            brpc::Controller ctrl;
+            CloneInstanceResponse resp;
+            ctx.meta_service()->clone_instance(&ctrl, &req, &resp, nullptr);
+            ASSERT_EQ(resp.status().code(), MetaServiceCode::OK) << resp.ShortDebugString();
+            ASSERT_EQ(resp.image_url(), "snapshot/idem_rb_snap");
+        }
+
+        // Verify source has successor (rolled back state)
+        {
+            InstanceInfoPB source = ctx.get_instance_info(source_id);
+            ASSERT_EQ(source.status(), InstanceInfoPB::DELETED);
+            ASSERT_EQ(source.successor_instance_id(), clone_id);
+        }
+
+        // Idempotent retry — source has been rolled back but target already exists
+        {
+            CloneInstanceRequest req = build_request();
+            brpc::Controller ctrl;
+            CloneInstanceResponse resp;
+            ctx.meta_service()->clone_instance(&ctrl, &req, &resp, nullptr);
+            ASSERT_EQ(resp.status().code(), MetaServiceCode::OK) << resp.ShortDebugString();
+            ASSERT_EQ(resp.image_url(), "snapshot/idem_rb_snap");
+        }
     }
 }
 
