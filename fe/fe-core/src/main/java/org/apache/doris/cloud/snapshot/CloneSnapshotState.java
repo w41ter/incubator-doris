@@ -43,6 +43,12 @@ public class CloneSnapshotState {
         private String ak;
         @JsonProperty("sk")
         private String sk;
+        @JsonProperty("cred_provider_type")
+        private String credProviderType;
+        @JsonProperty("role_arn")
+        private String roleArn;
+        @JsonProperty("external_id")
+        private String externalId;
         @JsonProperty("bucket")
         private String bucket;
         @JsonProperty("prefix")
@@ -57,9 +63,37 @@ public class CloneSnapshotState {
         private String provider;
 
         public Cloud.ObjectStoreInfoPB getObjectStoreInfoPB() {
-            return Cloud.ObjectStoreInfoPB.newBuilder().setAk(ak).setSk(sk).setBucket(bucket).setPrefix(prefix)
+            Cloud.ObjectStoreInfoPB.Builder builder = Cloud.ObjectStoreInfoPB.newBuilder()
+                    .setBucket(bucket).setPrefix(prefix)
                     .setEndpoint(endpoint).setExternalEndpoint(externalEndpoint).setRegion(region)
-                    .setProvider(getProvider()).build();
+                    .setProvider(getProvider());
+            if (roleArn != null && !roleArn.isEmpty()) {
+                builder.setRoleArn(roleArn)
+                        .setCredProviderType(getCredProviderType());
+                if (externalId != null && !externalId.isEmpty()) {
+                    builder.setExternalId(externalId);
+                }
+            } else {
+                builder.setAk(ak).setSk(sk);
+            }
+            return builder.build();
+        }
+
+        public Cloud.CredProviderTypePB getCredProviderType() {
+            if (credProviderType == null || credProviderType.isEmpty()) {
+                return Cloud.CredProviderTypePB.INSTANCE_PROFILE;
+            }
+
+            Cloud.CredProviderTypePB value;
+            try {
+                value = Cloud.CredProviderTypePB.valueOf(credProviderType);
+            } catch (Exception e) {
+                throw new IllegalArgumentException("Unknown cred provider type: " + credProviderType);
+            }
+            if (value != Cloud.CredProviderTypePB.INSTANCE_PROFILE) {
+                throw new IllegalArgumentException("Unsupported cred provider type: " + credProviderType);
+            }
+            return value;
         }
 
         private Cloud.ObjectStoreInfoPB.Provider getProvider() {
@@ -121,8 +155,17 @@ public class CloneSnapshotState {
             if (objInfo == null) {
                 throw new IllegalArgumentException("obj_info is null, it is required for writeable clone");
             }
-            checkNotNull("obj_info.ak", objInfo.ak);
-            checkNotNull("obj_info.sk", objInfo.sk);
+            boolean hasRoleArn = objInfo.roleArn != null && !objInfo.roleArn.isEmpty();
+            boolean hasAk = objInfo.ak != null && !objInfo.ak.isEmpty();
+            boolean hasSk = objInfo.sk != null && !objInfo.sk.isEmpty();
+            if (hasRoleArn && (hasAk || hasSk)) {
+                throw new IllegalArgumentException("obj_info cannot set both ak/sk and role_arn");
+            }
+            objInfo.getCredProviderType();
+            if (!hasRoleArn) {
+                checkNotNull("obj_info.ak", objInfo.ak);
+                checkNotNull("obj_info.sk", objInfo.sk);
+            }
             checkNotNull("obj_info.bucket", objInfo.bucket);
             // prefix can be empty
             checkNotNull("obj_info.endpoint", objInfo.endpoint);

@@ -801,6 +801,70 @@ TEST(MetaServiceSnapshotTest, BeginSnapshotTest) {
     }
 }
 
+TEST(MetaServiceSnapshotTest, BeginSnapshotWithRoleArnTest) {
+    auto meta_service = get_meta_service(true);
+    const char* const instance_id = "test_instance";
+    const std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+
+    {
+        brpc::Controller cntl;
+        CreateInstanceRequest req;
+        req.set_instance_id(instance_id);
+        req.set_user_id("test_user");
+        req.set_name("test_name_role");
+        ObjectStoreInfoPB obj;
+        obj.set_bucket("role_bucket");
+        obj.set_prefix("role_prefix");
+        obj.set_endpoint("role_endpoint");
+        obj.set_region("role_region");
+        obj.set_external_endpoint("role_external_endpoint");
+        obj.set_provider(ObjectStoreInfoPB::S3);
+        obj.set_role_arn("arn:aws:iam::123456789012:role/snapshot-test-role");
+        obj.set_external_id("snapshot-external-id");
+        obj.set_cred_provider_type(CredProviderTypePB::INSTANCE_PROFILE);
+        req.mutable_obj_info()->CopyFrom(obj);
+
+        CreateInstanceResponse res;
+        meta_service->create_instance(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                      &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+    }
+
+    {
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(meta_service->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+        std::string instance_key_str = instance_key(instance_id);
+        std::string instance_value;
+        ASSERT_EQ(txn->get(instance_key_str, &instance_value), TxnErrorCode::TXN_OK);
+        InstanceInfoPB instance_info;
+        ASSERT_TRUE(instance_info.ParseFromString(instance_value));
+        instance_info.set_snapshot_switch_status(SnapshotSwitchStatus::SNAPSHOT_SWITCH_ON);
+        txn->put(instance_key_str, instance_info.SerializeAsString());
+        ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+    }
+
+    {
+        brpc::Controller cntl;
+        BeginSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_timeout_seconds(3600);
+        req.set_auto_snapshot(true);
+        req.set_ttl_seconds(7200);
+        req.set_snapshot_label("role_snapshot");
+        BeginSnapshotResponse res;
+        meta_service->begin_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                     &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
+        ASSERT_TRUE(res.has_obj_info());
+        ASSERT_EQ(res.obj_info().role_arn(), "arn:aws:iam::123456789012:role/snapshot-test-role");
+        ASSERT_EQ(res.obj_info().external_id(), "snapshot-external-id");
+        ASSERT_EQ(res.obj_info().cred_provider_type(), CredProviderTypePB::INSTANCE_PROFILE);
+        ASSERT_FALSE(res.obj_info().has_ak());
+        ASSERT_FALSE(res.obj_info().has_sk());
+        ASSERT_FALSE(res.obj_info().has_encryption_info());
+    }
+}
+
 TEST(MetaServiceSnapshotTest, UpdateSnapshotTest) {
     auto meta_service = get_meta_service(true);
     const char* const cloud_unique_id = "test_cloud_unique_id";
@@ -2805,6 +2869,138 @@ TEST(MetaServiceSnapshotTest, CloneInstanceWritableTest) {
     }
 }
 
+TEST(MetaServiceSnapshotTest, CloneInstanceWritableWithRoleArnTest) {
+    auto meta_service = get_meta_service(false);
+    const char* const instance_id = "test_instance_role_clone_source";
+    const std::string cloud_unique_id = fmt::format("1:{}:0", instance_id);
+
+    auto* sp = SyncPoint::get_instance();
+    sp->enable_processing();
+    sp->set_call_back("encrypt_ak_sk:get_encryption_key", [](auto&& args) {
+        auto* ret = try_any_cast<int*>(args[0]);
+        *ret = 0;
+        auto* key = try_any_cast<std::string*>(args[1]);
+        *key = "selectdbselectdbselectdbselectdb";
+        auto* key_id = try_any_cast<int64_t*>(args[2]);
+        *key_id = 1;
+    });
+    sp->set_call_back("decrypt_ak_sk:get_encryption_key", [](auto&& args) {
+        auto* key = try_any_cast<std::string*>(args[0]);
+        *key = "selectdbselectdbselectdbselectdb";
+        auto* ret = try_any_cast<int*>(args[1]);
+        *ret = 0;
+    });
+
+    DORIS_CLOUD_DEFER {
+        sp->disable_processing();
+        sp->clear_all_call_backs();
+    };
+
+    {
+        CreateInstanceRequest req;
+        CreateInstanceResponse res;
+        req.set_instance_id(instance_id);
+        req.set_name(instance_id);
+        req.set_user_id("test_user");
+
+        auto obj_info = req.mutable_obj_info();
+        obj_info->set_ak("source_ak_role");
+        obj_info->set_sk("source_sk_role");
+        obj_info->set_bucket("source_bucket_role");
+        obj_info->set_prefix("source_prefix_role");
+        obj_info->set_endpoint("source_endpoint_role");
+        obj_info->set_region("source_region_role");
+        obj_info->set_external_endpoint("source_external_endpoint_role");
+        obj_info->set_provider(ObjectStoreInfoPB::S3);
+        obj_info->set_id("1");
+
+        brpc::Controller cntl;
+        meta_service->create_instance(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                      &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
+    }
+
+    {
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(meta_service->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+        std::string instance_key_str = instance_key(instance_id);
+        std::string instance_value;
+        ASSERT_EQ(txn->get(instance_key_str, &instance_value), TxnErrorCode::TXN_OK);
+        InstanceInfoPB instance_info;
+        ASSERT_TRUE(instance_info.ParseFromString(instance_value));
+        instance_info.set_snapshot_switch_status(SnapshotSwitchStatus::SNAPSHOT_SWITCH_ON);
+        txn->put(instance_key_str, instance_info.SerializeAsString());
+        ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+    }
+
+    std::string snapshot_id;
+    {
+        brpc::Controller cntl;
+        BeginSnapshotRequest req;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_timeout_seconds(1800);
+        req.set_ttl_seconds(14400);
+        req.set_snapshot_label("test_snapshot_role_clone");
+        BeginSnapshotResponse res;
+        meta_service->begin_snapshot(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                     &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
+        snapshot_id = res.snapshot_id();
+
+        commit_snapshot(meta_service.get(), cloud_unique_id, snapshot_id,
+                        "/snapshot/" + snapshot_id + "/", 200);
+    }
+
+    {
+        brpc::Controller cntl;
+        CloneInstanceRequest req;
+        req.set_clone_type(CloneInstanceRequest::WRITABLE);
+        req.set_from_instance_id(instance_id);
+        req.set_from_snapshot_id(snapshot_id);
+        req.set_new_instance_id("writable_clone_role");
+
+        ObjectStoreInfoPB* obj_info = req.mutable_obj_info();
+        obj_info->set_bucket("writable_role_bucket");
+        obj_info->set_prefix("writable_role_prefix");
+        obj_info->set_endpoint("writable_role_endpoint");
+        obj_info->set_region("writable_role_region");
+        obj_info->set_provider(ObjectStoreInfoPB::S3);
+        obj_info->set_role_arn("arn:aws:iam::123456789012:role/writable-clone-role");
+        obj_info->set_external_id("writable-clone-external-id");
+
+        CloneInstanceResponse res;
+        meta_service->clone_instance(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                     &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
+        ASSERT_FALSE(res.image_url().empty());
+        ASSERT_TRUE(res.has_obj_info());
+    }
+
+    {
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(meta_service->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+        std::string instance_key_str = instance_key("writable_clone_role");
+        std::string instance_value;
+        ASSERT_EQ(txn->get(instance_key_str, &instance_value), TxnErrorCode::TXN_OK);
+
+        InstanceInfoPB instance_info;
+        ASSERT_TRUE(instance_info.ParseFromString(instance_value));
+        ASSERT_FALSE(instance_info.ready_only());
+        ASSERT_EQ(instance_info.source_instance_id(), "test_instance_role_clone_source");
+        ASSERT_EQ(instance_info.source_snapshot_id(), snapshot_id);
+        ASSERT_EQ(instance_info.obj_info_size(), 2);
+
+        const auto& writable_obj = instance_info.obj_info(1);
+        ASSERT_EQ(writable_obj.role_arn(), "arn:aws:iam::123456789012:role/writable-clone-role");
+        ASSERT_EQ(writable_obj.external_id(), "writable-clone-external-id");
+        ASSERT_EQ(writable_obj.cred_provider_type(), CredProviderTypePB::INSTANCE_PROFILE);
+        ASSERT_FALSE(writable_obj.has_ak());
+        ASSERT_FALSE(writable_obj.has_sk());
+        ASSERT_FALSE(writable_obj.has_encryption_info());
+        ASSERT_EQ(instance_info.resource_ids_size(), 2) << instance_info.ShortDebugString();
+    }
+}
+
 TEST(MetaServiceSnapshotTest, CloneInstanceRollbackTest) {
     auto meta_service = get_meta_service(true);
     const char* const cloud_unique_id = "test_cloud_unique_id";
@@ -3181,6 +3377,30 @@ TEST(MetaServiceSnapshotTest, CloneInstanceParameterValidationTest) {
         ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
         ASSERT_TRUE(res.status().msg().find("WRITABLE clone requires obj_info") !=
                     std::string::npos);
+    }
+
+    // Test WRITABLE with both ak/sk and role_arn
+    {
+        brpc::Controller cntl;
+        CloneInstanceRequest req;
+        req.set_clone_type(CloneInstanceRequest::WRITABLE);
+        req.set_from_instance_id("source");
+        req.set_from_snapshot_id("1234567890abcdef1234");
+        req.set_new_instance_id("target_role_conflict");
+        auto* obj_info = req.mutable_obj_info();
+        obj_info->set_ak("ak_test");
+        obj_info->set_sk("sk_test");
+        obj_info->set_role_arn("arn:aws:iam::123456789012:role/conflict-role");
+        obj_info->set_bucket("test_bucket");
+        obj_info->set_endpoint("test_endpoint");
+
+        CloneInstanceResponse res;
+        meta_service->clone_instance(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
+                                     &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+        ASSERT_TRUE(res.status().msg().find("cannot set both ak/sk and role_arn") !=
+                    std::string::npos)
+                << res.ShortDebugString();
     }
 
     // Test clone with same from_instance_id and new_instance_id

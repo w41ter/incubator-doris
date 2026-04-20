@@ -174,6 +174,79 @@ public class CloneSnapshotStateTest {
                 + "        \"provider\": \"abc\"\n"
                 + "    }\n"
                 + "}", "Unknown provider"));
+        // normal clone with role arn
+        values.add(Pair.of("{\n"
+                + "    \"from_instance_id\": \"115400978\",\n"
+                + "    \"from_snapshot_id\": \"0000553fb058e8a20000\",\n"
+                + "    \"instance_id\": \"156952316\",\n"
+                + "    \"name\": \"156952316\",\n"
+                + "    \"is_read_only\": false,\n"
+                + "    \"obj_info\": {\n"
+                + "        \"role_arn\": \"arn:aws:iam::123456789012:role/MyRole\",\n"
+                + "        \"external_id\": \"snapshot-external-id\",\n"
+                + "        \"bucket\": \"bucket_val\",\n"
+                + "        \"prefix\": \"prefix_val\",\n"
+                + "        \"endpoint\": \"endpoint_val\",\n"
+                + "        \"external_endpoint\": \"external_endpoint_val\",\n"
+                + "        \"region\": \"us-east-1\",\n"
+                + "        \"provider\": \"S3\"\n"
+                + "    }\n"
+                + "}", ""));
+        // normal clone with explicit instance profile cred provider type
+        values.add(Pair.of("{\n"
+                + "    \"from_instance_id\": \"115400978\",\n"
+                + "    \"from_snapshot_id\": \"0000553fb058e8a20000\",\n"
+                + "    \"instance_id\": \"156952316\",\n"
+                + "    \"name\": \"156952316\",\n"
+                + "    \"is_read_only\": false,\n"
+                + "    \"obj_info\": {\n"
+                + "        \"role_arn\": \"arn:aws:iam::123456789012:role/MyRole\",\n"
+                + "        \"cred_provider_type\": \"INSTANCE_PROFILE\",\n"
+                + "        \"bucket\": \"bucket_val\",\n"
+                + "        \"prefix\": \"prefix_val\",\n"
+                + "        \"endpoint\": \"endpoint_val\",\n"
+                + "        \"external_endpoint\": \"external_endpoint_val\",\n"
+                + "        \"region\": \"us-east-1\",\n"
+                + "        \"provider\": \"S3\"\n"
+                + "    }\n"
+                + "}", ""));
+        // cred_provider_type only supports INSTANCE_PROFILE
+        values.add(Pair.of("{\n"
+                + "    \"from_instance_id\": \"115400978\",\n"
+                + "    \"from_snapshot_id\": \"0000553fb058e8a20000\",\n"
+                + "    \"instance_id\": \"156952316\",\n"
+                + "    \"name\": \"156952316\",\n"
+                + "    \"is_read_only\": false,\n"
+                + "    \"obj_info\": {\n"
+                + "        \"role_arn\": \"arn:aws:iam::123456789012:role/MyRole\",\n"
+                + "        \"cred_provider_type\": \"DEFAULT\",\n"
+                + "        \"bucket\": \"bucket_val\",\n"
+                + "        \"prefix\": \"prefix_val\",\n"
+                + "        \"endpoint\": \"endpoint_val\",\n"
+                + "        \"external_endpoint\": \"external_endpoint_val\",\n"
+                + "        \"region\": \"us-east-1\",\n"
+                + "        \"provider\": \"S3\"\n"
+                + "    }\n"
+                + "}", "Unsupported cred provider type"));
+        // mixed ak/sk and role_arn is not allowed
+        values.add(Pair.of("{\n"
+                + "    \"from_instance_id\": \"115400978\",\n"
+                + "    \"from_snapshot_id\": \"0000553fb058e8a20000\",\n"
+                + "    \"instance_id\": \"156952316\",\n"
+                + "    \"name\": \"156952316\",\n"
+                + "    \"is_read_only\": false,\n"
+                + "    \"obj_info\": {\n"
+                + "        \"ak\": \"ak_val\",\n"
+                + "        \"sk\": \"sk_val\",\n"
+                + "        \"role_arn\": \"arn:aws:iam::123456789012:role/MyRole\",\n"
+                + "        \"bucket\": \"bucket_val\",\n"
+                + "        \"prefix\": \"prefix_val\",\n"
+                + "        \"endpoint\": \"endpoint_val\",\n"
+                + "        \"external_endpoint\": \"external_endpoint_val\",\n"
+                + "        \"region\": \"us-east-1\",\n"
+                + "        \"provider\": \"S3\"\n"
+                + "    }\n"
+                + "}", "obj_info cannot set both ak/sk and role_arn"));
         // normal rollback with is_read_only false
         values.add(Pair.of("{\n"
                 + "    \"from_instance_id\": \"115400978\",\n"
@@ -254,5 +327,36 @@ public class CloneSnapshotStateTest {
         Assert.assertEquals("external_endpoint_val", objInfo.getExternalEndpoint());
         Assert.assertEquals("ap-beijing", objInfo.getRegion());
         Assert.assertEquals(Provider.COS, objInfo.getProvider());
+    }
+
+    @Test
+    public void testGetObjInfoWithRoleArn() throws JsonProcessingException {
+        String value = "{\n"
+                        + "    \"from_instance_id\": \"115400978\",\n"
+                        + "    \"from_snapshot_id\": \"0000553fb058e8a20000\",\n"
+                        + "    \"instance_id\": \"156952316\",\n"
+                        + "    \"name\": \"156952316\",\n"
+                        + "    \"is_read_only\": false,\n"
+                        + "    \"obj_info\": {\n"
+                        + "        \"role_arn\": \"arn:aws:iam::123456789012:role/MyRole\",\n"
+                        + "        \"external_id\": \"snapshot-external-id\",\n"
+                        + "        \"cred_provider_type\": \"INSTANCE_PROFILE\",\n"
+                        + "        \"bucket\": \"bucket_val\",\n"
+                        + "        \"prefix\": \"prefix_val\",\n"
+                        + "        \"endpoint\": \"endpoint_val\",\n"
+                        + "        \"external_endpoint\": \"external_endpoint_val\",\n"
+                        + "        \"region\": \"us-east-1\",\n"
+                        + "        \"provider\": \"S3\"\n"
+                        + "    }\n"
+                        + "}";
+        CloneSnapshotState cloneSnapshotState = new ObjectMapper().readValue(value, CloneSnapshotState.class);
+        cloneSnapshotState.check();
+        Cloud.ObjectStoreInfoPB objInfo = cloneSnapshotState.getObjectStoreInfoPB();
+        Assert.assertEquals("arn:aws:iam::123456789012:role/MyRole", objInfo.getRoleArn());
+        Assert.assertEquals("snapshot-external-id", objInfo.getExternalId());
+        Assert.assertEquals(Cloud.CredProviderTypePB.INSTANCE_PROFILE, objInfo.getCredProviderType());
+        Assert.assertFalse(objInfo.hasAk());
+        Assert.assertFalse(objInfo.hasSk());
+        Assert.assertEquals(Provider.S3, objInfo.getProvider());
     }
 }

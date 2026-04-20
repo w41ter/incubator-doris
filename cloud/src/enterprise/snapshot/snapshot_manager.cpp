@@ -64,6 +64,21 @@ static bool decrypt_object_store_info_ak_sk(ObjectStoreInfoPB* obj_info) {
     return true;
 }
 
+static bool has_role_based_credentials(const ObjectStoreInfoPB& obj_info) {
+    return obj_info.has_role_arn() && !obj_info.role_arn().empty();
+}
+
+static bool has_ak_sk_credentials(const ObjectStoreInfoPB& obj_info) {
+    return obj_info.has_ak() || obj_info.has_sk();
+}
+
+static void set_default_role_credential_provider(ObjectStoreInfoPB* obj_info) {
+    if (!has_role_based_credentials(*obj_info) || obj_info->has_cred_provider_type()) {
+        return;
+    }
+    obj_info->set_cred_provider_type(CredProviderTypePB::INSTANCE_PROFILE);
+}
+
 // Set snapshot info in response
 static MetaServiceCode set_snapshot_info_in_response(CloneInstanceResponse* response,
                                                      const SnapshotPB& snapshot_pb,
@@ -81,6 +96,7 @@ static MetaServiceCode set_snapshot_info_in_response(CloneInstanceResponse* resp
         for (const auto& source_obj_info : from_instance_info.obj_info()) {
             if (source_obj_info.id() == snapshot_resource_id) {
                 *obj_info = source_obj_info;
+                set_default_role_credential_provider(obj_info);
                 if (!decrypt_object_store_info_ak_sk(obj_info)) {
                     LOG_WARNING("failed to decrypt snapshot object store info ak/sk");
                     if (error_msg != nullptr) {
@@ -128,6 +144,7 @@ static MetaServiceCode set_snapshot_info_in_response(CloneInstanceResponse* resp
                 }
 
                 *obj_info = storage_vault.obj_info();
+                set_default_role_credential_provider(obj_info);
                 if (!decrypt_object_store_info_ak_sk(obj_info)) {
                     LOG_WARNING("failed to decrypt snapshot object store info ak/sk");
                     if (error_msg != nullptr) {
@@ -307,6 +324,7 @@ void SnapshotManager::begin_snapshot(std::string_view instance_id,
         }
     }
 
+    set_default_role_credential_provider(&obj_info);
     if (!decrypt_object_store_info_ak_sk(&obj_info)) {
         status->set_code(MetaServiceCode::UNDEFINED_ERR);
         status->set_msg("failed to decrypt object info ak/sk");
@@ -1019,13 +1037,22 @@ MetaServiceCode SnapshotManager::validate_writable_clone_request(
 
     // Validate object storage information if obj_info is provided
     const auto& obj_info = request.obj_info();
-    if (!obj_info.has_ak() || obj_info.ak().empty()) {
-        *error_msg = "obj_info.ak is required";
+    const bool has_role_arn = has_role_based_credentials(obj_info);
+    const bool has_ak = obj_info.has_ak() && !obj_info.ak().empty();
+    const bool has_sk = obj_info.has_sk() && !obj_info.sk().empty();
+
+    if (has_role_arn && has_ak_sk_credentials(obj_info)) {
+        *error_msg = "obj_info cannot set both ak/sk and role_arn";
         return MetaServiceCode::INVALID_ARGUMENT;
     }
 
-    if (!obj_info.has_sk() || obj_info.sk().empty()) {
-        *error_msg = "obj_info.sk is required";
+    if (has_ak ^ has_sk) {
+        *error_msg = "obj_info.ak and obj_info.sk must be set together";
+        return MetaServiceCode::INVALID_ARGUMENT;
+    }
+
+    if (!has_role_arn && !has_ak) {
+        *error_msg = "obj_info must provide either ak/sk or role_arn";
         return MetaServiceCode::INVALID_ARGUMENT;
     }
 
@@ -1036,6 +1063,11 @@ MetaServiceCode SnapshotManager::validate_writable_clone_request(
 
     if (!obj_info.has_endpoint() || obj_info.endpoint().empty()) {
         *error_msg = "obj_info.endpoint is required";
+        return MetaServiceCode::INVALID_ARGUMENT;
+    }
+
+    if (!has_role_arn && !has_sk) {
+        *error_msg = "obj_info.sk is required";
         return MetaServiceCode::INVALID_ARGUMENT;
     }
 
@@ -1336,6 +1368,7 @@ MetaServiceCode SnapshotManager::setup_writable_storage(Transaction* txn,
         }
 
         ObjectStoreInfoPB new_obj_info = request.obj_info();
+        set_default_role_credential_provider(&new_obj_info);
         std::string new_obj_id = next_available_resource_id(*new_instance);
         new_obj_info.set_id(new_obj_id);
         auto now_time = std::chrono::system_clock::now();
@@ -1396,7 +1429,8 @@ MetaServiceCode SnapshotManager::setup_writable_storage(Transaction* txn,
     std::string new_storage_vault_id = new_resource_id;
 
     // Get object store info from request
-    const auto& obj_info = request.obj_info();
+    ObjectStoreInfoPB obj_info = request.obj_info();
+    set_default_role_credential_provider(&obj_info);
 
     // Create new storage vault
     StorageVaultPB new_storage_vault;
