@@ -62,7 +62,8 @@ enum TPlanNodeType {
   GROUP_COMMIT_SCAN_NODE = 33,
   MATERIALIZATION_NODE = 34,
   REC_CTE_NODE = 35,
-  REC_CTE_SCAN_NODE = 36
+  REC_CTE_SCAN_NODE = 36,
+  BUCKETED_AGGREGATION_NODE = 37
 }
 
 struct TKeyRange {
@@ -253,9 +254,21 @@ struct TFileTextScanRangeParams {
     8: optional bool empty_field_as_null
 }
 
+enum TColumnCategory {
+    REGULAR = 0,
+    PARTITION_KEY = 1,
+    SYNTHESIZED = 2,
+    GENERATED = 3,
+}
+
 struct TFileScanSlotInfo {
     1: optional Types.TSlotId slot_id;
     2: optional bool is_file_slot;
+    3: optional TColumnCategory category;
+    // Default value expression for this column when it is missing from the data file.
+    // Populated by FE from Column.getDefaultValue() or NULL literal.
+    // This replaces the separate default_value_of_src_slot map in TFileScanRangeParams.
+    4: optional Exprs.TExpr default_value_expr;
 }
 
 // descirbe how to read file
@@ -1086,6 +1099,15 @@ struct TAggregationNode {
   10: optional TSortInfo agg_sort_info_by_group_key
 }
 
+struct TBucketedAggregationNode {
+  1: optional list<Exprs.TExpr> grouping_exprs
+  2: optional list<Exprs.TExpr> aggregate_functions
+  // Single tuple ID — bucketed agg is one-phase (raw input → final result),
+  // so intermediate and output tuples are always identical.
+  3: optional Types.TTupleId tuple_id
+  5: optional bool need_finalize
+}
+
 struct TRepeatNode {
  // Tulple id used for output, it has new slots.
   1: required Types.TTupleId output_tuple_id
@@ -1534,6 +1556,7 @@ struct TPlanNode {
   50: optional list<list<Exprs.TExpr>> distribute_expr_lists
   51: optional bool is_serial_operator
   52: optional TRecCTEScanNode rec_cte_scan_node
+  53: optional TBucketedAggregationNode bucketed_agg_node
 
   // projections is final projections, which means projecting into results and materializing them into the output block.
   101: optional list<Exprs.TExpr> projections
