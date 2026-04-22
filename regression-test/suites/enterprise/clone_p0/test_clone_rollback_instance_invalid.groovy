@@ -238,7 +238,7 @@ suite("test_clone_rollback_instance_invalid", "snapshot,docker") {
                     // After rollback, querying with old instance_id still returns old instance metadata
                     // But it should have successor_instance_id pointing to the new instance
                     assertEquals(instance.instance_id, instance_id, "Should return the old instance metadata")
-                    assertEquals(instance.status, "NORMAL", "Instance should be NORMAL after rollback")
+                    assertEquals(instance.status, "DELETED", "Instance should be DELETED after rollback")
                     assertEquals(instance.successor_instance_id, new_instance_id, "Should have successor_instance_id pointing to new instance")
 
                     logger.info("✓ Rollback successful: old instance has successor_instance_id = ${new_instance_id}")
