@@ -43,6 +43,8 @@
 #include "rate-limiter/rate_limiter.h"
 #include "resource-manager/resource_manager.h"
 
+#include "snapshot/snapshot_manager_factory.h"
+
 namespace doris::cloud {
 
 MetaServer::MetaServer(std::shared_ptr<TxnKv> txn_kv) : txn_kv_(std::move(txn_kv)) {}
@@ -78,7 +80,7 @@ int MetaServer::start(brpc::Server* server) {
     }
 
     auto rate_limiter = std::make_shared<RateLimiter>();
-    auto snapshot_mgr = std::make_shared<SnapshotManager>(txn_kv_);
+    auto snapshot_mgr = create_snapshot_manager(txn_kv_);
 
     // Add service
     auto meta_service = std::make_unique<MetaServiceImpl>(txn_kv_, rc_mgr, rate_limiter,
