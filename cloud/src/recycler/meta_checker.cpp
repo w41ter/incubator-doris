@@ -39,18 +39,12 @@
 #include "meta-store/keys.h"
 #include "meta-store/txn_kv.h"
 
-#ifdef FEATURE_ENTERPRISE_SNAPSHOT
-#include "enterprise/snapshot/snapshot_manager.h"
-#endif
+#include "snapshot/snapshot_manager_factory.h"
 
 namespace doris::cloud {
 
 MetaChecker::MetaChecker(std::shared_ptr<TxnKv> txn_kv) : txn_kv_(txn_kv) {
-#ifdef FEATURE_ENTERPRISE_SNAPSHOT
-    snapshot_manager_ = std::make_shared<selectdb::SnapshotManager>(std::move(txn_kv));
-#else
-    snapshot_manager_ = std::make_shared<SnapshotManager>(std::move(txn_kv));
-#endif
+    snapshot_manager_ = create_snapshot_manager(std::move(txn_kv));
 }
 
 bool MetaChecker::scan_and_handle_kv(
@@ -1058,13 +1052,11 @@ void MetaChecker::init_tablet_and_partition_info_from_fe_meta() {
 }
 
 bool MetaChecker::do_mvcc_check() {
-#ifdef BUILD_CHECK_META
     int ret = snapshot_manager_->check_meta(this);
     if (ret != 0) {
         LOG(INFO) << "do_mvcc_check failed";
         return false;
     }
-#endif
     return true;
 }
 

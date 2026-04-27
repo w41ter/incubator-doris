@@ -171,9 +171,7 @@ public class ObjectInfoAdapter {
         putIfNotBlank(props, STS_ROLE_NAME_KEY,    obj.getRoleName());
         putIfNotBlank(props, STS_ROLE_ARN_KEY,     obj.getArn());
         putIfNotBlank(props, STS_EXTERNAL_ID_KEY,  obj.getExternalId());
-        // Keep canonical AWS keys aligned with StoragePropertiesConverter and S3ObjStorage.
-        putIfNotBlank(props, "AWS_ROLE_ARN",      obj.getArn());
-        putIfNotBlank(props, "AWS_EXTERNAL_ID",   obj.getExternalId());
+        ObjectInfoSupport.addCanonicalAwsStsProps(props, obj);
         return props;
     }
 

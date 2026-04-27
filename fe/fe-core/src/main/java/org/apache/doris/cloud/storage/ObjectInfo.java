@@ -53,10 +53,7 @@ public class ObjectInfo {
 
     // Used by upload for internal stage
     public ObjectInfo(Cloud.ObjectStoreInfoPB objectStoreInfoPB) {
-        this(objectStoreInfoPB.getProvider(), objectStoreInfoPB.getAk(), objectStoreInfoPB.getSk(),
-                objectStoreInfoPB.getBucket(), objectStoreInfoPB.getEndpoint(), objectStoreInfoPB.getRegion(),
-                objectStoreInfoPB.getPrefix(), null, objectStoreInfoPB.getRoleArn(),
-                objectStoreInfoPB.getExternalId(), null);
+        this(ObjectInfoSupport.createForInternalStage(objectStoreInfoPB));
     }
 
     public ObjectInfo(Cloud.ObjectStoreInfoPB objectStoreInfoPB, String roleName, String arn,
@@ -64,6 +61,13 @@ public class ObjectInfo {
         this(objectStoreInfoPB.getProvider(), objectStoreInfoPB.getAk(), objectStoreInfoPB.getSk(),
                 objectStoreInfoPB.getBucket(), objectStoreInfoPB.getEndpoint(), objectStoreInfoPB.getRegion(),
                 objectStoreInfoPB.getPrefix(), roleName, arn, externalId, token);
+    }
+
+    private ObjectInfo(ObjectInfo objectInfo) {
+        this(objectInfo.getProvider(), objectInfo.getAk(), objectInfo.getSk(), objectInfo.getBucket(),
+                objectInfo.getEndpoint(), objectInfo.getRegion(), objectInfo.getPrefix(),
+                objectInfo.getRoleName(), objectInfo.getArn(), objectInfo.getExternalId(),
+                objectInfo.getToken());
     }
 
     public ObjectInfo(Cloud.ObjectStoreInfoPB.Provider provider, String ak, String sk, String bucket,

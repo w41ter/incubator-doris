@@ -53,7 +53,7 @@
 #include "meta-store/blob_message.h"
 #include "meta-store/keys.h"
 #include "meta-store/txn_kv.h"
-#include "snapshot/snapshot_manager.h"
+#include "snapshot/snapshot_manager_factory.h"
 #ifdef ENABLE_HDFS_STORAGE_VAULT
 #include "recycler/hdfs_accessor.h"
 #endif
@@ -64,10 +64,6 @@
 #endif
 #include "recycler/recycler.h"
 #include "recycler/util.h"
-
-#ifdef FEATURE_ENTERPRISE_SNAPSHOT
-#include "enterprise/snapshot/snapshot_manager.h"
-#endif
 
 namespace doris::cloud {
 namespace config {
@@ -468,11 +464,7 @@ int key_exist(TxnKv* txn_kv, std::string_view key) {
 
 InstanceChecker::InstanceChecker(std::shared_ptr<TxnKv> txn_kv, const std::string& instance_id)
         : txn_kv_(txn_kv), instance_id_(instance_id) {
-#ifdef FEATURE_ENTERPRISE_SNAPSHOT
-    snapshot_manager_ = std::make_shared<selectdb::SnapshotManager>(txn_kv);
-#else
-    snapshot_manager_ = std::make_shared<SnapshotManager>(txn_kv);
-#endif
+    snapshot_manager_ = create_snapshot_manager(txn_kv);
     resource_mgr_ = std::make_shared<ResourceManager>(std::move(txn_kv));
     resource_mgr_->init();
 }
