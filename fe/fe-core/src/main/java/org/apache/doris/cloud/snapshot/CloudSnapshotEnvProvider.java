@@ -24,6 +24,6 @@ public final class CloudSnapshotEnvProvider {
     }
 
     public static Env getCurrentEnvOrNull() {
-        return null;
+        return CloudSnapshotEnv.getInstance();
     }
 }

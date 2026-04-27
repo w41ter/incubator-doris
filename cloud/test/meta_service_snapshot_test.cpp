@@ -28,8 +28,6 @@
 #include "common/defer.h"
 #include "cpp/sync_point.h"
 #include "meta-service/meta_service.h"
-#include "meta-store/keys.h"
-#include "meta-store/txn_kv_error.h"
 
 namespace doris::cloud {
 
@@ -79,20 +77,6 @@ TEST(MetaServiceSnapshotTest, DISABLED_BeginSnapshotTest) {
         meta_service->create_instance(reinterpret_cast<::google::protobuf::RpcController*>(&cntl),
                                       &req, &res, nullptr);
         ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
-    }
-
-    // Enable multi version for the test instance
-    {
-        std::unique_ptr<Transaction> txn;
-        ASSERT_EQ(meta_service->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
-        std::string instance_key_str = instance_key("test_instance");
-        std::string instance_value;
-        ASSERT_EQ(txn->get(instance_key_str, &instance_value), TxnErrorCode::TXN_OK);
-        InstanceInfoPB instance_info;
-        ASSERT_TRUE(instance_info.ParseFromString(instance_value));
-        instance_info.set_multi_version_status(MultiVersionStatus::MULTI_VERSION_ENABLED);
-        txn->put(instance_key_str, instance_info.SerializeAsString());
-        ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
     }
 
     // test invalid argument - empty cloud_unique_id

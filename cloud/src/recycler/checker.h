@@ -146,11 +146,11 @@ public:
 
     void get_all_accessor(std::vector<StorageVaultAccessor*>* accessors);
 
+    std::string_view instance_id() const { return instance_id_; }
+
     void TEST_add_accessor(std::string_view id, std::shared_ptr<StorageVaultAccessor> accessor) {
         accessor_map_.insert({std::string(id), std::move(accessor)});
     }
-
-    std::string_view instance_id() const { return instance_id_; }
 
     // If there are multiple buckets, return the minimum lifecycle; if there are no buckets (i.e.
     // all accessors are HdfsAccessor), return INT64_MAX.

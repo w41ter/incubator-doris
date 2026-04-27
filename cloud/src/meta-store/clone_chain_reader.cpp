@@ -707,9 +707,6 @@ TxnErrorCode CloneChainReader::get_tablet_meta(Transaction* txn, int64_t tablet_
         MetaReader reader(current_instance_id, current_snapshot_version);
         TxnErrorCode err =
                 reader.get_tablet_meta(txn, tablet_id, tablet_meta, versionstamp, snapshot);
-        VLOG_DEBUG << "CloneChainReader::get_tablet_meta instance_id=" << current_instance_id
-                   << ", snapshot_version=" << current_snapshot_version.to_string()
-                   << ", tablet_id=" << tablet_id << ", err=" << err;
         if (err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
             if (err == TxnErrorCode::TXN_OK) {
                 min_read_versionstamp_ =

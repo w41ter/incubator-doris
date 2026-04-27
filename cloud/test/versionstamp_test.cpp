@@ -29,7 +29,6 @@
 #include <vector>
 
 #include "common/util.h"
-#include "enterprise/snapshot/snapshot_helper.h"
 #include "meta-store/codec.h"
 #include "meta-store/keys.h"
 

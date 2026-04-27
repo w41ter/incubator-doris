@@ -17,10 +17,12 @@
 
 #include "snapshot/snapshot_manager_factory.h"
 
+#include "enterprise/snapshot/snapshot_manager.h"
+
 namespace doris::cloud {
 
 std::shared_ptr<SnapshotManager> create_snapshot_manager(std::shared_ptr<TxnKv> txn_kv) {
-    return std::make_shared<SnapshotManager>(std::move(txn_kv));
+    return std::make_shared<selectdb::SnapshotManager>(std::move(txn_kv));
 }
 
 } // namespace doris::cloud

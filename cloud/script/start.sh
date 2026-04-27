@@ -58,7 +58,7 @@ custom_start="${DORIS_HOME}/bin/custom_start.sh"
 if [[ -f "${custom_start}" ]]; then
   source "${custom_start}" 
 fi
-enable_hdfs=${enable_hdfs:-0}
+enable_hdfs=${enable_hdfs:-1}
 process_name="${process_name:-doris_cloud}"
 
 # export env variables from ${process_name}.conf

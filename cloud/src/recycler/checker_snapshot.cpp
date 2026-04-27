@@ -15,12 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <brpc/builtin_service.pb.h>
 #include <brpc/server.h>
 #include <butil/endpoint.h>
 #include <butil/strings/string_split.h>
 #include <bvar/status.h>
-#include <cpp/sync_point.h>
 #include <gen_cpp/cloud.pb.h>
 #include <gen_cpp/olap_file.pb.h>
 
